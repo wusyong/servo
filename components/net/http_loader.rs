@@ -19,6 +19,7 @@ use devtools_traits::{
 use devtools_traits::{HttpResponse as DevtoolsHttpResponse, NetworkEvent};
 use futures::Future;
 use futures_util::compat::*;
+use futures_util::StreamExt;
 use headers::authorization::Basic;
 use headers::{AccessControlAllowCredentials, AccessControlAllowHeaders, HeaderMapExt};
 use headers::{
@@ -507,7 +508,7 @@ async fn obtain_response(
     request_id: Option<&str>,
     is_xhr: bool,
     context: &FetchContext,
-    fetch_terminated: Sender<bool>,
+    fetch_terminated: TokioSender<bool>,
 ) -> Result<(HyperResponse<Decoder>, Option<ChromeToDevtoolsControlMsg>), NetworkError> {
     {
         let headers = request_headers.clone();
@@ -558,11 +559,12 @@ async fn obtain_response(
             ROUTER.add_route(
                 body_port.to_opaque(),
                 Box::new(move |message| {
+                    let fetch_terminated2 = fetch_terminated.clone();
                     let bytes: Vec<u8> = match message.to().unwrap() {
                         BodyChunkResponse::Chunk(bytes) => bytes,
                         BodyChunkResponse::Done => {
                             // Step 3, abort these parallel steps.
-                            let _ = fetch_terminated.send(false);
+                            let _ = fetch_terminated2.send(false);
                             sink.close();
                             return;
                         },
@@ -570,7 +572,7 @@ async fn obtain_response(
                             // Step 4 and/or 5.
                             // TODO: differentiate between the two steps,
                             // where step 5 requires setting an `aborted` flag on the fetch.
-                            let _ = fetch_terminated.send(true);
+                            let _ = fetch_terminated2.send(true);
                             sink.close();
                             return;
                         },
@@ -1712,7 +1714,7 @@ async fn http_network_fetch(
     let is_xhr = request.destination == Destination::None;
 
     // The receiver will receive true if there has been an error streaming the request body.
-    let (fetch_terminated_sender, fetch_terminated_receiver) = unbounded();
+    let (fetch_terminated_sender, fetch_terminated_receiver) = channel(1);
 
     let body = request.body.as_ref().map(|body| body.take_stream());
 
@@ -1721,7 +1723,7 @@ async fn http_network_fetch(
         // However in such a case the channel will remain unused
         // and drop inside `obtain_response`.
         // Send the confirmation now, ensuring the receiver will not dis-connect first.
-        let _ = fetch_terminated_sender.send(false);
+        let _ = fetch_terminated_sender.clone().send(false).compat().await;
     }
 
     let response_future = obtain_response(
@@ -1758,18 +1760,14 @@ async fn http_network_fetch(
 
     // Check if there was an error while streaming the request body.
     //
-    // It's ok to block on the receiver,
-    // since we're already blocking on the response future above,
-    // so we can be sure that the request has already been processed,
-    // and a message is in the channel(or soon will be).
-    match fetch_terminated_receiver.recv() {
-        Ok(true) => {
+    match fetch_terminated_receiver.compat().next().await {
+        Some(Ok(true)) => {
             return Response::network_error(NetworkError::Internal(
                 "Request body streaming failed.".into(),
             ));
         },
-        Ok(false) => {},
-        Err(_) => warn!("Failed to receive confirmation request was streamed without error."),
+        Some(Ok(false)) => {},
+        _ => warn!("Failed to receive confirmation request was streamed without error."),
     }
 
     let header_strings: Vec<&str> = res
