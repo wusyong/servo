@@ -1913,8 +1913,6 @@ async fn http_network_fetch(
             }),
     );
 
-    tokio2::task::yield_now().await;
-
     // TODO these substeps aren't possible yet
     // Substep 1
 

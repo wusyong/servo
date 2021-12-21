@@ -447,7 +447,7 @@ pub async fn main_fetch(
     let mut response_loaded = false;
     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
         // Step 19.1.
-        wait_for_response(&mut response, target, done_chan);
+        wait_for_response(&mut response, target, done_chan).await;
         response_loaded = true;
 
         // Step 19.2.
@@ -471,7 +471,7 @@ pub async fn main_fetch(
         // by sync fetch, but we overload it here for simplicity
         target.process_response(&mut response);
         if !response_loaded {
-            wait_for_response(&mut response, target, done_chan);
+            wait_for_response(&mut response, target, done_chan).await;
         }
         // overloaded similarly to process_response
         target.process_response_eof(&response);
@@ -493,7 +493,7 @@ pub async fn main_fetch(
 
     // Step 23.
     if !response_loaded {
-        wait_for_response(&mut response, target, done_chan);
+        wait_for_response(&mut response, target, done_chan).await;
     }
 
     // Step 24.
@@ -508,20 +508,29 @@ pub async fn main_fetch(
     response
 }
 
-fn wait_for_response(response: &mut Response, target: Target, done_chan: &mut DoneChannel) {
+async fn wait_for_response(
+    response: &mut Response,
+    target: Target<'_>,
+    done_chan: &mut DoneChannel,
+) {
     if let Some(ref ch) = *done_chan {
         loop {
-            match ch
-                .1
-                .recv()
-                .expect("fetch worker should always send Done before terminating")
-            {
-                Data::Payload(vec) => {
+            match ch.1.try_recv() {
+                Ok(Data::Payload(vec)) => {
                     target.process_response_chunk(vec);
                 },
-                Data::Done => break,
-                Data::Cancelled => {
+                Ok(Data::Done) => break,
+                Ok(Data::Cancelled) => {
                     response.aborted.store(true, Ordering::Release);
+                    break;
+                },
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // empty recv, wait for more data
+                    tokio2::task::yield_now().await;
+                    continue;
+                },
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    panic!("fetch worker should always send Done before terminating");
                     break;
                 },
             }
