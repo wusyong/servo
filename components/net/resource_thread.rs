@@ -460,7 +460,6 @@ pub struct CoreResourceManager {
     devtools_chan: Option<Sender<DevtoolsControlMsg>>,
     sw_managers: HashMap<ImmutableOrigin, IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
-    thread_pool: Arc<CoreResourceThreadPool>,
     certificate_path: Option<String>,
 }
 
@@ -604,7 +603,6 @@ impl CoreResourceManager {
             devtools_chan: devtools_channel,
             sw_managers: Default::default(),
             filemanager: FileManager::new(embedder_proxy, Arc::downgrade(&pool_handle)),
-            thread_pool: pool_handle,
             certificate_path,
         }
     }
@@ -614,7 +612,6 @@ impl CoreResourceManager {
         // Prevents further work from being spawned on the pool,
         // blocks until all workers in the pool are done,
         // or a short timeout has been reached.
-        self.thread_pool.exit();
 
         // Shut-down the async runtime used by fetch workers.
         drop(HANDLE.lock().unwrap().take());
