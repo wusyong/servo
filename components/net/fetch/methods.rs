@@ -10,8 +10,10 @@ use crate::http_loader::{determine_requests_referrer, http_fetch, HttpState};
 use crate::http_loader::{set_default_accept, set_default_accept_language};
 use crate::subresource_integrity::is_response_integrity_valid;
 use content_security_policy as csp;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
+use futures_util::compat::*;
+use futures_util::StreamExt;
 use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt, Range};
 use http::header::{self, HeaderMap, HeaderName};
 use hyper::Method;
@@ -40,6 +42,9 @@ use std::ops::Bound;
 use std::str;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use tokio2::sync::mpsc::{
+    unbounded_channel, UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender,
+};
 
 lazy_static! {
     static ref X_CONTENT_TYPE_OPTIONS: HeaderName =
@@ -48,7 +53,7 @@ lazy_static! {
 
 pub type Target<'a> = &'a mut (dyn FetchTaskTarget + Send);
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub enum Data {
     Payload(Vec<u8>),
     Done,
@@ -93,7 +98,7 @@ impl CancellationListener {
         }
     }
 }
-pub type DoneChannel = Option<(Sender<Data>, Receiver<Data>)>;
+pub type DoneChannel = Option<(TokioSender<Data>, TokioReceiver<Data>)>;
 
 /// [Fetch](https://fetch.spec.whatwg.org#concept-fetch)
 pub async fn fetch(request: &mut Request, target: Target<'_>, context: &FetchContext) {
@@ -513,25 +518,19 @@ async fn wait_for_response(
     target: Target<'_>,
     done_chan: &mut DoneChannel,
 ) {
-    if let Some(ref ch) = *done_chan {
+    if let Some(ref mut ch) = *done_chan {
         loop {
-            match ch.1.try_recv() {
-                Ok(Data::Payload(vec)) => {
+            match ch.1.next().await {
+                Some(Data::Payload(vec)) => {
                     target.process_response_chunk(vec);
                 },
-                Ok(Data::Done) => break,
-                Ok(Data::Cancelled) => {
+                Some(Data::Done) => break,
+                Some(Data::Cancelled) => {
                     response.aborted.store(true, Ordering::Release);
                     break;
                 },
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // empty recv, wait for more data
-                    tokio2::task::yield_now().await;
-                    continue;
-                },
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                _ => {
                     panic!("fetch worker should always send Done before terminating");
-                    break;
                 },
             }
         }
@@ -745,12 +744,13 @@ async fn scheme_fetch(
 
                     // Setup channel to receive cross-thread messages about the file fetch
                     // operation.
-                    let (done_sender, done_receiver) = unbounded();
+                    let (mut done_sender, done_receiver) = unbounded_channel();
                     *done_chan = Some((done_sender.clone(), done_receiver));
+
                     *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
 
                     context.filemanager.lock().unwrap().fetch_file_in_chunks(
-                        done_sender,
+                        &mut done_sender,
                         reader,
                         response.body.clone(),
                         context.cancellation_listener.clone(),
@@ -800,12 +800,12 @@ async fn scheme_fetch(
                 partial_content(&mut response);
             }
 
-            let (done_sender, done_receiver) = unbounded();
+            let (mut done_sender, done_receiver) = unbounded_channel();
             *done_chan = Some((done_sender.clone(), done_receiver));
             *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
 
             if let Err(err) = context.filemanager.lock().unwrap().fetch_file(
-                &done_sender,
+                &mut done_sender,
                 context.cancellation_listener.clone(),
                 id,
                 &context.file_token,

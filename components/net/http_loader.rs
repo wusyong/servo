@@ -69,7 +69,9 @@ use std::sync::{Arc as StdArc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use time::{self, Tm};
 use tokio::prelude::{Sink, Stream};
-use tokio::sync::mpsc::{channel, Receiver as TokioReceiver, Sender as TokioSender};
+use tokio2::sync::mpsc::{
+    channel, unbounded_channel, Receiver as TokioReceiver, Sender as TokioSender,
+};
 use tokio_compat::runtime::{Builder, Runtime};
 
 lazy_static! {
@@ -439,7 +441,7 @@ enum BodyChunk {
 enum BodyStream {
     /// A receiver that can be used in Body::wrap_stream,
     /// for streaming the request over the network.
-    Chunked(TokioReceiver<Vec<u8>>),
+    Chunked(TokioReceiver<Result<Vec<u8>, String>>),
     /// A body whose bytes are buffered
     /// and sent in one chunk over the network.
     Buffered(Receiver<BodyChunk>),
@@ -449,7 +451,7 @@ enum BodyStream {
 /// used to enqueue chunks.
 enum BodySink {
     /// A Tokio sender used to feed chunks to the network stream.
-    Chunked(TokioSender<Vec<u8>>),
+    Chunked(TokioSender<Result<Vec<u8>, String>>),
     /// A Crossbeam sender used to send chunks to the fetch worker,
     /// where they will be buffered
     /// in order to ensure they are not streamed them over the network.
@@ -457,16 +459,19 @@ enum BodySink {
 }
 
 impl BodySink {
-    pub fn transmit_bytes(&self, bytes: Vec<u8>) {
+    pub fn transmit_bytes(&mut self, bytes: Vec<u8>) {
+        use futures_util::FutureExt;
         match self {
-            BodySink::Chunked(ref sender) => {
-                let sender = sender.clone();
+            BodySink::Chunked(ref mut sender) => {
+                let mut sender = sender.clone();
                 HANDLE
                     .lock()
                     .unwrap()
                     .as_mut()
                     .unwrap()
-                    .spawn(sender.send(bytes).map(|_| ()).map_err(|_| ()));
+                    .spawn_std(async move {
+                        let _ = sender.send(Ok(bytes)).await;
+                    });
             },
             BodySink::Buffered(ref sender) => {
                 let _ = sender.send(BodyChunk::Chunk(bytes));
@@ -476,20 +481,7 @@ impl BodySink {
 
     pub fn close(&self) {
         match self {
-            BodySink::Chunked(ref sender) => {
-                let mut sender = sender.clone();
-                HANDLE
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .unwrap()
-                    .spawn(tokio::prelude::future::lazy(move || {
-                        if sender.close().is_err() {
-                            warn!("Failed to close network request sink.");
-                        }
-                        Ok(())
-                    }));
-            },
+            BodySink::Chunked(ref _sender) => {},
             BodySink::Buffered(ref sender) => {
                 let _ = sender.send(BodyChunk::Done);
             },
@@ -525,7 +517,7 @@ async fn obtain_response(
             .replace("}", "%7D");
 
         let request = if let Some(chunk_requester) = body {
-            let (sink, stream) = if source_is_null {
+            let (mut sink, stream) = if source_is_null {
                 // Step 4.2 of https://fetch.spec.whatwg.org/#concept-http-network-fetch
                 // TODO: this should not be set for HTTP/2(currently not supported?).
                 request_headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
@@ -559,7 +551,7 @@ async fn obtain_response(
             ROUTER.add_route(
                 body_port.to_opaque(),
                 Box::new(move |message| {
-                    let fetch_terminated2 = fetch_terminated.clone();
+                    let mut fetch_terminated2 = fetch_terminated.clone();
                     let bytes: Vec<u8> = match message.to().unwrap() {
                         BodyChunkResponse::Chunk(bytes) => bytes,
                         BodyChunkResponse::Done => {
@@ -594,7 +586,10 @@ async fn obtain_response(
             );
 
             let body = match stream {
-                BodyStream::Chunked(receiver) => Body::wrap_stream(receiver),
+                BodyStream::Chunked(receiver) => {
+                    let receiver = Compat::new(receiver);
+                    Body::wrap_stream(receiver)
+                },
                 BodyStream::Buffered(receiver) => {
                     // Accumulate bytes received over IPC into a vector.
                     let mut body = vec![];
@@ -1415,26 +1410,27 @@ async fn http_network_or_cache_fetch(
         }
     }
 
-    fn wait_for_cached_response(done_chan: &mut DoneChannel, response: &mut Option<Response>) {
-        if let Some(ref ch) = *done_chan {
+    async fn wait_for_cached_response(
+        done_chan: &mut DoneChannel,
+        response: &mut Option<Response>,
+    ) {
+        if let Some(ref mut ch) = *done_chan {
             // The cache constructed a response with a body of ResponseBody::Receiving.
             // We wait for the response in the cache to "finish",
             // with a body of either Done or Cancelled.
             assert!(response.is_some());
+
             loop {
-                match ch
-                    .1
-                    .recv()
-                    .expect("HTTP cache should always send Done or Cancelled")
-                {
-                    Data::Payload(_) => {},
-                    Data::Done => break, // Return the full response as if it was initially cached as such.
-                    Data::Cancelled => {
+                match ch.1.next().await {
+                    Some(Data::Payload(_)) => {},
+                    Some(Data::Done) => break, // Return the full response as if it was initially cached as such.
+                    Some(Data::Cancelled) => {
                         // The response was cancelled while the fetch was ongoing.
                         // Set response to None, which will trigger a network fetch below.
                         *response = None;
                         break;
                     },
+                    _ => panic!("HTTP cache should always send Done or Cancelled"),
                 }
             }
         }
@@ -1442,7 +1438,7 @@ async fn http_network_or_cache_fetch(
         *done_chan = None;
     }
 
-    wait_for_cached_response(done_chan, &mut response);
+    wait_for_cached_response(done_chan, &mut response).await;
 
     // Step 6
     // TODO: https://infra.spec.whatwg.org/#if-aborted
@@ -1484,8 +1480,8 @@ async fn http_network_or_cache_fetch(
                 // since the network response will be replaced by the revalidated stored one.
                 *done_chan = None;
                 response = http_cache.refresh(&http_request, forward_response.clone(), done_chan);
-                wait_for_cached_response(done_chan, &mut response);
             }
+            wait_for_cached_response(done_chan, &mut response).await;
         }
 
         // Substep 5
@@ -1714,7 +1710,7 @@ async fn http_network_fetch(
     let is_xhr = request.destination == Destination::None;
 
     // The receiver will receive true if there has been an error streaming the request body.
-    let (fetch_terminated_sender, fetch_terminated_receiver) = channel(1);
+    let (fetch_terminated_sender, mut fetch_terminated_receiver) = channel(1);
 
     let body = request.body.as_ref().map(|body| body.take_stream());
 
@@ -1723,7 +1719,7 @@ async fn http_network_fetch(
         // However in such a case the channel will remain unused
         // and drop inside `obtain_response`.
         // Send the confirmation now, ensuring the receiver will not dis-connect first.
-        let _ = fetch_terminated_sender.clone().send(false).compat().await;
+        let _ = fetch_terminated_sender.clone().send(false).await;
     }
 
     let response_future = obtain_response(
@@ -1760,13 +1756,13 @@ async fn http_network_fetch(
 
     // Check if there was an error while streaming the request body.
     //
-    match fetch_terminated_receiver.compat().next().await {
-        Some(Ok(true)) => {
+    match fetch_terminated_receiver.next().await {
+        Some(true) => {
             return Response::network_error(NetworkError::Internal(
                 "Request body streaming failed.".into(),
             ));
         },
-        Some(Ok(false)) => {},
+        Some(false) => {},
         _ => warn!("Failed to receive confirmation request was streamed without error."),
     }
 
@@ -1817,7 +1813,7 @@ async fn http_network_fetch(
     let res_body = response.body.clone();
 
     // We're about to spawn a future to be waited on here
-    let (done_sender, done_receiver) = unbounded();
+    let (done_sender, done_receiver) = unbounded_channel();
     *done_chan = Some((done_sender.clone(), done_receiver));
     let meta = match response
         .metadata()
@@ -1868,15 +1864,16 @@ async fn http_network_fetch(
         res.into_body()
             .map_err(|_| ())
             .fold(res_body, move |res_body, chunk| {
+                let done_sender1 = done_sender.clone();
                 if cancellation_listener.lock().unwrap().cancelled() {
                     *res_body.lock().unwrap() = ResponseBody::Done(vec![]);
-                    let _ = done_sender.send(Data::Cancelled);
+                    let _ = done_sender1.send(Data::Cancelled);
                     return tokio::prelude::future::failed(());
                 }
                 if let ResponseBody::Receiving(ref mut body) = *res_body.lock().unwrap() {
                     let bytes = chunk.into_bytes();
                     body.extend_from_slice(&*bytes);
-                    let _ = done_sender.send(Data::Payload(bytes.to_vec()));
+                    let _ = done_sender1.send(Data::Payload(bytes.to_vec()));
                 }
                 tokio::prelude::future::ok(res_body)
             })
