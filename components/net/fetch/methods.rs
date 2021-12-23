@@ -520,7 +520,7 @@ async fn wait_for_response(
 ) {
     if let Some(ref mut ch) = *done_chan {
         loop {
-            match ch.1.next().await {
+            match ch.1.recv().await {
                 Some(Data::Payload(vec)) => {
                     target.process_response_chunk(vec);
                 },
