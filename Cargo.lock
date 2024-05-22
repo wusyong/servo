@@ -670,6 +670,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "servo_config",
+ "servo_runtime",
  "sparkle",
  "style",
  "time 0.1.45",
@@ -5590,6 +5591,16 @@ dependencies = [
  "rand_core",
  "rand_isaac",
  "uuid",
+]
+
+[[package]]
+name = "servo_runtime"
+version = "0.0.1"
+dependencies = [
+ "crossbeam-channel",
+ "ipc-channel",
+ "serde",
+ "servo_config",
 ]
 
 [[package]]
