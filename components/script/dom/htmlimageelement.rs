@@ -20,10 +20,9 @@ use ipc_channel::router::ROUTER;
 use js::jsapi::JSAutoRealm;
 use js::rust::HandleObject;
 use mime::{self, Mime};
-use net_traits::image::base::{Image, ImageMetadata};
 use net_traits::image_cache::{
-    CorsStatus, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse,
-    PendingImageId, PendingImageResponse, UsePlaceholder,
+    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse, PendingImageId,
+    PendingImageResponse, UsePlaceholder,
 };
 use net_traits::request::{CorsSettings, Destination, Initiator, Referrer, RequestBuilder};
 use net_traits::{
@@ -31,6 +30,7 @@ use net_traits::{
     ResourceFetchTiming, ResourceTimingType,
 };
 use num_traits::ToPrimitive;
+use pixels::{CorsStatus, Image, ImageMetadata};
 use servo_url::origin::{ImmutableOrigin, MutableOrigin};
 use servo_url::ServoUrl;
 use style::attr::{
@@ -670,7 +670,8 @@ impl HTMLImageElement {
     ) -> Au {
         let document = document_from_node(self);
         let quirks_mode = document.quirks_mode();
-        document.with_device(move |device| source_size_list.evaluate(device, quirks_mode))
+        let result = source_size_list.evaluate(document.window().layout().device(), quirks_mode);
+        result
     }
 
     /// <https://html.spec.whatwg.org/multipage/#matches-the-environment>
@@ -696,7 +697,8 @@ impl HTMLImageElement {
         let mut parserInput = ParserInput::new(&media_query);
         let mut parser = Parser::new(&mut parserInput);
         let media_list = MediaList::parse(&context, &mut parser);
-        document.with_device(move |device| media_list.evaluate(device, quirks_mode))
+        let result = media_list.evaluate(document.window().layout().device(), quirks_mode);
+        result
     }
 
     /// <https://html.spec.whatwg.org/multipage/#normalise-the-source-densities>
