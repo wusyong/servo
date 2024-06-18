@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::slice;
 
 use dom_struct::dom_struct;
+use js::gc::MutableHandleValue;
 use js::glue::{
     CreateReadableStreamUnderlyingSource, DeleteReadableStreamUnderlyingSource,
     ReadableStreamUnderlyingSourceTraps,
@@ -24,17 +25,21 @@ use js::jsapi::{
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
 
-use super::bindings::import::module::Fallible;
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
-use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::UnderlyingSource;
+use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
+    ReadableStreamController, UnderlyingSource, UnderlyingSourceStartCallback,
+};
 use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
 use crate::dom::bindings::error::Error;
+use crate::dom::bindings::import::module::Fallible;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::settings_stack::{AutoEntryScript, AutoIncumbentScript};
 use crate::dom::bindings::utils::get_dictionary_property;
+use crate::dom::countqueuingstrategy::{extract_high_water_mark, extract_size_algorithm};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
+use crate::dom::readablestreamdefaultcontroller::setup_readable_stream_default_controller_from_underlying_source;
 use crate::js::conversions::FromJSValConvertible;
 use crate::realms::{enter_realm, InRealm};
 use crate::script_runtime::JSContext as SafeJSContext;
@@ -71,9 +76,9 @@ impl ReadableStream {
         underlying_source: Option<*mut JSObject>,
         strategy: &QueuingStrategy,
     ) -> Fallible<DomRoot<Self>> {
-        // Step 1.
+        // Step 1
         rooted!(in(*cx) let underlying_source_obj = underlying_source.unwrap_or(ptr::null_mut()));
-        // Step 2.
+        // Step 2
         let underlying_source_dict = if !underlying_source_obj.is_null() {
             rooted!(in(*cx) let obj_val = ObjectValue(underlying_source_obj.get()));
             match UnderlyingSource::new(cx, obj_val.handle()) {
@@ -89,8 +94,29 @@ impl ReadableStream {
             UnderlyingSource::empty()
         };
 
-        // Step 3.
-        let stream = ReadableStream::new(global, None);
+        // Step 3
+        let readable_stream = ReadableStream::new(global, None);
+
+        // Step 4
+        if underlying_source_dict.type_.is_some() {
+        } else {
+            // Step 5.1 (implicit in above check)
+            // Step 5.2
+            let size_algorithm = extract_size_algorithm(strategy);
+
+            // Step 5.3
+            let highwatermark = extract_high_water_mark(strategy, 1.0)?;
+
+            // Step 5.4.
+            setup_readable_stream_default_controller_from_underlying_source(
+                cx,
+                readable_stream,
+                underlying_source_obj.handle(),
+                underlying_source_dict,
+                highwatermark,
+                size_algorithm,
+            )?;
+        }
         todo!()
     }
 
@@ -350,6 +376,67 @@ impl ReadableStream {
         locked_or_disturbed
     }
 }
+
+pub trait UnderlyingSourceAlgorithmsBase {
+    fn start(
+        &self,
+        cx: SafeJSContext,
+        controller: ReadableStreamController,
+        retval: MutableHandleValue,
+    ) -> Fallible<()>;
+
+    fn pull(
+        &self,
+        cx: SafeJSContext,
+        controller: ReadableStreamController,
+    ) -> Fallible<Rc<Promise>>;
+
+    fn cancel(&self, cx: SafeJSContext, reason: Option<HandleValue>) -> Fallible<Rc<Promise>>;
+}
+
+// impl UnderlyingSourceStartCallback {
+//     pub fn call(
+//         &self,
+//         aThisObj: HandleObject,
+//         controller: UnionTypes::ReadableStreamController,
+//         aExceptionHandling: ExceptionHandling,
+//     ) -> Fallible<JSVal> {
+//         let s = CallSetup::new(self, aExceptionHandling);
+//         let cx = s.get_cx();
+//         rooted!(in(*cx) let mut rval = UndefinedValue());
+//         rooted_vec!(let mut argv);
+//         argv.extend((0..1).map(|_| Heap::default()));
+//
+//         let argc = 1;
+//
+//         rooted!(in(*cx) let mut argv_root = UndefinedValue());
+//         (controller).to_jsval(*cx, argv_root.handle_mut());
+//         {
+//             let arg = &mut argv[0];
+//             *arg = Heap::default();
+//             arg.set(argv_root.get());
+//         }
+//
+//         rooted!(in(*cx) let callable = ObjectValue(self.callback()));
+//         rooted!(in(*cx) let rootedThis = aThisObj.get());
+//         let ok = JS_CallFunctionValue(
+//             *cx,
+//             rootedThis.handle(),
+//             callable.handle(),
+//             &HandleValueArray {
+//                 length_: argc as ::libc::size_t,
+//                 elements_: argv.as_ptr() as *const JSVal,
+//             },
+//             rval.handle_mut(),
+//         );
+//         maybe_resume_unwind();
+//         if !ok {
+//             return Err(JSFailed);
+//         }
+//         let rvalDecl: HandleValue = rval.handle();
+//         Ok(rvalDecl.get())
+//     }
+// }
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn request_data(
