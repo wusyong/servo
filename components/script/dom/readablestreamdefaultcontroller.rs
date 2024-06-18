@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use std::rc::Rc;
+
 use dom_struct::dom_struct;
 use js::jsapi::{
     AutoRequireNoGC, HandleObject, HandleValue, Heap, IsReadableStream, JSContext, JSObject,
@@ -9,6 +11,9 @@ use js::jsapi::{
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
 
+use super::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategySize;
+use super::bindings::codegen::Bindings::UnderlyingSourceBinding::UnderlyingSource;
+use super::readablestream::ReadableStream;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultControllerBinding::ReadableStreamDefaultControllerMethods;
 use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
 use crate::dom::bindings::error::Error;
@@ -48,7 +53,15 @@ impl ReadableStreamDefaultControllerMethods for ReadableStreamDefaultController 
 }
 
 /// <https://streams.spec.whatwg.org/#set-up-readable-stream-default-controller-from-underlying-source>
-pub fn setup_readable_stream_default_controller_from_underlying_source() {}
+pub fn setup_readable_stream_default_controller_from_underlying_source(
+    stream: &ReadableStream,
+    underlying_source: Option<*mut JSObject>,
+    underlying_source_dict: &UnderlyingSource,
+    high_water_mark: f64,
+    size_algorithm: Rc<QueuingStrategySize>,
+) {
+    todo!()
+}
 
 /// <https://streams.spec.whatwg.org/#set-up-readable-stream-default-controller>
 fn SetUpReadableStreamDefaultController() {}

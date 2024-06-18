@@ -26,6 +26,7 @@ use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
 
 use super::bindings::import::module::Fallible;
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
+use crate::dom::bindings::codegen::Bindings::ReadableStreamBinding::ReadableStreamType;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::UnderlyingSource;
 use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
 use crate::dom::bindings::error::Error;
@@ -33,8 +34,11 @@ use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::settings_stack::{AutoEntryScript, AutoIncumbentScript};
 use crate::dom::bindings::utils::get_dictionary_property;
+use crate::dom::countqueuingstrategy::{extract_high_water_mark, extract_size_algorithm};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
+use crate::dom::readablebytestreamcontroller::setup_readable_byte_stream_controller_from_underlying_source;
+use crate::dom::readablestreamdefaultcontroller::setup_readable_stream_default_controller_from_underlying_source;
 use crate::js::conversions::FromJSValConvertible;
 use crate::realms::{enter_realm, InRealm};
 use crate::script_runtime::JSContext as SafeJSContext;
@@ -91,7 +95,36 @@ impl ReadableStream {
 
         // Step 3.
         let stream = ReadableStream::new(global, None);
-        todo!()
+
+        if underlying_source_dict.type_ == Some(ReadableStreamType::Bytes) {
+            // Step 4.
+            if strategy.size.is_some() {
+                return Err(Error::Range(
+                    "Queuing strategy size is not supported for byte streams.".to_string(),
+                ));
+            }
+            let high_water_mark = extract_high_water_mark(&strategy, 0.0)?;
+            setup_readable_byte_stream_controller_from_underlying_source(
+                &stream,
+                underlying_source,
+                &underlying_source_dict,
+                high_water_mark,
+            );
+        } else {
+            // Step 5.
+            assert_eq!(underlying_source_dict.type_, None);
+            let size_algorithm = extract_size_algorithm(&strategy);
+            let high_water_mark = extract_high_water_mark(&strategy, 1.0)?;
+            setup_readable_stream_default_controller_from_underlying_source(
+                &stream,
+                underlying_source,
+                &underlying_source_dict,
+                high_water_mark,
+                size_algorithm.clone(),
+            );
+        }
+
+        Ok(stream)
     }
 
     fn new_inherited(

@@ -9,6 +9,8 @@ use js::jsapi::{
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
 
+use super::bindings::codegen::Bindings::UnderlyingSourceBinding::UnderlyingSource;
+use super::readablestream::ReadableStream;
 use crate::dom::bindings::codegen::Bindings::ReadableByteStreamControllerBinding::ReadableByteStreamControllerMethods;
 use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
 use crate::dom::bindings::error::Error;
@@ -54,4 +56,14 @@ impl ReadableByteStreamControllerMethods for ReadableByteStreamController {
     fn Error(&self, cx: SafeJSContext, e: SafeHandleValue) -> Fallible<()> {
         todo!()
     }
+}
+
+/// <https://streams.spec.whatwg.org/#set-up-readable-byte-stream-controller-from-underlying-source>
+pub fn setup_readable_byte_stream_controller_from_underlying_source(
+    stream: &ReadableStream,
+    underlying_source: Option<*mut JSObject>,
+    underlying_source_dict: &UnderlyingSource,
+    high_water_mark: f64,
+) {
+    todo!()
 }
