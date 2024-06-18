@@ -23,6 +23,7 @@ use crate::js::conversions::FromJSValConvertible;
 use crate::realms::{enter_realm, InRealm};
 use crate::script_runtime::JSContext as SafeJSContext;
 
+/// <https://streams.spec.whatwg.org/#rs-default-controller-class-definition>
 #[dom_struct]
 pub struct ReadableStreamDefaultController {
     reflector_: Reflector,
@@ -45,3 +46,9 @@ impl ReadableStreamDefaultControllerMethods for ReadableStreamDefaultController 
         todo!()
     }
 }
+
+/// <https://streams.spec.whatwg.org/#set-up-readable-stream-default-controller-from-underlying-source>
+pub fn setup_readable_stream_default_controller_from_underlying_source() {}
+
+/// <https://streams.spec.whatwg.org/#set-up-readable-stream-default-controller>
+fn SetUpReadableStreamDefaultController() {}

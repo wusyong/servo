@@ -71,9 +71,9 @@ impl ReadableStream {
         underlying_source: Option<*mut JSObject>,
         strategy: &QueuingStrategy,
     ) -> Fallible<DomRoot<Self>> {
-        // Step 1
+        // Step 1.
         rooted!(in(*cx) let underlying_source_obj = underlying_source.unwrap_or(ptr::null_mut()));
-        // Step 2
+        // Step 2.
         let underlying_source_dict = if !underlying_source_obj.is_null() {
             rooted!(in(*cx) let obj_val = ObjectValue(underlying_source_obj.get()));
             match UnderlyingSource::new(cx, obj_val.handle()) {
@@ -88,6 +88,9 @@ impl ReadableStream {
         } else {
             UnderlyingSource::empty()
         };
+
+        // Step 3.
+        let stream = ReadableStream::new(global, None);
         todo!()
     }
 
