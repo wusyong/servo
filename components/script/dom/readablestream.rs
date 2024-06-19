@@ -9,7 +9,6 @@ use std::rc::Rc;
 use std::slice;
 
 use dom_struct::dom_struct;
-use js::gc::MutableHandleValue;
 use js::glue::{
     CreateReadableStreamUnderlyingSource, DeleteReadableStreamUnderlyingSource,
     ReadableStreamUnderlyingSourceTraps,
@@ -25,9 +24,10 @@ use js::jsapi::{
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
 
+use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
-    ReadableStreamController, UnderlyingSource, UnderlyingSourceStartCallback,
+    ReadableStreamController, UnderlyingSource,
 };
 use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
 use crate::dom::bindings::error::Error;
@@ -64,6 +64,9 @@ pub struct ReadableStream {
     has_reader: Cell<bool>,
     #[ignore_malloc_size_of = "Rc is hard"]
     external_underlying_source: Option<Rc<ExternalUnderlyingSourceController>>,
+    /// A [ReadableStreamDefaultController] or [ReadableByteStreamController]
+    /// created with the ability to control the state and queue of this stream.
+    controller: DomRefCell<Option<ReadableStreamController>>,
 }
 
 impl ReadableStream {
@@ -129,6 +132,7 @@ impl ReadableStream {
             js_reader: Heap::default(),
             has_reader: Default::default(),
             external_underlying_source,
+            controller: Default::default(),
         }
     }
 
@@ -375,68 +379,15 @@ impl ReadableStream {
 
         locked_or_disturbed
     }
+
+    pub fn set_controller(&self, controller: ReadableStreamController) {
+        *self.controller.borrow_mut() = Some(controller);
+    }
+
+    pub fn controller(&'_ self) -> std::cell::Ref<'_, Option<ReadableStreamController>> {
+        self.controller.borrow()
+    }
 }
-
-pub trait UnderlyingSourceAlgorithmsBase {
-    fn start(
-        &self,
-        cx: SafeJSContext,
-        controller: ReadableStreamController,
-        retval: MutableHandleValue,
-    ) -> Fallible<()>;
-
-    fn pull(
-        &self,
-        cx: SafeJSContext,
-        controller: ReadableStreamController,
-    ) -> Fallible<Rc<Promise>>;
-
-    fn cancel(&self, cx: SafeJSContext, reason: Option<HandleValue>) -> Fallible<Rc<Promise>>;
-}
-
-// impl UnderlyingSourceStartCallback {
-//     pub fn call(
-//         &self,
-//         aThisObj: HandleObject,
-//         controller: UnionTypes::ReadableStreamController,
-//         aExceptionHandling: ExceptionHandling,
-//     ) -> Fallible<JSVal> {
-//         let s = CallSetup::new(self, aExceptionHandling);
-//         let cx = s.get_cx();
-//         rooted!(in(*cx) let mut rval = UndefinedValue());
-//         rooted_vec!(let mut argv);
-//         argv.extend((0..1).map(|_| Heap::default()));
-//
-//         let argc = 1;
-//
-//         rooted!(in(*cx) let mut argv_root = UndefinedValue());
-//         (controller).to_jsval(*cx, argv_root.handle_mut());
-//         {
-//             let arg = &mut argv[0];
-//             *arg = Heap::default();
-//             arg.set(argv_root.get());
-//         }
-//
-//         rooted!(in(*cx) let callable = ObjectValue(self.callback()));
-//         rooted!(in(*cx) let rootedThis = aThisObj.get());
-//         let ok = JS_CallFunctionValue(
-//             *cx,
-//             rootedThis.handle(),
-//             callable.handle(),
-//             &HandleValueArray {
-//                 length_: argc as ::libc::size_t,
-//                 elements_: argv.as_ptr() as *const JSVal,
-//             },
-//             rval.handle_mut(),
-//         );
-//         maybe_resume_unwind();
-//         if !ok {
-//             return Err(JSFailed);
-//         }
-//         let rvalDecl: HandleValue = rval.handle();
-//         Ok(rvalDecl.get())
-//     }
-// }
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn request_data(
@@ -664,6 +615,15 @@ pub fn get_read_promise_bytes(cx: SafeJSContext, v: &SafeHandleValue) -> Result<
             },
             Ok(false) => Err(Error::Type("Promise has no value property.".to_string())),
             Err(()) => Err(Error::JSFailed),
+        }
+    }
+}
+
+impl malloc_size_of::MallocSizeOf for ReadableStreamController {
+    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        match self {
+            ReadableStreamController::ReadableStreamDefaultController(c) => c.size_of(ops),
+            ReadableStreamController::ReadableByteStreamController(c) => c.size_of(ops),
         }
     }
 }
