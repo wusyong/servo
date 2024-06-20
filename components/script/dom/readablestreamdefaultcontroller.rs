@@ -20,11 +20,11 @@ use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
 };
 use crate::dom::bindings::import::module::{ExceptionHandling, Fallible, InRealm};
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
-use crate::dom::readablestream::ReadableStream;
+use crate::dom::readablestream::{ReadableStream, StreamState};
 use crate::realms::enter_realm;
 use crate::script_runtime::JSContext as SafeJSContext;
 
@@ -54,8 +54,8 @@ pub struct ReadableStreamDefaultController {
     /// If missing use default value (1) per https://streams.spec.whatwg.org/#make-size-algorithm-from-size-function
     #[ignore_malloc_size_of = "Rc is hard"]
     strategy_size_algorithm: Rc<QueuingStrategySize>,
-    // /// The ReadableStream instance controlled
-    // stream: MutNullableDom<ReadableStream>,
+    /// The ReadableStream instance controlled
+    stream: MutNullableDom<ReadableStream>,
 }
 
 impl ReadableStreamDefaultController {
@@ -70,6 +70,7 @@ impl ReadableStreamDefaultController {
             strategy_highwatermark: Cell::new(0.),
             algorithms,
             strategy_size_algorithm: size,
+            stream: MutNullableDom::default(),
         }
     }
 
@@ -335,4 +336,45 @@ impl UnderlyingSourceAlgorithms {
             )
         }
     }
+}
+
+/// <https://streams.spec.whatwg.org/#readable-stream-default-controller-call-pull-if-needed>
+fn readable_stream_default_controller_call_pull_if_needed(
+    controller: DomRoot<ReadableStreamDefaultController>,
+) {
+    let should_pull = readable_stream_default_controller_should_call_pull(controller);
+    todo!()
+}
+
+/// <https://streams.spec.whatwg.org/#readable-stream-default-controller-should-call-pull>
+fn readable_stream_default_controller_should_call_pull(
+    controller: DomRoot<ReadableStreamDefaultController>,
+) -> bool {
+    let stream = controller.stream.get();
+    if !readable_stream_default_controller_should_call_pull(controller.clone()) {
+        return false;
+    }
+    if !controller.started.get() {
+        return false;
+    }
+    todo!()
+}
+
+/// <https://streams.spec.whatwg.org/#readable-stream-default-controller-can-close-or-enqueue>
+fn readable_stream_default_controller_can_close_or_enqueue(
+    controller: DomRoot<ReadableStreamDefaultController>,
+) -> bool {
+    let stream: DomRoot<ReadableStream> = controller.stream.get().unwrap();
+    let state = stream.state();
+
+    if controller.close_requested.get() == false && state == StreamState::Readable {
+        return true;
+    }
+
+    false
+}
+
+/// <https://streams.spec.whatwg.org/#is-readable-stream-locked>
+fn is_readable_stream_locked(stream: DomRoot<ReadableStream>) -> bool {
+    stream.reader().is_some()
 }

@@ -11,3 +11,7 @@ interface _ReadableStream {
 };
 
 enum ReadableStreamType { "bytes" };
+
+typedef (ReadableStreamDefaultReader or ReadableStreamBYOBReader) ReadableStreamReader;
+
+enum ReadableStreamReaderMode { "byob" };

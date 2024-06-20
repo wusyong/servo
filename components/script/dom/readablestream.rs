@@ -26,6 +26,7 @@ use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
+use crate::dom::bindings::codegen::Bindings::ReadableStreamBinding::ReadableStreamReader;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
     ReadableStreamController, UnderlyingSource,
 };
@@ -69,6 +70,7 @@ pub struct ReadableStream {
     controller: DomRefCell<Option<ReadableStreamController>>,
     /// A enum containing the stream’s current state, used internally
     state: Cell<StreamState>,
+    reader: DomRefCell<Option<ReadableStreamReader>>,
 }
 
 impl ReadableStream {
@@ -136,6 +138,7 @@ impl ReadableStream {
             external_underlying_source,
             controller: Default::default(),
             state: Cell::new(StreamState::Readable),
+            reader: Default::default(),
         }
     }
 
@@ -390,6 +393,18 @@ impl ReadableStream {
     pub fn controller(&'_ self) -> std::cell::Ref<'_, Option<ReadableStreamController>> {
         self.controller.borrow()
     }
+
+    pub fn set_reader(&self, reader: ReadableStreamReader) {
+        *self.reader.borrow_mut() = Some(reader);
+    }
+
+    pub fn reader(&'_ self) -> std::cell::Ref<'_, Option<ReadableStreamReader>> {
+        self.reader.borrow()
+    }
+
+    pub fn state(&self) -> StreamState {
+        self.state.get()
+    }
 }
 
 #[allow(unsafe_code)]
@@ -627,6 +642,15 @@ impl malloc_size_of::MallocSizeOf for ReadableStreamController {
         match self {
             ReadableStreamController::ReadableStreamDefaultController(c) => c.size_of(ops),
             ReadableStreamController::ReadableByteStreamController(c) => c.size_of(ops),
+        }
+    }
+}
+
+impl malloc_size_of::MallocSizeOf for ReadableStreamReader {
+    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        match self {
+            ReadableStreamReader::ReadableStreamDefaultReader(c) => c.size_of(ops),
+            ReadableStreamReader::ReadableStreamBYOBReader(c) => c.size_of(ops),
         }
     }
 }
