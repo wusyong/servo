@@ -513,6 +513,7 @@ pub mod readablestreambyobreader;
 pub mod readablestreambyobrequest;
 pub mod readablestreamdefaultcontroller;
 pub mod readablestreamdefaultreader;
+pub mod readablestreamgenericreader;
 pub mod request;
 pub mod resizeobserver;
 pub mod resizeobserverentry;

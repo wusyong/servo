@@ -14,6 +14,7 @@ use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue}
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategySize;
+use crate::dom::bindings::codegen::Bindings::ReadableStreamBinding::ReadableStreamReader;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultControllerBinding::ReadableStreamDefaultControllerMethods;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
     ReadableStreamController, UnderlyingSource,
@@ -361,8 +362,8 @@ fn readable_stream_default_controller_should_call_pull(
         return false;
     }
     // Step 4
-    if is_readable_stream_locked(stream.clone())
-        && readable_stream_get_num_read_requests(stream.clone()) > 0
+    if is_readable_stream_locked(stream.clone()) &&
+        readable_stream_get_num_read_requests(stream.clone()) > 0
     {
         return true;
     }
@@ -387,6 +388,23 @@ fn is_readable_stream_locked(stream: DomRoot<ReadableStream>) -> bool {
     stream.reader().is_some()
 }
 
+/// <https://streams.spec.whatwg.org/#readable-stream-get-num-read-requests>
 fn readable_stream_get_num_read_requests(stream: DomRoot<ReadableStream>) -> usize {
-    todo!()
+    assert_eq!(readable_stream_has_default_reader(stream.clone()), true);
+    match stream.reader().as_ref().unwrap() {
+        ReadableStreamReader::ReadableStreamDefaultReader(reader) => reader.read_requests().len(),
+        _ => unreachable!(), // readable_stream_has_default_reader() guarantees the reader must be ReadableStreamDefaultReader
+    }
+}
+
+/// <https://streams.spec.whatwg.org/#readable-stream-has-default-reader>
+fn readable_stream_has_default_reader(stream: DomRoot<ReadableStream>) -> bool {
+    let reader = stream.reader();
+    if reader.is_none() {
+        return false;
+    }
+    match reader.as_ref().unwrap() {
+        ReadableStreamReader::ReadableStreamDefaultReader(_) => true,
+        _ => false,
+    }
 }
