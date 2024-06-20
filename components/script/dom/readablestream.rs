@@ -67,6 +67,8 @@ pub struct ReadableStream {
     /// A [ReadableStreamDefaultController] or [ReadableByteStreamController]
     /// created with the ability to control the state and queue of this stream.
     controller: DomRefCell<Option<ReadableStreamController>>,
+    /// A enum containing the stream’s current state, used internally
+    state: Cell<StreamState>,
 }
 
 impl ReadableStream {
@@ -133,6 +135,7 @@ impl ReadableStream {
             has_reader: Default::default(),
             external_underlying_source,
             controller: Default::default(),
+            state: Cell::new(StreamState::Readable),
         }
     }
 
@@ -626,4 +629,13 @@ impl malloc_size_of::MallocSizeOf for ReadableStreamController {
             ReadableStreamController::ReadableByteStreamController(c) => c.size_of(ops),
         }
     }
+}
+
+/// Stream’s state, used internally;
+#[derive(Clone, Copy, Debug, Default, JSTraceable, MallocSizeOf, PartialEq)]
+pub enum StreamState {
+    #[default]
+    Readable,
+    Closed,
+    Errored,
 }
