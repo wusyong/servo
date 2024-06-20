@@ -350,12 +350,21 @@ fn readable_stream_default_controller_call_pull_if_needed(
 fn readable_stream_default_controller_should_call_pull(
     controller: DomRoot<ReadableStreamDefaultController>,
 ) -> bool {
-    let stream = controller.stream.get();
-    if !readable_stream_default_controller_should_call_pull(controller.clone()) {
+    // Step 1
+    let stream: DomRoot<ReadableStream> = controller.stream.get().unwrap();
+    // Step 2
+    if !readable_stream_default_controller_can_close_or_enqueue(controller.clone()) {
         return false;
     }
+    // Step 3
     if !controller.started.get() {
         return false;
+    }
+    // Step 4
+    if is_readable_stream_locked(stream.clone())
+        && readable_stream_get_num_read_requests(stream.clone()) > 0
+    {
+        return true;
     }
     todo!()
 }
@@ -370,11 +379,14 @@ fn readable_stream_default_controller_can_close_or_enqueue(
     if controller.close_requested.get() == false && state == StreamState::Readable {
         return true;
     }
-
     false
 }
 
 /// <https://streams.spec.whatwg.org/#is-readable-stream-locked>
 fn is_readable_stream_locked(stream: DomRoot<ReadableStream>) -> bool {
     stream.reader().is_some()
+}
+
+fn readable_stream_get_num_read_requests(stream: DomRoot<ReadableStream>) -> usize {
+    todo!()
 }
