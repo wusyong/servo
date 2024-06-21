@@ -195,7 +195,7 @@ fn set_up_readable_stream_default_controller(
             // Step 11.3
             assert!(!self.controller.pull_again.get());
             // Step 11.4
-            todo!()
+            readable_stream_default_controller_call_pull_if_needed(cx, self.controller.clone());
         }
     }
 
@@ -212,7 +212,8 @@ fn set_up_readable_stream_default_controller(
 
     impl Callback for RejectHandler {
         fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, realm: InRealm) {
-            todo!()
+            // Step 12
+            readable_stream_default_controller_error(self.controller.clone(), v);
         }
     }
 
@@ -341,10 +342,85 @@ impl UnderlyingSourceAlgorithms {
 
 /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-call-pull-if-needed>
 fn readable_stream_default_controller_call_pull_if_needed(
+    cx: SafeJSContext,
     controller: DomRoot<ReadableStreamDefaultController>,
 ) {
-    let should_pull = readable_stream_default_controller_should_call_pull(controller);
-    todo!()
+    // Step 1
+    let should_pull = readable_stream_default_controller_should_call_pull(controller.clone());
+    // Step 2
+    if !should_pull {
+        return;
+    }
+    // Step 3
+    if controller.pulling.get() {
+        controller.pull_again.set(true);
+        return;
+    }
+    // Step 4
+    assert_eq!(controller.pulling.get(), false);
+    // Strp 5
+    controller.pulling.set(true);
+    // Step 6
+    let pull_promise: Rc<Promise> = controller
+        .algorithms
+        .pull(
+            cx,
+            ReadableStreamController::ReadableStreamDefaultController(controller.clone()),
+        )
+        .unwrap();
+    // Step 7 & 8
+    let global = &*controller.global();
+    let realm = enter_realm(global);
+    let comp = InRealm::Entered(&realm);
+    pull_promise.append_native_handler(
+        &PromiseNativeHandler::new(
+            global,
+            Some(ResolveHandler::new(controller.clone())),
+            Some(RejectHandler::new(controller)),
+        ),
+        comp,
+    );
+
+    #[derive(JSTraceable, MallocSizeOf)]
+    struct ResolveHandler {
+        controller: DomRoot<ReadableStreamDefaultController>,
+    }
+
+    impl ResolveHandler {
+        pub fn new(controller: DomRoot<ReadableStreamDefaultController>) -> Box<dyn Callback> {
+            Box::new(Self { controller })
+        }
+    }
+
+    impl Callback for ResolveHandler {
+        fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm) {
+            // Step 7.1
+            self.controller.pulling.set(false);
+            // Step 7.2
+            if self.controller.pull_again.get() {
+                self.controller.pull_again.set(false);
+                readable_stream_default_controller_call_pull_if_needed(cx, self.controller.clone());
+            }
+        }
+    }
+
+    #[derive(JSTraceable, MallocSizeOf)]
+    struct RejectHandler {
+        controller: DomRoot<ReadableStreamDefaultController>,
+    }
+
+    impl RejectHandler {
+        pub fn new(controller: DomRoot<ReadableStreamDefaultController>) -> Box<dyn Callback> {
+            Box::new(Self { controller })
+        }
+    }
+
+    impl Callback for RejectHandler {
+        fn callback(&self, _cx: SafeJSContext, v: SafeHandleValue, _realm: InRealm) {
+            // Step 8
+            readable_stream_default_controller_error(self.controller.clone(), v);
+        }
+    }
 }
 
 /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-should-call-pull>
@@ -367,7 +443,12 @@ fn readable_stream_default_controller_should_call_pull(
     {
         return true;
     }
-    todo!()
+    // Step 5
+    let desired_size = readable_stream_default_controller_get_desired_size(controller.clone());
+    // Step 6
+    assert_eq!(desired_size.is_some(), true);
+    // Step 7 & 8
+    desired_size.unwrap() > 0.
 }
 
 /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-can-close-or-enqueue>
@@ -376,11 +457,7 @@ fn readable_stream_default_controller_can_close_or_enqueue(
 ) -> bool {
     let stream: DomRoot<ReadableStream> = controller.stream.get().unwrap();
     let state = stream.state();
-
-    if controller.close_requested.get() == false && state == StreamState::Readable {
-        return true;
-    }
-    false
+    controller.close_requested.get() == false && state == StreamState::Readable
 }
 
 /// <https://streams.spec.whatwg.org/#is-readable-stream-locked>
@@ -407,4 +484,28 @@ fn readable_stream_has_default_reader(stream: DomRoot<ReadableStream>) -> bool {
         ReadableStreamReader::ReadableStreamDefaultReader(_) => true,
         _ => false,
     }
+}
+
+/// <https://streams.spec.whatwg.org/#readable-stream-default-controller-get-desired-size>
+fn readable_stream_default_controller_get_desired_size(
+    controller: DomRoot<ReadableStreamDefaultController>,
+) -> Option<f64> {
+    let stream: DomRoot<ReadableStream> = controller.stream.get().unwrap();
+    let state = stream.state();
+
+    if state == StreamState::Errored {
+        return None;
+    } else if state == StreamState::Closed {
+        return Some(0.);
+    }
+
+    Some(controller.strategy_highwatermark.get() - controller.queue.borrow().len() as f64)
+}
+
+/// <https://streams.spec.whatwg.org/#readable-stream-default-controller-error>
+fn readable_stream_default_controller_error(
+    _controller: DomRoot<ReadableStreamDefaultController>,
+    _e: SafeHandleValue,
+) {
+    todo!()
 }
