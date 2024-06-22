@@ -35,7 +35,7 @@ pub struct ReadableStreamDefaultController {
     /// All algoritems packed together:
     /// - Close algorithm: A promise-returning algorithm, taking one argument (the cancel reason), which communicates a requested cancelation to the underlying source
     /// - Pull algorithm: A promise-returning algorithm that pulls data from the underlying source
-    algorithms: ControllerAlgorithms,
+    algorithms: DomRefCell<Option<ControllerAlgorithms>>,
     /// A boolean flag indicating whether the stream has been closed by its underlying source, but still has chunks in its internal queue that have not yet been read
     close_requested: Cell<bool>,
     /// A boolean flag set to true if the stream’s mechanisms requested a call to the underlying source's pull algorithm to pull more data, but the pull could not yet be done since a previous call is still executing
@@ -53,17 +53,13 @@ pub struct ReadableStreamDefaultController {
     ///
     /// If missing use default value (1) per https://streams.spec.whatwg.org/#make-size-algorithm-from-size-function
     #[ignore_malloc_size_of = "Rc is hard"]
-    strategy_size_algorithm: Rc<QueuingStrategySize>,
+    strategy_size_algorithm: DomRefCell<Option<Rc<QueuingStrategySize>>>,
     /// The ReadableStream instance controlled
     stream: DomRoot<ReadableStream>,
 }
 
 impl ReadableStreamDefaultController {
-    fn new_inherited(
-        algorithms: ControllerAlgorithms,
-        size: Rc<QueuingStrategySize>,
-        stream: DomRoot<ReadableStream>,
-    ) -> Self {
+    fn new_inherited(stream: DomRoot<ReadableStream>) -> Self {
         Self {
             reflector_: Reflector::new(),
             queue: Default::default(),
@@ -72,22 +68,14 @@ impl ReadableStreamDefaultController {
             pulling: Cell::new(false),
             started: Cell::new(false),
             strategy_highwatermark: Cell::new(0.),
-            algorithms,
-            strategy_size_algorithm: size,
+            algorithms: DomRefCell::new(None),
+            strategy_size_algorithm: DomRefCell::new(None),
             stream,
         }
     }
 
-    fn new(
-        global: &GlobalScope,
-        algorithms: ControllerAlgorithms,
-        size: Rc<QueuingStrategySize>,
-        stream: DomRoot<ReadableStream>,
-    ) -> DomRoot<Self> {
-        reflect_dom_object(
-            Box::new(Self::new_inherited(algorithms, size, stream)),
-            global,
-        )
+    fn new(global: &GlobalScope, stream: DomRoot<ReadableStream>) -> DomRoot<Self> {
+        reflect_dom_object(Box::new(Self::new_inherited(stream)), global)
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-call-pull-if-needed>
@@ -175,23 +163,25 @@ pub fn setup_readable_stream_default_controller_from_underlying_source(
     let algorithms = UnderlyingSourceAlgorithms::new(underlying_source_dict, underlying_source_obj);
 
     // Step 1
-    let controller = ReadableStreamDefaultController::new(
-        &*stream.global(),
-        ControllerAlgorithms::UnderlyingSource(algorithms),
-        size_algorithm,
-        stream,
-    );
+    let controller = ReadableStreamDefaultController::new(&*stream.global(), stream);
 
     // Step 8
-    set_up_readable_stream_default_controller(cx, controller, highwatermark)
+    set_up_readable_stream_default_controller(
+        cx,
+        controller,
+        ControllerAlgorithms::UnderlyingSource(algorithms),
+        highwatermark,
+        size_algorithm,
+    )
 }
 
 /// <https://streams.spec.whatwg.org/#set-up-readable-stream-default-controller>
 fn set_up_readable_stream_default_controller(
     cx: SafeJSContext,
-    // stream: DomRoot<ReadableStream>,
     mut controller: DomRoot<ReadableStreamDefaultController>,
+    algorithms: ControllerAlgorithms,
     highwatermark: f64,
+    size_algorithm: Rc<QueuingStrategySize>,
 ) -> Fallible<()> {
     // Step 1
     assert!(controller.stream.controller().is_none());
@@ -204,9 +194,11 @@ fn set_up_readable_stream_default_controller(
     controller.pull_again.set(false);
     controller.pulling.set(false);
     // Step 5
-    // Note sizeAlgorithm is set in ReadableStreamDefaultController::new already.
+    *controller.strategy_size_algorithm.borrow_mut() = Some(size_algorithm);
     controller.strategy_highwatermark.set(highwatermark);
-    // Step 6 & 7 are done in ReadableStreamDefaultController::new already.
+    // Step 6 & 7
+    *controller.algorithms.borrow_mut() = Some(algorithms);
+    //
     // Step 8
     controller
         .stream
@@ -215,7 +207,7 @@ fn set_up_readable_stream_default_controller(
         ));
     // Step 9
     rooted!(in(*cx) let mut start_result = UndefinedValue());
-    controller.algorithms.start(
+    controller.algorithms.borrow().as_ref().unwrap().start(
         cx,
         ReadableStreamController::ReadableStreamDefaultController(controller.clone()),
         start_result.handle_mut(),
