@@ -20,11 +20,11 @@ use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
 };
 use crate::dom::bindings::import::module::{ExceptionHandling, Fallible, InRealm};
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
-use crate::dom::readablestream::ReadableStream;
+use crate::dom::readablestream::{ReadableStream, StreamState};
 use crate::realms::enter_realm;
 use crate::script_runtime::JSContext as SafeJSContext;
 
@@ -54,12 +54,16 @@ pub struct ReadableStreamDefaultController {
     /// If missing use default value (1) per https://streams.spec.whatwg.org/#make-size-algorithm-from-size-function
     #[ignore_malloc_size_of = "Rc is hard"]
     strategy_size_algorithm: Rc<QueuingStrategySize>,
-    // /// The ReadableStream instance controlled
-    // stream: MutNullableDom<ReadableStream>,
+    /// The ReadableStream instance controlled
+    stream: DomRoot<ReadableStream>,
 }
 
 impl ReadableStreamDefaultController {
-    fn new_inherited(algorithms: ControllerAlgorithms, size: Rc<QueuingStrategySize>) -> Self {
+    fn new_inherited(
+        algorithms: ControllerAlgorithms,
+        size: Rc<QueuingStrategySize>,
+        stream: DomRoot<ReadableStream>,
+    ) -> Self {
         Self {
             reflector_: Reflector::new(),
             queue: Default::default(),
@@ -70,6 +74,7 @@ impl ReadableStreamDefaultController {
             strategy_highwatermark: Cell::new(0.),
             algorithms,
             strategy_size_algorithm: size,
+            stream,
         }
     }
 
@@ -77,8 +82,65 @@ impl ReadableStreamDefaultController {
         global: &GlobalScope,
         algorithms: ControllerAlgorithms,
         size: Rc<QueuingStrategySize>,
+        stream: DomRoot<ReadableStream>,
     ) -> DomRoot<Self> {
-        reflect_dom_object(Box::new(Self::new_inherited(algorithms, size)), global)
+        reflect_dom_object(
+            Box::new(Self::new_inherited(algorithms, size, stream)),
+            global,
+        )
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-call-pull-if-needed>
+    fn call_pull_if_needed(&self) {}
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-should-call-pull>
+    fn should_call_pull(&self) -> bool {
+        // Step 1
+        let stream = &self.stream;
+        // Step 2
+        if !self.can_close_or_enqueue() {
+            false
+        // Step 3
+        } else if !self.started.get() {
+            false
+        // Step 4
+        } else if stream.is_locked() && stream.get_num_read_requests() > 0 {
+            return true;
+        // Step 5 ~ 7
+        } else if self.get_desired_size().unwrap() > 0. {
+            true
+        // Step 8
+        } else {
+            false
+        }
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-can-close-or-enqueue>
+    fn can_close_or_enqueue(&self) -> bool {
+        // Step 1
+        let state = self.stream.state();
+        // Step 2 & 3
+        if !self.close_requested.get() && state == StreamState::Readable {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-get-desired-size>
+    pub fn get_desired_size(&self) -> Option<f64> {
+        // Step 1
+        let state = self.stream.state();
+        match state {
+            // Step 2
+            StreamState::Errored => None,
+            // Step 3
+            StreamState::Closed => Some(0.),
+            // Step 4
+            StreamState::Readable => {
+                Some(self.strategy_highwatermark.get() - self.queue.borrow().len() as f64)
+            },
+        }
     }
 }
 
@@ -117,25 +179,23 @@ pub fn setup_readable_stream_default_controller_from_underlying_source(
         &*stream.global(),
         ControllerAlgorithms::UnderlyingSource(algorithms),
         size_algorithm,
+        stream,
     );
 
     // Step 8
-    set_up_readable_stream_default_controller(cx, stream, controller, highwatermark)
+    set_up_readable_stream_default_controller(cx, controller, highwatermark)
 }
 
 /// <https://streams.spec.whatwg.org/#set-up-readable-stream-default-controller>
 fn set_up_readable_stream_default_controller(
     cx: SafeJSContext,
-    stream: DomRoot<ReadableStream>,
+    // stream: DomRoot<ReadableStream>,
     mut controller: DomRoot<ReadableStreamDefaultController>,
     highwatermark: f64,
 ) -> Fallible<()> {
     // Step 1
-    assert!(stream.controller().is_none());
-    // Step 2
-    stream.set_controller(ReadableStreamController::ReadableStreamDefaultController(
-        controller.clone(),
-    ));
+    assert!(controller.stream.controller().is_none());
+    // Step 2 is done in ReadableStreamDefaultController::new already.
     // Step 3 Perform ! ResetQueue(controller).
     controller.queue.borrow_mut().clear();
     // Step 4
@@ -146,11 +206,13 @@ fn set_up_readable_stream_default_controller(
     // Step 5
     // Note sizeAlgorithm is set in ReadableStreamDefaultController::new already.
     controller.strategy_highwatermark.set(highwatermark);
-    // Step 6 & 7 are in ReadableStreamDefaultController::new already.
+    // Step 6 & 7 are done in ReadableStreamDefaultController::new already.
     // Step 8
-    stream.set_controller(ReadableStreamController::ReadableStreamDefaultController(
-        controller.clone(),
-    ));
+    controller
+        .stream
+        .set_controller(ReadableStreamController::ReadableStreamDefaultController(
+            controller.clone(),
+        ));
     // Step 9
     rooted!(in(*cx) let mut start_result = UndefinedValue());
     controller.algorithms.start(
@@ -159,7 +221,7 @@ fn set_up_readable_stream_default_controller(
         start_result.handle_mut(),
     )?;
     // Step 10
-    let global = &*stream.global();
+    let global = &*controller.stream.global();
     let realm = enter_realm(&*global);
     let comp = InRealm::Entered(&realm);
     let start_promise = Promise::new_resolved(global, cx, start_result.handle())?;
@@ -193,7 +255,7 @@ fn set_up_readable_stream_default_controller(
             // Step 11.3
             assert!(!self.controller.pull_again.get());
             // Step 11.4
-            todo!()
+            self.controller.call_pull_if_needed();
         }
     }
 

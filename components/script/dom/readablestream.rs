@@ -353,6 +353,7 @@ impl ReadableStream {
     }
 
     #[allow(unsafe_code)]
+    /// <https://streams.spec.whatwg.org/#is-readable-stream-locked>
     pub fn is_locked(&self) -> bool {
         // If we natively took a reader, we're locked.
         if self.has_reader.get() {
@@ -389,6 +390,16 @@ impl ReadableStream {
 
     pub fn controller(&'_ self) -> std::cell::Ref<'_, Option<ReadableStreamController>> {
         self.controller.borrow()
+    }
+
+    pub fn state(&self) -> StreamState {
+        self.state.get()
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-get-num-read-requests>
+    pub fn get_num_read_requests(&self) -> usize {
+        // TODO
+        0
     }
 }
 
