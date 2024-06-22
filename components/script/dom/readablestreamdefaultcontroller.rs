@@ -415,7 +415,6 @@ impl UnderlyingSourceAlgorithms {
                 ExceptionHandling::Rethrow,
             )
         } else {
-            // let global = controller.global();
             Promise::new_resolved(
                 &GlobalScope::current().expect("No current global"),
                 cx,

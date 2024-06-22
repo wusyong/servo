@@ -78,7 +78,7 @@ impl ReadableStream {
     pub fn Constructor(
         cx: SafeJSContext,
         global: &GlobalScope,
-        _proto: Option<SafeHandleObject>,
+        proto: Option<SafeHandleObject>,
         underlying_source: Option<*mut JSObject>,
         strategy: &QueuingStrategy,
     ) -> Fallible<DomRoot<Self>> {

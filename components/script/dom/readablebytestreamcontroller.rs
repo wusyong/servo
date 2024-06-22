@@ -78,8 +78,9 @@ impl ReadableByteStreamController {
         reflect_dom_object(Box::new(Self::new_inherited(stream)), global)
     }
 
-    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-should-call-pull>
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-should-call-pull>
     fn should_call_pull(&self) -> bool {
+        // TODO
         // Step 1
         let stream = &self.stream;
         // Step 2
@@ -286,7 +287,7 @@ fn set_up_readable_byte_stream_controller(
     Ok(())
 }
 
-/// <https://streams.spec.whatwg.org/#readable-stream-default-controller-call-pull-if-needed>
+/// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-call-pull-if-needed>
 fn readable_byte_stream_controller_call_pull_if_needed(
     cx: SafeJSContext,
     controller: DomRoot<ReadableByteStreamController>,
@@ -442,7 +443,6 @@ impl UnderlyingSourceAlgorithms {
                 ExceptionHandling::Rethrow,
             )
         } else {
-            // let global = controller.global();
             Promise::new_resolved(
                 &GlobalScope::current().expect("No current global"),
                 cx,
