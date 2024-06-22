@@ -2,14 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use std::cell::{Cell, OnceCell};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::gc::MutableHandleValue;
 use js::jsapi::{HandleValue, Heap, JSObject};
-use js::jsval::{JSVal, ObjectValue, UndefinedValue};
+use js::jsval::{JSVal, UndefinedValue};
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue};
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -20,7 +20,7 @@ use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
 };
 use crate::dom::bindings::import::module::{ExceptionHandling, Fallible, InRealm};
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
-use crate::dom::bindings::root::{Dom, DomRoot};
+use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
@@ -180,7 +180,7 @@ pub fn setup_readable_stream_default_controller_from_underlying_source(
 /// <https://streams.spec.whatwg.org/#set-up-readable-stream-default-controller>
 fn set_up_readable_stream_default_controller(
     cx: SafeJSContext,
-    mut controller: DomRoot<ReadableStreamDefaultController>,
+    controller: DomRoot<ReadableStreamDefaultController>,
     algorithms: ControllerAlgorithms,
     highwatermark: f64,
     size_algorithm: Rc<QueuingStrategySize>,

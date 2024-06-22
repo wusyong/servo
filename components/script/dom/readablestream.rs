@@ -39,6 +39,7 @@ use crate::dom::bindings::utils::get_dictionary_property;
 use crate::dom::countqueuingstrategy::{extract_high_water_mark, extract_size_algorithm};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
+use crate::dom::readablebytestreamcontroller::setup_readable_byte_stream_controller_from_underlying_source;
 use crate::dom::readablestreamdefaultcontroller::setup_readable_stream_default_controller_from_underlying_source;
 use crate::js::conversions::FromJSValConvertible;
 use crate::realms::{enter_realm, InRealm};
@@ -77,7 +78,7 @@ impl ReadableStream {
     pub fn Constructor(
         cx: SafeJSContext,
         global: &GlobalScope,
-        proto: Option<SafeHandleObject>,
+        _proto: Option<SafeHandleObject>,
         underlying_source: Option<*mut JSObject>,
         strategy: &QueuingStrategy,
     ) -> Fallible<DomRoot<Self>> {
@@ -104,6 +105,20 @@ impl ReadableStream {
 
         // Step 4
         if underlying_source_dict.type_.is_some() {
+            // Step 4.1
+            if strategy.size.is_some() {
+                return Err(Error::Range("size should not eixst".to_string()));
+            }
+            // Step 4.2
+            let highwatermark = extract_high_water_mark(strategy, 0.0)?;
+            // Step 4.3
+            setup_readable_byte_stream_controller_from_underlying_source(
+                cx,
+                readable_stream,
+                underlying_source_obj.handle(),
+                underlying_source_dict,
+                highwatermark,
+            )?;
         } else {
             // Step 5.1 (implicit in above check)
             // Step 5.2
