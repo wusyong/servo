@@ -35,7 +35,7 @@ pub struct ReadableStreamDefaultController {
     /// All algoritems packed together:
     /// - Close algorithm: A promise-returning algorithm, taking one argument (the cancel reason), which communicates a requested cancelation to the underlying source
     /// - Pull algorithm: A promise-returning algorithm that pulls data from the underlying source
-    algorithms: DomRefCell<Option<ControllerAlgorithms>>,
+    algorithms: DomRefCell<ControllerAlgorithms>,
     /// A boolean flag indicating whether the stream has been closed by its underlying source, but still has chunks in its internal queue that have not yet been read
     close_requested: Cell<bool>,
     /// A boolean flag set to true if the stream’s mechanisms requested a call to the underlying source's pull algorithm to pull more data, but the pull could not yet be done since a previous call is still executing
@@ -68,7 +68,7 @@ impl ReadableStreamDefaultController {
             pulling: Cell::new(false),
             started: Cell::new(false),
             strategy_highwatermark: Cell::new(0.),
-            algorithms: DomRefCell::new(None),
+            algorithms: DomRefCell::new(ControllerAlgorithms::Undefined),
             strategy_size_algorithm: DomRefCell::new(None),
             stream,
         }
@@ -77,9 +77,6 @@ impl ReadableStreamDefaultController {
     fn new(global: &GlobalScope, stream: DomRoot<ReadableStream>) -> DomRoot<Self> {
         reflect_dom_object(Box::new(Self::new_inherited(stream)), global)
     }
-
-    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-call-pull-if-needed>
-    fn call_pull_if_needed(&self) {}
 
     /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-should-call-pull>
     fn should_call_pull(&self) -> bool {
@@ -129,6 +126,11 @@ impl ReadableStreamDefaultController {
                 Some(self.strategy_highwatermark.get() - self.queue.borrow().len() as f64)
             },
         }
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-error>
+    fn error(&self, e: SafeHandleValue) {
+        // TODO
     }
 }
 
@@ -197,8 +199,7 @@ fn set_up_readable_stream_default_controller(
     *controller.strategy_size_algorithm.borrow_mut() = Some(size_algorithm);
     controller.strategy_highwatermark.set(highwatermark);
     // Step 6 & 7
-    *controller.algorithms.borrow_mut() = Some(algorithms);
-    //
+    *controller.algorithms.borrow_mut() = algorithms;
     // Step 8
     controller
         .stream
@@ -207,7 +208,7 @@ fn set_up_readable_stream_default_controller(
         ));
     // Step 9
     rooted!(in(*cx) let mut start_result = UndefinedValue());
-    controller.algorithms.borrow().as_ref().unwrap().start(
+    controller.algorithms.borrow().start(
         cx,
         ReadableStreamController::ReadableStreamDefaultController(controller.clone()),
         start_result.handle_mut(),
@@ -239,7 +240,7 @@ fn set_up_readable_stream_default_controller(
     }
 
     impl Callback for ResolveHandler {
-        fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, realm: InRealm) {
+        fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm) {
             // Step 11.1
             self.controller.started.set(true);
             // Step 11.2
@@ -247,27 +248,77 @@ fn set_up_readable_stream_default_controller(
             // Step 11.3
             assert!(!self.controller.pull_again.get());
             // Step 11.4
-            self.controller.call_pull_if_needed();
+            assert!(readable_stream_default_controller_call_pull_if_needed(
+                cx,
+                self.controller.clone()
+            )
+            .is_ok());
+        }
+    }
+
+    Ok(())
+}
+
+/// <https://streams.spec.whatwg.org/#readable-stream-default-controller-call-pull-if-needed>
+fn readable_stream_default_controller_call_pull_if_needed(
+    cx: SafeJSContext,
+    controller: DomRoot<ReadableStreamDefaultController>,
+) -> Fallible<()> {
+    // Step 1 & 2
+    if controller.should_call_pull() {
+        // Step 3
+        if controller.pulling.get() {
+            controller.pull_again.set(true);
+        } else {
+            // Step 4
+            assert!(!controller.pull_again.get());
+            // Step 5
+            controller.pulling.set(true);
+            // Step 6
+            let pull_promise = controller.algorithms.borrow().pull(
+                cx,
+                ReadableStreamController::ReadableStreamDefaultController(controller.clone()),
+            )?;
+            let global = &*controller.global();
+            let realm = enter_realm(&*global);
+            let comp = InRealm::Entered(&realm);
+            pull_promise.append_native_handler(
+                &PromiseNativeHandler::new(
+                    global,
+                    Some(ResolveHandler::new(controller.clone())),
+                    Some(RejectHandler::new(controller)),
+                ),
+                comp,
+            );
         }
     }
 
     #[derive(JSTraceable, MallocSizeOf)]
-    struct RejectHandler {
+    struct ResolveHandler {
         controller: DomRoot<ReadableStreamDefaultController>,
     }
 
-    impl RejectHandler {
+    impl ResolveHandler {
         pub fn new(controller: DomRoot<ReadableStreamDefaultController>) -> Box<dyn Callback> {
             Box::new(Self { controller })
         }
     }
 
-    impl Callback for RejectHandler {
-        fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, realm: InRealm) {
-            todo!()
+    impl Callback for ResolveHandler {
+        fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm) {
+            // Step 7.1
+            self.controller.pulling.set(false);
+            // Step 7.2
+            if self.controller.pull_again.get() {
+                self.controller.pull_again.set(false);
+                assert!(readable_stream_default_controller_call_pull_if_needed(
+                    cx,
+                    self.controller.clone()
+                )
+                .is_ok());
+            }
         }
     }
-
     Ok(())
 }
 
@@ -275,7 +326,7 @@ fn set_up_readable_stream_default_controller(
 #[derive(JSTraceable, MallocSizeOf)]
 pub enum ControllerAlgorithms {
     UnderlyingSource(UnderlyingSourceAlgorithms),
-    None,
+    Undefined,
 }
 
 impl ControllerAlgorithms {
@@ -287,7 +338,7 @@ impl ControllerAlgorithms {
     ) -> Fallible<()> {
         match self {
             ControllerAlgorithms::UnderlyingSource(s) => s.start(cx, controller, retval),
-            ControllerAlgorithms::None => unreachable!(),
+            ControllerAlgorithms::Undefined => unreachable!(),
         }
     }
 
@@ -298,14 +349,14 @@ impl ControllerAlgorithms {
     ) -> Fallible<Rc<Promise>> {
         match self {
             ControllerAlgorithms::UnderlyingSource(s) => s.pull(cx, controller),
-            ControllerAlgorithms::None => unreachable!(),
+            ControllerAlgorithms::Undefined => unreachable!(),
         }
     }
 
     fn cancel(&self, cx: SafeJSContext, reason: Option<HandleValue>) -> Fallible<Rc<Promise>> {
         match self {
             ControllerAlgorithms::UnderlyingSource(s) => s.cancel(cx, reason),
-            ControllerAlgorithms::None => unreachable!(),
+            ControllerAlgorithms::Undefined => unreachable!(),
         }
     }
 }
@@ -388,5 +439,22 @@ impl UnderlyingSourceAlgorithms {
                 SafeHandleValue::undefined(),
             )
         }
+    }
+}
+
+#[derive(JSTraceable, MallocSizeOf)]
+struct RejectHandler {
+    controller: DomRoot<ReadableStreamDefaultController>,
+}
+
+impl RejectHandler {
+    pub fn new(controller: DomRoot<ReadableStreamDefaultController>) -> Box<dyn Callback> {
+        Box::new(Self { controller })
+    }
+}
+
+impl Callback for RejectHandler {
+    fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, realm: InRealm) {
+        self.controller.error(v);
     }
 }
