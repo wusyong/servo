@@ -4,7 +4,7 @@
 
 // https://streams.spec.whatwg.org/#readablestream
 
-[Exposed=(Window,Worker)]
+[Exposed=*]
 interface _ReadableStream {
     [Throws]
     constructor(optional object underlyingSource, optional QueuingStrategy strategy = {});
