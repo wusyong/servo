@@ -33,7 +33,7 @@ use crate::script_runtime::JSContext as SafeJSContext;
 pub struct ReadableStreamDefaultController {
     reflector_: Reflector,
     /// All algoritems packed together:
-    /// - Close algorithm: A promise-returning algorithm, taking one argument (the cancel reason), which communicates a requested cancelation to the underlying source
+    /// - Cancel algorithm: A promise-returning algorithm, taking one argument (the cancel reason), which communicates a requested cancelation to the underlying source
     /// - Pull algorithm: A promise-returning algorithm that pulls data from the underlying source
     algorithms: DomRefCell<ControllerAlgorithms>,
     /// A boolean flag indicating whether the stream has been closed by its underlying source, but still has chunks in its internal queue that have not yet been read

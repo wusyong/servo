@@ -416,6 +416,24 @@ impl ReadableStream {
         // TODO
         0
     }
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-get-num-read-into-requests>
+    pub fn get_num_read_into_requests(&self) -> usize {
+        // TODO
+        0
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-has-default-reader>
+    pub fn has_default_reader(&self) -> bool {
+        // TODO
+        false
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-stream-has-byob-reader>
+    pub fn has_byob_reader(&self) -> bool {
+        // TODO
+        false
+    }
 }
 
 #[allow(unsafe_code)]

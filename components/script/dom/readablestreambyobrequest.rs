@@ -28,6 +28,18 @@ pub struct ReadableStreamBYOBRequest {
     reflector_: Reflector,
 }
 
+impl ReadableStreamBYOBRequest {
+    fn new_inherited() -> ReadableStreamBYOBRequest {
+        ReadableStreamBYOBRequest {
+            reflector_: Reflector::new(),
+        }
+    }
+
+    fn new(global: &GlobalScope) -> DomRoot<ReadableStreamBYOBRequest> {
+        reflect_dom_object(Box::new(ReadableStreamBYOBRequest::new_inherited()), global)
+    }
+}
+
 impl ReadableStreamBYOBRequestMethods for ReadableStreamBYOBRequest {
     fn GetView(&self, cx: SafeJSContext) -> Option<js::typedarray::ArrayBufferView> {
         todo!()

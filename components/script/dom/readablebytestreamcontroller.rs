@@ -13,18 +13,18 @@ use js::jsval::{JSVal, UndefinedValue};
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue};
 
 use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategySize;
 use crate::dom::bindings::codegen::Bindings::ReadableByteStreamControllerBinding::ReadableByteStreamControllerMethods;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
     ReadableStreamController, UnderlyingSource,
 };
 use crate::dom::bindings::import::module::{Error, ExceptionHandling, Fallible, InRealm};
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::readablestream::{ReadableStream, StreamState};
+use crate::dom::readablestreambyobrequest::ReadableStreamBYOBRequest;
 use crate::realms::enter_realm;
 use crate::script_runtime::JSContext as SafeJSContext;
 
@@ -32,28 +32,32 @@ use crate::script_runtime::JSContext as SafeJSContext;
 #[dom_struct]
 pub struct ReadableByteStreamController {
     reflector_: Reflector,
+    /// A positive integer, when the automatic buffer allocation feature is enabled. In that case, this value specifies the size of buffer to allocate. It is undefined otherwise.
+    auto_allocate_chunk_size: Cell<Option<u64>>,
+    /// A ReadableStreamBYOBRequest instance representing the current BYOB pull request, or null if
+    /// there are no pending requests.
+    byob_request: MutNullableDom<ReadableStreamBYOBRequest>,
     /// All algoritems packed together:
-    /// - Close algorithm: A promise-returning algorithm, taking one argument (the cancel reason), which communicates a requested cancelation to the underlying source
-    /// - Pull algorithm: A promise-returning algorithm that pulls data from the underlying source
+    /// - Cancel algorithm: A promise-returning algorithm, taking one argument (the cancel reason), which communicates a requested cancelation to the underlying byte source
+    /// - Pull algorithm: A promise-returning algorithm that pulls data from the underlying byte source
     algorithms: DomRefCell<ControllerAlgorithms>,
-    /// A boolean flag indicating whether the stream has been closed by its underlying source, but still has chunks in its internal queue that have not yet been read
+    /// A boolean flag indicating whether the stream has been closed by its underlying byte source, but still has chunks in its internal queue that have not yet been read
     close_requested: Cell<bool>,
-    /// A boolean flag set to true if the stream’s mechanisms requested a call to the underlying source's pull algorithm to pull more data, but the pull could not yet be done since a previous call is still executing
+    /// A boolean flag set to true if the stream’s mechanisms requested a call to the underlying byte source's pull algorithm to pull more data,
+    /// but the pull could not yet be done since a previous call is still executing
     pull_again: Cell<bool>,
-    /// A boolean flag set to true while the underlying source's pull algorithm is executing and the returned promise has not yet fulfilled, used to prevent reentrant calls
+    /// A boolean flag set to true while the underlying byte source's pull algorithm is executing and the returned promise has not yet fulfilled, used to prevent reentrant calls
     pulling: Cell<bool>,
-    /// A list representing the stream’s internal queue of chunks
+    /// A list of pull-into descriptors
+    #[ignore_malloc_size_of = "Defined in mozjs"]
+    pending_pull_intos: DomRefCell<VecDeque<Heap<JSVal>>>,
+    /// A list of readable byte stream queue entries representing the stream’s internal queue of chunks
     #[ignore_malloc_size_of = "Defined in mozjs"]
     queue: DomRefCell<VecDeque<Heap<JSVal>>>,
-    /// A boolean flag indicating whether the underlying source has finished starting
+    /// A boolean flag indicating whether the underlying byte source has finished starting
     started: Cell<bool>,
-    /// A number supplied to the constructor as part of the stream’s queuing strategy, indicating the point at which the stream will apply backpressure to its underlying source
+    /// A number supplied to the constructor as part of the stream’s queuing strategy, indicating the point at which the stream will apply backpressure to its underlying byte source
     strategy_highwatermark: Cell<f64>,
-    /// An algorithm to calculate the size of enqueued chunks, as part of the stream’s queuing strategy
-    ///
-    /// If missing use default value (1) per https://streams.spec.whatwg.org/#make-size-algorithm-from-size-function
-    #[ignore_malloc_size_of = "Rc is hard"]
-    strategy_size_algorithm: DomRefCell<Option<Rc<QueuingStrategySize>>>,
     /// The ReadableStream instance controlled
     stream: DomRoot<ReadableStream>,
 }
@@ -62,6 +66,9 @@ impl ReadableByteStreamController {
     fn new_inherited(stream: DomRoot<ReadableStream>) -> Self {
         Self {
             reflector_: Reflector::new(),
+            auto_allocate_chunk_size: Cell::new(None),
+            byob_request: MutNullableDom::new(None),
+            pending_pull_intos: Default::default(),
             queue: Default::default(),
             close_requested: Cell::new(false),
             pull_again: Cell::new(false),
@@ -69,7 +76,6 @@ impl ReadableByteStreamController {
             started: Cell::new(false),
             strategy_highwatermark: Cell::new(0.),
             algorithms: DomRefCell::new(ControllerAlgorithms::Undefined),
-            strategy_size_algorithm: DomRefCell::new(None),
             stream,
         }
     }
@@ -80,40 +86,33 @@ impl ReadableByteStreamController {
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-should-call-pull>
     fn should_call_pull(&self) -> bool {
-        // TODO
         // Step 1
         let stream = &self.stream;
         // Step 2
-        if !self.can_close_or_enqueue() {
+        if stream.state() == StreamState::Readable {
             false
         // Step 3
-        } else if !self.started.get() {
+        } else if self.close_requested.get() {
             false
         // Step 4
-        } else if stream.is_locked() && stream.get_num_read_requests() > 0 {
-            return true;
-        // Step 5 ~ 7
+        } else if !self.started.get() {
+            false
+        // Step 5
+        } else if stream.has_default_reader() && stream.get_num_read_requests() > 0 {
+            true
+        // Step 6
+        } else if stream.has_byob_reader() && stream.get_num_read_into_requests() > 0 {
+            true
+        // Step 7 ~ 9
         } else if self.get_desired_size().unwrap() > 0. {
             true
-        // Step 8
+        // Step 10
         } else {
             false
         }
     }
 
-    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-can-close-or-enqueue>
-    fn can_close_or_enqueue(&self) -> bool {
-        // Step 1
-        let state = self.stream.state();
-        // Step 2 & 3
-        if !self.close_requested.get() && state == StreamState::Readable {
-            return true;
-        } else {
-            return false;
-        }
-    }
-
-    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-get-desired-size>
+    /// https://streams.spec.whatwg.org/#readable-byte-stream-controller-get-desired-size
     pub fn get_desired_size(&self) -> Option<f64> {
         // Step 1
         let state = self.stream.state();
@@ -129,7 +128,7 @@ impl ReadableByteStreamController {
         }
     }
 
-    /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-error>
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-error>
     fn error(&self, e: SafeHandleValue) {
         // TODO
     }
@@ -213,8 +212,7 @@ fn set_up_readable_byte_stream_controller(
     // Step 4
     controller.pull_again.set(false);
     controller.pulling.set(false);
-    // Step 5
-    // TODO
+    // Step 5 is done in ReadableStreamDefaultController::new already.
     // Step 6
     controller.queue.borrow_mut().clear();
     // Step 7
@@ -225,9 +223,11 @@ fn set_up_readable_byte_stream_controller(
     // Step 9 & 10
     *controller.algorithms.borrow_mut() = algorithms;
     // Step 11
-    // TODO
+    controller
+        .auto_allocate_chunk_size
+        .set(auto_allocate_chunk_size);
     // Step 12
-    // TODO
+    controller.pending_pull_intos.borrow_mut().clear();
     // Step 13
     controller
         .stream
