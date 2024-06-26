@@ -467,11 +467,6 @@ impl ReadableStream {
             _ => false,
         }
     }
-
-    /// <https://streams.spec.whatwg.org/#is-readable-stream-locked>
-    pub fn is_readable_stream_locked(&self) -> bool {
-        self.reader().is_some()
-    }
 }
 
 impl malloc_size_of::MallocSizeOf for ReadableStreamReader {
