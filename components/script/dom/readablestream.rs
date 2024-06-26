@@ -26,6 +26,7 @@ use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
+use crate::dom::bindings::codegen::Bindings::ReadableStreamBinding::ReadableStreamReader;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::{
     ReadableStreamController, UnderlyingSource,
 };
@@ -70,6 +71,7 @@ pub struct ReadableStream {
     controller: DomRefCell<Option<ReadableStreamController>>,
     /// A enum containing the stream’s current state, used internally
     state: Cell<StreamState>,
+    reader: DomRefCell<Option<ReadableStreamReader>>,
 }
 
 impl ReadableStream {
@@ -151,6 +153,7 @@ impl ReadableStream {
             external_underlying_source,
             controller: Default::default(),
             state: Cell::new(StreamState::Readable),
+            reader: Default::default(),
         }
     }
 
@@ -411,28 +414,72 @@ impl ReadableStream {
         self.state.get()
     }
 
+    pub fn set_reader(&self, reader: ReadableStreamReader) {
+        *self.reader.borrow_mut() = Some(reader);
+    }
+
+    pub fn reader(&'_ self) -> std::cell::Ref<'_, Option<ReadableStreamReader>> {
+        self.reader.borrow()
+    }
+
     /// <https://streams.spec.whatwg.org/#readable-stream-get-num-read-requests>
     pub fn get_num_read_requests(&self) -> usize {
-        // TODO
-        0
+        assert_eq!(self.has_default_reader(), true);
+        match self.reader().as_ref().unwrap() {
+            ReadableStreamReader::ReadableStreamDefaultReader(reader) => {
+                reader.read_requests().len()
+            },
+            _ => unreachable!(), // has_default_reader() guarantees the reader must be ReadableStreamDefaultReader
+        }
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-get-num-read-into-requests>
     pub fn get_num_read_into_requests(&self) -> usize {
-        // TODO
-        0
+        assert_eq!(self.has_byob_reader(), true);
+        match self.reader().as_ref().unwrap() {
+            ReadableStreamReader::ReadableStreamBYOBReader(reader) => {
+                reader.read_into_requests().len()
+            },
+            _ => unreachable!(), // has_byob_reader() guarantees the reader must be ReadableStreamDefaultReader
+        }
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-has-default-reader>
     pub fn has_default_reader(&self) -> bool {
-        // TODO
-        false
+        let reader = self.reader();
+        if reader.is_none() {
+            return false;
+        }
+        match reader.as_ref().unwrap() {
+            ReadableStreamReader::ReadableStreamDefaultReader(_) => true,
+            _ => false,
+        }
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-has-byob-reader>
     pub fn has_byob_reader(&self) -> bool {
-        // TODO
-        false
+        let reader = self.reader();
+        if reader.is_none() {
+            return false;
+        }
+        match reader.as_ref().unwrap() {
+            ReadableStreamReader::ReadableStreamBYOBReader(_) => true,
+            _ => false,
+        }
+    }
+
+    /// <https://streams.spec.whatwg.org/#is-readable-stream-locked>
+    pub fn is_readable_stream_locked(&self) -> bool {
+        self.reader().is_some()
+    }
+}
+
+impl malloc_size_of::MallocSizeOf for ReadableStreamReader {
+    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        match self {
+            ReadableStreamReader::ReadableStreamDefaultReader(c) => c.size_of(ops),
+            ReadableStreamReader::ReadableStreamBYOBReader(c) => c.size_of(ops),
+        }
     }
 }
 

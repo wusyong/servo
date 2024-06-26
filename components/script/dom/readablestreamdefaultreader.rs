@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use std::rc::Rc;
+
 use dom_struct::dom_struct;
 use js::jsapi::{
     AutoRequireNoGC, HandleObject, HandleValue, Heap, IsReadableStream, JSContext, JSObject,
@@ -9,6 +11,8 @@ use js::jsapi::{
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
 
+use crate::dom::bindings::cell::DomRefCell;
+use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultReaderBinding::ReadableStreamDefaultReaderMethods;
 use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
 use crate::dom::bindings::error::Error;
@@ -27,6 +31,7 @@ use crate::script_runtime::JSContext as SafeJSContext;
 #[dom_struct]
 pub struct ReadableStreamDefaultReader {
     reflector_: Reflector,
+    read_requests: DomRefCell<Vec<ReadRequest>>,
 }
 
 impl ReadableStreamDefaultReader {
@@ -42,6 +47,7 @@ impl ReadableStreamDefaultReader {
     fn new_inherited() -> ReadableStreamDefaultReader {
         ReadableStreamDefaultReader {
             reflector_: Reflector::new(),
+            read_requests: DomRefCell::new(Vec::new()),
         }
     }
 
@@ -50,6 +56,12 @@ impl ReadableStreamDefaultReader {
             Box::new(ReadableStreamDefaultReader::new_inherited()),
             global,
         )
+    }
+}
+
+impl ReadableStreamDefaultReader {
+    pub fn read_requests(&'_ self) -> std::cell::Ref<'_, Vec<ReadRequest>> {
+        self.read_requests.borrow()
     }
 }
 
@@ -69,4 +81,14 @@ impl ReadableStreamDefaultReaderMethods for ReadableStreamDefaultReader {
     fn Cancel(&self, cx: SafeJSContext, reason: SafeHandleValue) -> std::rc::Rc<Promise> {
         todo!()
     }
+}
+
+#[derive(Clone, JSTraceable, MallocSizeOf)]
+pub struct ReadRequest {
+    #[ignore_malloc_size_of = "Rc"]
+    chunk_steps: Rc<Function>,
+    #[ignore_malloc_size_of = "Rc"]
+    close_steps: Rc<Function>,
+    #[ignore_malloc_size_of = "Rc"]
+    error_steps: Rc<Function>,
 }
