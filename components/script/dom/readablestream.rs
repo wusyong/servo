@@ -429,7 +429,7 @@ impl ReadableStream {
             ReadableStreamReader::ReadableStreamDefaultReader(reader) => {
                 reader.read_requests().len()
             },
-            _ => unreachable!(), // has_default_reader() guarantees the reader must be ReadableStreamDefaultReader
+            _ => unreachable!(), // has_default_reader() guarantees the reader must be a ReadableStreamDefaultReader
         }
     }
 
@@ -440,7 +440,7 @@ impl ReadableStream {
             ReadableStreamReader::ReadableStreamBYOBReader(reader) => {
                 reader.read_into_requests().len()
             },
-            _ => unreachable!(), // has_byob_reader() guarantees the reader must be ReadableStreamDefaultReader
+            _ => unreachable!(), // has_byob_reader() guarantees the reader must be a ReadableStreamBYOBReader
         }
     }
 
