@@ -5,8 +5,6 @@
 // https://streams.spec.whatwg.org/#generic-reader-mixin-definition
 // https://streams.spec.whatwg.org/#default-reader-class-definition
 
-typedef (ReadableStreamDefaultReader or ReadableStreamBYOBReader) ReadableStreamReader;
-
 interface mixin ReadableStreamGenericReader {
   readonly attribute Promise<undefined> closed;
 

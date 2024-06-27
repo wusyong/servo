@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use std::rc::Rc;
+
 use dom_struct::dom_struct;
 use js::jsapi::{
     AutoRequireNoGC, HandleObject, HandleValue, Heap, IsReadableStream, JSContext, JSObject,
@@ -9,6 +11,8 @@ use js::jsapi::{
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
 
+use super::bindings::codegen::Bindings::FunctionBinding::Function;
+use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamBYOBReaderBinding::ReadableStreamBYOBReaderMethods;
 use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
 use crate::dom::bindings::error::Error;
@@ -27,6 +31,7 @@ use crate::script_runtime::JSContext as SafeJSContext;
 #[dom_struct]
 pub struct ReadableStreamBYOBReader {
     reflector_: Reflector,
+    read_into_requests: DomRefCell<Vec<ReadIntoRequest>>,
 }
 
 impl ReadableStreamBYOBReader {
@@ -42,11 +47,18 @@ impl ReadableStreamBYOBReader {
     fn new_inherited() -> ReadableStreamBYOBReader {
         ReadableStreamBYOBReader {
             reflector_: Reflector::new(),
+            read_into_requests: Default::default(),
         }
     }
 
     fn new(global: &GlobalScope) -> DomRoot<ReadableStreamBYOBReader> {
         reflect_dom_object(Box::new(ReadableStreamBYOBReader::new_inherited()), global)
+    }
+}
+
+impl ReadableStreamBYOBReader {
+    pub fn read_into_requests(&'_ self) -> std::cell::Ref<'_, Vec<ReadIntoRequest>> {
+        self.read_into_requests.borrow()
     }
 }
 
@@ -69,4 +81,9 @@ impl ReadableStreamBYOBReaderMethods for ReadableStreamBYOBReader {
     fn Cancel(&self, cx: SafeJSContext, reason: SafeHandleValue) -> std::rc::Rc<Promise> {
         todo!()
     }
+}
+
+#[derive(Clone, JSTraceable, MallocSizeOf)]
+pub struct ReadIntoRequest {
+    // TODO: Algorithms
 }
