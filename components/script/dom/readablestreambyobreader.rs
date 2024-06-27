@@ -85,10 +85,5 @@ impl ReadableStreamBYOBReaderMethods for ReadableStreamBYOBReader {
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 pub struct ReadIntoRequest {
-    #[ignore_malloc_size_of = "Rc"]
-    chunk_steps: Rc<Function>,
-    #[ignore_malloc_size_of = "Rc"]
-    close_steps: Rc<Function>,
-    #[ignore_malloc_size_of = "Rc"]
-    error_steps: Rc<Function>,
+    // TODO: Algorithms
 }
