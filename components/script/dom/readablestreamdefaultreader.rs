@@ -39,6 +39,7 @@ pub struct ReadableStreamDefaultReader {
 }
 
 impl ReadableStreamDefaultReader {
+    /// <https://streams.spec.whatwg.org/#default-reader-constructor>
     #[allow(non_snake_case)]
     pub fn Constructor(
         global: &GlobalScope,
