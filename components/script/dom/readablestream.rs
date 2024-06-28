@@ -72,6 +72,8 @@ pub struct ReadableStream {
     /// A enum containing the stream’s current state, used internally
     state: Cell<StreamState>,
     reader: DomRefCell<Option<ReadableStreamReader>>,
+    #[ignore_malloc_size_of = "Defined in rust-mozjs"]
+    stored_error: Heap<JSVal>,
 }
 
 impl ReadableStream {
@@ -154,6 +156,7 @@ impl ReadableStream {
             controller: Default::default(),
             state: Cell::new(StreamState::Readable),
             reader: Default::default(),
+            stored_error: Heap::default(),
         }
     }
 
@@ -412,6 +415,10 @@ impl ReadableStream {
 
     pub fn state(&self) -> StreamState {
         self.state.get()
+    }
+
+    pub fn stored_error(&self) -> JSVal {
+        self.stored_error.get()
     }
 
     pub fn set_reader(&self, reader: ReadableStreamReader) {
