@@ -165,6 +165,10 @@ mod gen {
         std::cmp::max(num_cpus::get() * 3 / 4, 1) as i64
     }
 
+    fn default_threads() -> i64 {
+        1
+    }
+
     fn default_font_size() -> i64 {
         16
     }
@@ -564,6 +568,12 @@ mod gen {
                 }
             },
             network: {
+                async_runtime: {
+                    /// Worker threads to spawn in the Tokio async runtime. Default to 1.
+                    #[serde(default = "default_threads")]
+                    #[serde(rename = "network.async-runtime.threads")]
+                    threads: i64,
+                },
                 enforce_tls: {
                     enabled: bool,
                     localhost: bool,

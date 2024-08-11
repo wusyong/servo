@@ -5,8 +5,16 @@
 use std::sync::Mutex;
 
 use lazy_static::lazy_static;
-use tokio::runtime::Runtime;
+use servo_config::pref;
+use tokio::runtime::{self, Runtime};
 
 lazy_static! {
-    pub static ref HANDLE: Mutex<Option<Runtime>> = Mutex::new(Some(Runtime::new().unwrap()));
+    pub static ref HANDLE: Mutex<Option<Runtime>> = Mutex::new(Some(
+        runtime::Builder::new_multi_thread()
+            .thread_name("AsyncRuntime")
+            .worker_threads(pref!(network.async_runtime.threads) as usize)
+            .enable_all()
+            .build()
+            .unwrap()
+    ));
 }
