@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-#[cfg(not(windows))]
 use std::env;
 use std::ffi::OsStr;
 use std::process;
@@ -141,7 +140,7 @@ pub fn content_process_sandbox_profile() {
 #[cfg(any(
     target_os = "android",
     target_arch = "arm",
-    all(target_arch = "aarch64", not(target_os = "windows"))
+    all(target_arch = "aarch64",)
 ))]
 pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<(), Error> {
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
@@ -165,32 +164,31 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<(), Error> {
 }
 
 #[cfg(all(
-    not(target_os = "windows"),
     not(target_os = "ios"),
     not(target_os = "android"),
     not(target_arch = "arm"),
     not(target_arch = "aarch64")
 ))]
 pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<(), Error> {
-    use gaol::sandbox::{self, Sandbox, SandboxMethods};
+    // use gaol::sandbox::{self, Sandbox, SandboxMethods};
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
 
-    impl CommandMethods for sandbox::Command {
-        fn arg<T>(&mut self, arg: T)
-        where
-            T: AsRef<OsStr>,
-        {
-            self.arg(arg);
-        }
+    // impl CommandMethods for sandbox::Command {
+    //     fn arg<T>(&mut self, arg: T)
+    //     where
+    //         T: AsRef<OsStr>,
+    //     {
+    //         self.arg(arg);
+    //     }
 
-        fn env<T, U>(&mut self, key: T, val: U)
-        where
-            T: AsRef<OsStr>,
-            U: AsRef<OsStr>,
-        {
-            self.env(key, val);
-        }
-    }
+    //     fn env<T, U>(&mut self, key: T, val: U)
+    //     where
+    //         T: AsRef<OsStr>,
+    //         U: AsRef<OsStr>,
+    //     {
+    //         self.env(key, val);
+    //     }
+    // }
 
     // Note that this function can panic, due to process creation,
     // avoiding this panic would require a mechanism for dealing
@@ -199,36 +197,38 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<(), Error> {
         .expect("Failed to create IPC one-shot server.");
 
     // If there is a sandbox, use the `gaol` API to create the child process.
-    if content.opts().sandbox {
-        let mut command = sandbox::Command::me().expect("Failed to get current sandbox.");
-        setup_common(&mut command, token);
+    // if false {
+    //     let mut command = sandbox::Command::me().expect("Failed to get current sandbox.");
+    //     setup_common(&mut command, token);
 
-        let profile = content_process_sandbox_profile();
-        let _ = Sandbox::new(profile)
-            .start(&mut command)
-            .expect("Failed to start sandboxed child process!");
-    } else {
-        let path_to_self = env::current_exe().expect("Failed to get current executor.");
+    //     let profile = content_process_sandbox_profile();
+    //     let _ = Sandbox::new(profile)
+    //         .start(&mut command)
+    //         .expect("Failed to start sandboxed child process!");
+    // } else {
+    dbg!(1);
+        let path_to_self = std::env::current_exe().expect("Failed to get current executor.");
         let mut child_process = process::Command::new(path_to_self);
         setup_common(&mut child_process, token);
         let _ = child_process
             .spawn()
             .expect("Failed to start unsandboxed child process!");
-    }
+    // }
 
+    dbg!(2);
     let (_receiver, sender) = server.accept().expect("Server failed to accept.");
     sender.send(content)?;
-
+    dbg!(3);
     Ok(())
 }
 
-#[cfg(any(target_os = "windows", target_os = "ios"))]
+#[cfg(any(target_os = "ios"))]
 pub fn spawn_multiprocess(_content: UnprivilegedContent) -> Result<(), Error> {
     log::error!("Multiprocess is not supported on Windows or iOS.");
     process::exit(1);
 }
 
-#[cfg(not(windows))]
+
 fn setup_common<C: CommandMethods>(command: &mut C, token: String) {
     C::arg(command, "--content-process");
     C::arg(command, token);
