@@ -5,11 +5,9 @@
 use std::cmp::PartialEq;
 use std::fmt;
 
+use base::id::{BrowsingContextId, HistoryStateId, PipelineId, TopLevelBrowsingContextId};
 use euclid::Size2D;
 use log::debug;
-use msg::constellation_msg::{
-    BrowsingContextId, HistoryStateId, PipelineId, TopLevelBrowsingContextId,
-};
 use script_traits::LoadData;
 use servo_url::ServoUrl;
 use style_traits::CSSPixel;
@@ -111,6 +109,7 @@ impl JointSessionHistory {
 
 /// Represents a pending change in a session history, that will be applied
 /// once the new pipeline has loaded and completed initial layout / paint.
+#[derive(Debug)]
 pub struct SessionHistoryChange {
     /// The browsing context to change.
     pub browsing_context_id: BrowsingContextId,

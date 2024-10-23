@@ -2,22 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::Cow;
+
 use dom_struct::dom_struct;
-use webgpu::wgpu::command::{bundle_ffi as wgpu_bundle, RenderBundleEncoder};
+use webgpu::wgc::command::{
+    bundle_ffi as wgpu_bundle, RenderBundleEncoder, RenderBundleEncoderDescriptor,
+};
 use webgpu::{wgt, WebGPU, WebGPURenderBundle, WebGPURequest};
 
 use super::bindings::codegen::Bindings::WebGPUBinding::GPUIndexFormat;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
-    GPURenderBundleDescriptor, GPURenderBundleEncoderMethods,
+    GPURenderBundleDescriptor, GPURenderBundleEncoderDescriptor, GPURenderBundleEncoderMethods,
 };
+use crate::dom::bindings::import::module::Fallible;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::gpubindgroup::GPUBindGroup;
 use crate::dom::gpubuffer::GPUBuffer;
-use crate::dom::gpuconvert::convert_label;
 use crate::dom::gpudevice::GPUDevice;
 use crate::dom::gpurenderbundle::GPURenderBundle;
 use crate::dom::gpurenderpipeline::GPURenderPipeline;
@@ -70,6 +74,56 @@ impl GPURenderBundleEncoder {
     }
 }
 
+impl GPURenderBundleEncoder {
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createrenderbundleencoder>
+    pub fn create(
+        device: &GPUDevice,
+        descriptor: &GPURenderBundleEncoderDescriptor,
+    ) -> Fallible<DomRoot<GPURenderBundleEncoder>> {
+        let desc = RenderBundleEncoderDescriptor {
+            label: (&descriptor.parent.parent).into(),
+            color_formats: Cow::Owned(
+                descriptor
+                    .parent
+                    .colorFormats
+                    .iter()
+                    .map(|format| {
+                        device
+                            .validate_texture_format_required_features(format)
+                            .map(Some)
+                    })
+                    .collect::<Fallible<Vec<_>>>()?,
+            ),
+            depth_stencil: descriptor
+                .parent
+                .depthStencilFormat
+                .map(|dsf| {
+                    device
+                        .validate_texture_format_required_features(&dsf)
+                        .map(|format| wgt::RenderBundleDepthStencil {
+                            format,
+                            depth_read_only: descriptor.depthReadOnly,
+                            stencil_read_only: descriptor.stencilReadOnly,
+                        })
+                })
+                .transpose()?,
+            sample_count: descriptor.parent.sampleCount,
+            multiview: None,
+        };
+
+        // Handle error gracefully
+        let render_bundle_encoder = RenderBundleEncoder::new(&desc, device.id().0, None).unwrap();
+
+        Ok(GPURenderBundleEncoder::new(
+            &device.global(),
+            render_bundle_encoder,
+            device,
+            device.channel().clone(),
+            descriptor.parent.parent.label.clone(),
+        ))
+    }
+}
+
 impl GPURenderBundleEncoderMethods for GPURenderBundleEncoder {
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label>
     fn Label(&self) -> USVString {
@@ -89,7 +143,7 @@ impl GPURenderBundleEncoderMethods for GPURenderBundleEncoder {
                 wgpu_bundle::wgpu_render_bundle_set_bind_group(
                     encoder,
                     index,
-                    bind_group.id().0,
+                    Some(bind_group.id().0),
                     dynamic_offsets.as_ptr(),
                     dynamic_offsets.len(),
                 )
@@ -198,26 +252,19 @@ impl GPURenderBundleEncoderMethods for GPURenderBundleEncoder {
     /// <https://gpuweb.github.io/gpuweb/#dom-gpurenderbundleencoder-finish>
     fn Finish(&self, descriptor: &GPURenderBundleDescriptor) -> DomRoot<GPURenderBundle> {
         let desc = wgt::RenderBundleDescriptor {
-            label: convert_label(&descriptor.parent),
+            label: (&descriptor.parent).into(),
         };
         let encoder = self.render_bundle_encoder.borrow_mut().take().unwrap();
-        let render_bundle_id = self
-            .global()
-            .wgpu_id_hub()
-            .lock()
-            .create_render_bundle_id(self.device.id().0.backend());
+        let render_bundle_id = self.global().wgpu_id_hub().create_render_bundle_id();
 
         self.channel
             .0
-            .send((
-                self.device.use_current_scope(),
-                WebGPURequest::RenderBundleEncoderFinish {
-                    render_bundle_encoder: encoder,
-                    descriptor: desc,
-                    render_bundle_id,
-                    device_id: self.device.id().0,
-                },
-            ))
+            .send(WebGPURequest::RenderBundleEncoderFinish {
+                render_bundle_encoder: encoder,
+                descriptor: desc,
+                render_bundle_id,
+                device_id: self.device.id().0,
+            })
             .expect("Failed to send RenderBundleEncoderFinish");
 
         let render_bundle = WebGPURenderBundle(render_bundle_id);
@@ -226,7 +273,7 @@ impl GPURenderBundleEncoderMethods for GPURenderBundleEncoder {
             render_bundle,
             self.device.id(),
             self.channel.clone(),
-            descriptor.parent.label.clone().unwrap_or_default(),
+            descriptor.parent.label.clone(),
         )
     }
 }

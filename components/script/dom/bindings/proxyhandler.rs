@@ -259,7 +259,7 @@ unsafe fn id_to_source(cx: SafeJSContext, id: RawHandleId) -> Option<DOMString> 
             jsstr.set(jsapi::JS_ValueToSource(*cx, value.handle().into()));
             jsstr.get()
         })
-        .filter(|jsstr| !jsstr.is_null())
+        .and_then(ptr::NonNull::new)
         .map(|jsstr| jsstring_to_str(*cx, jsstr))
 }
 
@@ -598,7 +598,7 @@ pub unsafe fn cross_origin_has_own(
     // TODO: Once we have the slot for the holder, it'd be more efficient to
     //       use `ensure_cross_origin_property_holder`. We'll need `_proxy` to
     //       do that.
-    *bp = jsid_to_string(*cx, Handle::from_raw(id)).map_or(false, |key| {
+    *bp = jsid_to_string(*cx, Handle::from_raw(id)).is_some_and(|key| {
         cross_origin_properties.keys().any(|defined_key| {
             let defined_key = CStr::from_ptr(defined_key);
             defined_key.to_bytes() == key.as_bytes()
@@ -674,7 +674,7 @@ const ALLOWLISTED_SYMBOL_CODES: &[SymbolCode] = &[
 ];
 
 unsafe fn is_cross_origin_allowlisted_prop(cx: SafeJSContext, id: RawHandleId) -> bool {
-    if jsid_to_string(*cx, Handle::from_raw(id)).map_or(false, |st| st == "then") {
+    if jsid_to_string(*cx, Handle::from_raw(id)).is_some_and(|st| st == "then") {
         return true;
     }
 
@@ -697,7 +697,7 @@ unsafe fn append_cross_origin_allowlisted_prop_keys(
 ) {
     rooted!(in(*cx) let mut id: jsid);
 
-    let jsstring = JS_AtomizeAndPinString(*cx, b"then\0".as_ptr() as *const c_char);
+    let jsstring = JS_AtomizeAndPinString(*cx, c"then".as_ptr());
     rooted!(in(*cx) let rooted = jsstring);
     RUST_INTERNED_STRING_TO_JSID(*cx, rooted.handle().get(), id.handle_mut());
     AppendToIdVector(props, id.handle());

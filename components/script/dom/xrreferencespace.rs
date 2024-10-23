@@ -3,8 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use euclid::RigidTransform3D;
-use webxr_api::{self, Frame, Space};
+use euclid::{Point2D, RigidTransform3D};
+use webxr_api::{self, Floor, Frame, Space};
 
 use crate::dom::bindings::codegen::Bindings::XRReferenceSpaceBinding::{
     XRReferenceSpaceMethods, XRReferenceSpaceType,
@@ -16,6 +16,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::xrrigidtransform::XRRigidTransform;
 use crate::dom::xrsession::{cast_transform, ApiPose, BaseTransform, XRSession};
 use crate::dom::xrspace::XRSpace;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct XRReferenceSpace {
@@ -42,8 +43,9 @@ impl XRReferenceSpace {
         global: &GlobalScope,
         session: &XRSession,
         ty: XRReferenceSpaceType,
+        can_gc: CanGc,
     ) -> DomRoot<XRReferenceSpace> {
-        let offset = XRRigidTransform::identity(global);
+        let offset = XRRigidTransform::identity(global, can_gc);
         Self::new_offset(global, session, ty, &offset)
     }
 
@@ -65,18 +67,23 @@ impl XRReferenceSpace {
             XRReferenceSpaceType::Local => webxr_api::BaseSpace::Local,
             XRReferenceSpaceType::Viewer => webxr_api::BaseSpace::Viewer,
             XRReferenceSpaceType::Local_floor => webxr_api::BaseSpace::Floor,
+            XRReferenceSpaceType::Bounded_floor => webxr_api::BaseSpace::BoundedFloor,
             _ => panic!("unsupported reference space found"),
         };
         let offset = self.offset.transform();
         Space { base, offset }
     }
+
+    pub fn ty(&self) -> XRReferenceSpaceType {
+        self.ty
+    }
 }
 
 impl XRReferenceSpaceMethods for XRReferenceSpace {
     /// <https://immersive-web.github.io/webxr/#dom-xrreferencespace-getoffsetreferencespace>
-    fn GetOffsetReferenceSpace(&self, new: &XRRigidTransform) -> DomRoot<Self> {
+    fn GetOffsetReferenceSpace(&self, new: &XRRigidTransform, can_gc: CanGc) -> DomRoot<Self> {
         let offset = new.transform().then(&self.offset.transform());
-        let offset = XRRigidTransform::new(&self.global(), offset);
+        let offset = XRRigidTransform::new(&self.global(), offset, can_gc);
         Self::new_offset(
             &self.global(),
             self.upcast::<XRSpace>().session(),
@@ -84,6 +91,9 @@ impl XRReferenceSpaceMethods for XRReferenceSpace {
             &offset,
         )
     }
+
+    // https://www.w3.org/TR/webxr/#dom-xrreferencespace-onreset
+    event_handler!(reset, GetOnreset, SetOnreset);
 }
 
 impl XRReferenceSpace {
@@ -121,7 +131,7 @@ impl XRReferenceSpace {
                 // for most devices is (0, 0, 0)
                 Some(RigidTransform3D::identity())
             },
-            XRReferenceSpaceType::Local_floor => {
+            XRReferenceSpaceType::Local_floor | XRReferenceSpaceType::Bounded_floor => {
                 let native_to_floor = self
                     .upcast::<XRSpace>()
                     .session()
@@ -133,5 +143,11 @@ impl XRReferenceSpace {
             },
             _ => unimplemented!(),
         }
+    }
+
+    pub fn get_bounds(&self) -> Option<Vec<Point2D<f32, Floor>>> {
+        self.upcast::<XRSpace>()
+            .session()
+            .with_session(|s| s.reference_space_bounds())
     }
 }

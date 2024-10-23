@@ -1,7 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-
+#![allow(unused_imports)]
 use core::ffi::c_void;
 use std::cell::Cell;
 use std::fs::{create_dir_all, read_to_string, File};
@@ -12,21 +12,17 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use base::id::PipelineId;
 use content_security_policy as csp;
 use dom_struct::dom_struct;
 use encoding_rs::Encoding;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
-use js::jsapi::{CanCompileOffThread, CompileToStencilOffThread1, OffThreadToken};
 use js::jsval::UndefinedValue;
-use js::rust::{
-    transform_str_to_source_text, CompileOptionsWrapper, FinishOffThreadStencil, HandleObject,
-    Stencil,
-};
-use msg::constellation_msg::PipelineId;
+use js::rust::{transform_str_to_source_text, CompileOptionsWrapper, HandleObject, Stencil};
+use net_traits::http_status::HttpStatus;
 use net_traits::request::{
-    CorsSettings, CredentialsMode, Destination, ParserMetadata, RequestBuilder,
+    CorsSettings, CredentialsMode, Destination, ParserMetadata, RequestBuilder, RequestId,
 };
 use net_traits::{
     FetchMetadata, FetchResponseListener, Metadata, NetworkError, ResourceFetchTiming,
@@ -70,11 +66,13 @@ use crate::realms::enter_realm;
 use crate::script_module::{
     fetch_external_module_script, fetch_inline_module_script, ModuleOwner, ScriptFetchOptions,
 };
+use crate::script_runtime::CanGc;
 use crate::task::TaskCanceller;
 use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
 use crate::task_source::{TaskSource, TaskSourceName};
 
-pub struct OffThreadCompilationContext {
+// TODO Implement offthread compilation in mozjs
+/*pub struct OffThreadCompilationContext {
     script_element: Trusted<HTMLScriptElement>,
     script_kind: ExternalScriptKind,
     final_url: ServoUrl,
@@ -84,14 +82,6 @@ pub struct OffThreadCompilationContext {
     script_text: String,
     fetch_options: ScriptFetchOptions,
 }
-
-/// A wrapper to mark OffThreadToken as Send,
-/// which should be safe according to
-/// mozjs/js/public/OffThreadScriptCompilation.h
-struct OffThreadCompilationToken(*mut OffThreadToken);
-
-#[allow(unsafe_code)]
-unsafe impl Send for OffThreadCompilationToken {}
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn off_thread_compilation_callback(
@@ -116,8 +106,12 @@ unsafe extern "C" fn off_thread_compilation_callback(
             let cx = GlobalScope::get_cx();
             let _ar = enter_realm(&*global);
 
-            let compiled_script = FinishOffThreadStencil(*cx, token.0, ptr::null_mut());
+            // TODO: This is necessary because the rust compiler will otherwise try to move the *mut
+            // OffThreadToken directly, which isn't marked as Send. The correct fix is that this
+            // type is marked as Send in mozjs.
+            let used_token = token;
 
+            let compiled_script = FinishOffThreadStencil(*cx, used_token.0, ptr::null_mut());
             let load = if compiled_script.is_null() {
                 Err(NoTrace(NetworkError::Internal(
                     "Off-thread compilation failed.".into(),
@@ -142,7 +136,7 @@ unsafe extern "C" fn off_thread_compilation_callback(
         }),
         &context.canceller,
     );
-}
+}*/
 
 /// An unique id for script element.
 #[derive(Clone, Copy, Debug, Eq, Hash, JSTraceable, PartialEq)]
@@ -311,6 +305,7 @@ fn finish_fetching_a_classic_script(
     script_kind: ExternalScriptKind,
     url: ServoUrl,
     load: ScriptResult,
+    can_gc: CanGc,
 ) {
     // Step 11, Asynchronously complete this algorithm with script,
     // which refers to step 26.6 "When the chosen algorithm asynchronously completes",
@@ -322,11 +317,11 @@ fn finish_fetching_a_classic_script(
         ExternalScriptKind::AsapInOrder => document.asap_in_order_script_loaded(elem, load),
         ExternalScriptKind::Deferred => document.deferred_script_loaded(elem, load),
         ExternalScriptKind::ParsingBlocking => {
-            document.pending_parsing_blocking_script_loaded(elem, load)
+            document.pending_parsing_blocking_script_loaded(elem, load, can_gc)
         },
     }
 
-    document.finish_load(LoadType::Script(url));
+    document.finish_load(LoadType::Script(url), can_gc);
 }
 
 pub type ScriptResult = Result<ScriptOrigin, NoTrace<NetworkError>>;
@@ -355,38 +350,41 @@ struct ClassicContext {
 }
 
 impl FetchResponseListener for ClassicContext {
-    fn process_request_body(&mut self) {} // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+    // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self) {} // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+    // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
+    fn process_response(&mut self, _: RequestId, metadata: Result<FetchMetadata, NetworkError>) {
         self.metadata = metadata.ok().map(|meta| match meta {
             FetchMetadata::Unfiltered(m) => m,
             FetchMetadata::Filtered { unsafe_, .. } => unsafe_,
         });
 
-        let status_code = self
+        let status = self
             .metadata
             .as_ref()
-            .and_then(|m| match m.status {
-                Some((c, _)) => Some(c),
-                _ => None,
-            })
-            .unwrap_or(0);
+            .map(|m| m.status.clone())
+            .unwrap_or_else(HttpStatus::new_error);
 
-        self.status = match status_code {
-            0 => Err(NetworkError::Internal(
-                "No http status code received".to_owned(),
-            )),
-            200..=299 => Ok(()), // HTTP ok status codes
-            _ => Err(NetworkError::Internal(format!(
-                "HTTP error code {}",
-                status_code
-            ))),
+        self.status = {
+            if status.is_error() {
+                Err(NetworkError::Internal(
+                    "No http status code received".to_owned(),
+                ))
+            } else if status.is_success() {
+                Ok(())
+            } else {
+                Err(NetworkError::Internal(format!(
+                    "HTTP error code {}",
+                    status.code()
+                )))
+            }
         };
     }
 
-    fn process_response_chunk(&mut self, mut chunk: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, mut chunk: Vec<u8>) {
         if self.status.is_ok() {
             self.data.append(&mut chunk);
         }
@@ -395,7 +393,11 @@ impl FetchResponseListener for ClassicContext {
     /// <https://html.spec.whatwg.org/multipage/#fetch-a-classic-script>
     /// step 4-9
     #[allow(unsafe_code)]
-    fn process_response_eof(&mut self, response: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         let (source_text, final_url) = match (response.as_ref(), self.status.as_ref()) {
             (Err(err), _) | (_, Err(err)) => {
                 // Step 6, response is an error.
@@ -404,6 +406,7 @@ impl FetchResponseListener for ClassicContext {
                     self.kind,
                     self.url.clone(),
                     Err(NoTrace(err.clone())),
+                    CanGc::note(),
                 );
                 return;
             },
@@ -424,9 +427,10 @@ impl FetchResponseListener for ClassicContext {
 
         let elem = self.elem.root();
         let global = elem.global();
-        let cx = GlobalScope::get_cx();
+        //let cx = GlobalScope::get_cx();
         let _ar = enter_realm(&*global);
 
+        /*
         let options = unsafe { CompileOptionsWrapper::new(*cx, final_url.as_str(), 1) };
 
         let can_compile_off_thread = pref!(dom.script.asynch) &&
@@ -456,15 +460,21 @@ impl FetchResponseListener for ClassicContext {
                 )
                 .is_null());
             }
-        } else {
-            let load = ScriptOrigin::external(
-                Rc::new(DOMString::from(source_text)),
-                final_url.clone(),
-                self.fetch_options.clone(),
-                ScriptType::Classic,
-            );
-            finish_fetching_a_classic_script(&elem, self.kind, self.url.clone(), Ok(load));
-        }
+        } else {*/
+        let load = ScriptOrigin::external(
+            Rc::new(DOMString::from(source_text)),
+            final_url.clone(),
+            self.fetch_options.clone(),
+            ScriptType::Classic,
+        );
+        finish_fetching_a_classic_script(
+            &elem,
+            self.kind,
+            self.url.clone(),
+            Ok(load),
+            CanGc::note(),
+        );
+        //}
     }
 
     fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
@@ -533,9 +543,8 @@ fn fetch_a_classic_script(
     options: ScriptFetchOptions,
     character_encoding: &'static Encoding,
 ) {
-    let doc = document_from_node(script);
-
     // Step 1, 2.
+    let doc = document_from_node(script);
     let request = script_fetch_request(
         url.clone(),
         cors_setting,
@@ -543,10 +552,11 @@ fn fetch_a_classic_script(
         script.global().pipeline_id(),
         options.clone(),
     );
+    let request = doc.prepare_request(request);
 
     // TODO: Step 3, Add custom steps to perform fetch
 
-    let context = Arc::new(Mutex::new(ClassicContext {
+    let context = ClassicContext {
         elem: Trusted::new(script),
         kind,
         character_encoding,
@@ -556,31 +566,13 @@ fn fetch_a_classic_script(
         status: Ok(()),
         fetch_options: options,
         resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
-    }));
-
-    let (action_sender, action_receiver) = ipc::channel().unwrap();
-    let (task_source, canceller) = doc
-        .window()
-        .task_manager()
-        .networking_task_source_with_canceller();
-    let listener = NetworkListener {
-        context,
-        task_source,
-        canceller: Some(canceller),
     };
-
-    ROUTER.add_route(
-        action_receiver.to_opaque(),
-        Box::new(move |message| {
-            listener.notify_fetch(message.to().unwrap());
-        }),
-    );
-    doc.fetch_async(LoadType::Script(url), request, action_sender);
+    doc.fetch(LoadType::Script(url), request, context);
 }
 
 impl HTMLScriptElement {
     /// <https://html.spec.whatwg.org/multipage/#prepare-a-script>
-    pub fn prepare(&self) {
+    pub fn prepare(&self, can_gc: CanGc) {
         // Step 1.
         if self.already_started.get() {
             return;
@@ -792,6 +784,7 @@ impl HTMLScriptElement {
                         url.clone(),
                         Destination::Script,
                         options,
+                        can_gc,
                     );
 
                     if !asynch && was_parser_inserted {
@@ -822,7 +815,7 @@ impl HTMLScriptElement {
                 ScriptType::Classic => {
                     if was_parser_inserted &&
                         doc.get_current_parser()
-                            .map_or(false, |parser| parser.script_nesting_level() <= 1) &&
+                            .is_some_and(|parser| parser.script_nesting_level() <= 1) &&
                         doc.get_script_blocking_stylesheets_count() > 0
                     {
                         // Step 27.h: classic, has no src, was parser-inserted, is blocked on stylesheet.
@@ -850,6 +843,7 @@ impl HTMLScriptElement {
                         base_url.clone(),
                         self.id,
                         options,
+                        can_gc,
                     );
                 },
             }
@@ -989,7 +983,7 @@ impl HTMLScriptElement {
             // Step 2.
             Err(e) => {
                 warn!("error loading script {:?}", e);
-                self.dispatch_error_event();
+                self.dispatch_error_event(CanGc::note());
                 return;
             },
 
@@ -1022,12 +1016,12 @@ impl HTMLScriptElement {
 
         match script.type_ {
             ScriptType::Classic => {
-                self.run_a_classic_script(&script);
+                self.run_a_classic_script(&script, CanGc::note());
                 document.set_current_script(old_script.as_deref());
             },
             ScriptType::Module => {
                 assert!(document.GetCurrentScript().is_none());
-                self.run_a_module_script(&script, false);
+                self.run_a_module_script(&script, false, CanGc::note());
             },
         }
 
@@ -1038,12 +1032,12 @@ impl HTMLScriptElement {
 
         // Step 6.
         if script.external {
-            self.dispatch_load_event();
+            self.dispatch_load_event(CanGc::note());
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#run-a-classic-script
-    pub fn run_a_classic_script(&self, script: &ScriptOrigin) {
+    pub fn run_a_classic_script(&self, script: &ScriptOrigin, can_gc: CanGc) {
         // TODO use a settings object rather than this element's document/window
         // Step 2
         let document = document_from_node(self);
@@ -1067,12 +1061,13 @@ impl HTMLScriptElement {
             line_number,
             script.fetch_options.clone(),
             script.url.clone(),
+            can_gc,
         );
     }
 
     #[allow(unsafe_code)]
     /// <https://html.spec.whatwg.org/multipage/#run-a-module-script>
-    pub fn run_a_module_script(&self, script: &ScriptOrigin, _rethrow_errors: bool) {
+    pub fn run_a_module_script(&self, script: &ScriptOrigin, _rethrow_errors: bool, can_gc: CanGc) {
         // TODO use a settings object rather than this element's document/window
         // Step 2
         let document = document_from_node(self);
@@ -1101,7 +1096,7 @@ impl HTMLScriptElement {
                 let module_error = module_tree.get_rethrow_error().borrow();
                 let network_error = module_tree.get_network_error().borrow();
                 if module_error.is_some() && network_error.is_none() {
-                    module_tree.report_error(global);
+                    module_tree.report_error(global, can_gc);
                     return;
                 }
             }
@@ -1119,7 +1114,7 @@ impl HTMLScriptElement {
 
                 if let Err(exception) = evaluated {
                     module_tree.set_rethrow_error(exception);
-                    module_tree.report_error(global);
+                    module_tree.report_error(global, can_gc);
                 }
             }
         }
@@ -1133,19 +1128,21 @@ impl HTMLScriptElement {
             .queue_simple_event(self.upcast(), atom!("error"), &window);
     }
 
-    pub fn dispatch_load_event(&self) {
+    pub fn dispatch_load_event(&self, can_gc: CanGc) {
         self.dispatch_event(
             atom!("load"),
             EventBubbles::DoesNotBubble,
             EventCancelable::NotCancelable,
+            can_gc,
         );
     }
 
-    pub fn dispatch_error_event(&self) {
+    pub fn dispatch_error_event(&self, can_gc: CanGc) {
         self.dispatch_event(
             atom!("error"),
             EventBubbles::DoesNotBubble,
             EventCancelable::NotCancelable,
+            can_gc,
         );
     }
 
@@ -1224,9 +1221,10 @@ impl HTMLScriptElement {
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
+        can_gc: CanGc,
     ) -> EventStatus {
         let window = window_from_node(self);
-        let event = Event::new(window.upcast(), type_, bubbles, cancelable);
+        let event = Event::new(window.upcast(), type_, bubbles, cancelable, can_gc);
         event.fire(self.upcast())
     }
 }
@@ -1241,7 +1239,7 @@ impl VirtualMethods for HTMLScriptElement {
         if *attr.local_name() == local_name!("src") {
             if let AttributeMutation::Set(_) = mutation {
                 if !self.parser_inserted.get() && self.upcast::<Node>().is_connected() {
-                    self.prepare();
+                    self.prepare(CanGc::note());
                 }
             }
         }
@@ -1252,7 +1250,7 @@ impl VirtualMethods for HTMLScriptElement {
             s.children_changed(mutation);
         }
         if !self.parser_inserted.get() && self.upcast::<Node>().is_connected() {
-            self.prepare();
+            self.prepare(CanGc::note());
         }
     }
 
@@ -1264,7 +1262,7 @@ impl VirtualMethods for HTMLScriptElement {
         if context.tree_connected && !self.parser_inserted.get() {
             let script = Trusted::new(self);
             document_from_node(self).add_delayed_task(task!(ScriptDelayedInitialize: move || {
-                script.root().prepare();
+                script.root().prepare(CanGc::note());
             }));
         }
     }

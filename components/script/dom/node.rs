@@ -13,6 +13,7 @@ use std::sync::Arc as StdArc;
 use std::{cmp, iter};
 
 use app_units::Au;
+use base::id::{BrowsingContextId, PipelineId};
 use bitflags::bitflags;
 use devtools_traits::NodeInfo;
 use dom_struct::dom_struct;
@@ -22,8 +23,7 @@ use js::jsapi::JSObject;
 use js::rust::HandleObject;
 use libc::{self, c_void, uintptr_t};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image::base::{Image, ImageMetadata};
+use pixels::{Image, ImageMetadata};
 use script_layout_interface::{
     GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutElementType, LayoutNodeType, QueryMsg,
     SVGSVGData, StyleData, TrustedNodeAddress,
@@ -103,6 +103,7 @@ use crate::dom::svgsvgelement::{LayoutSVGSVGElementHelpers, SVGSVGElement};
 use crate::dom::text::Text;
 use crate::dom::virtualmethods::{vtable_for, VirtualMethods};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
 //
@@ -389,7 +390,7 @@ impl Node {
     }
 
     /// <https://html.spec.whatg.org/#fire_a_synthetic_mouse_event>
-    pub fn fire_synthetic_mouse_event_not_trusted(&self, name: DOMString) {
+    pub fn fire_synthetic_mouse_event_not_trusted(&self, name: DOMString, can_gc: CanGc) {
         // Spec says the choice of which global to create
         // the mouse event on is not well-defined,
         // and refers to heycam/webidl#135
@@ -414,6 +415,7 @@ impl Node {
             0,     // buttons uninitialized (and therefore none)
             None,  // related_target uninitialized,
             None,  // point_in_target uninitialized,
+            can_gc,
         );
 
         // Step 4: TODO composed flag for shadow root
@@ -425,7 +427,7 @@ impl Node {
 
         mouse_event
             .upcast::<Event>()
-            .dispatch(self.upcast::<EventTarget>(), false);
+            .dispatch(self.upcast::<EventTarget>(), false, can_gc);
     }
 
     pub fn parent_directionality(&self) -> String {
@@ -604,6 +606,11 @@ impl Node {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        // A node is considered empty if its length is 0.
+        self.len() == 0
+    }
+
     /// <https://dom.spec.whatwg.org/#concept-tree-index>
     pub fn index(&self) -> u32 {
         self.preceding_siblings().count() as u32
@@ -777,7 +784,7 @@ impl Node {
         child
             .parent_node
             .get()
-            .map_or(false, |parent| &*parent == self)
+            .is_some_and(|parent| &*parent == self)
     }
 
     pub fn to_trusted_node_address(&self) -> TrustedNodeAddress {
@@ -786,25 +793,25 @@ impl Node {
 
     /// Returns the rendered bounding content box if the element is rendered,
     /// and none otherwise.
-    pub fn bounding_content_box(&self) -> Option<Rect<Au>> {
-        window_from_node(self).content_box_query(self)
+    pub fn bounding_content_box(&self, can_gc: CanGc) -> Option<Rect<Au>> {
+        window_from_node(self).content_box_query(self, can_gc)
     }
 
-    pub fn bounding_content_box_or_zero(&self) -> Rect<Au> {
-        self.bounding_content_box().unwrap_or_else(Rect::zero)
+    pub fn bounding_content_box_or_zero(&self, can_gc: CanGc) -> Rect<Au> {
+        self.bounding_content_box(can_gc).unwrap_or_else(Rect::zero)
     }
 
-    pub fn content_boxes(&self) -> Vec<Rect<Au>> {
-        window_from_node(self).content_boxes_query(self)
+    pub fn content_boxes(&self, can_gc: CanGc) -> Vec<Rect<Au>> {
+        window_from_node(self).content_boxes_query(self, can_gc)
     }
 
-    pub fn client_rect(&self) -> Rect<i32> {
-        window_from_node(self).client_rect_query(self)
+    pub fn client_rect(&self, can_gc: CanGc) -> Rect<i32> {
+        window_from_node(self).client_rect_query(self, can_gc)
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth>
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollheight>
-    pub fn scroll_area(&self) -> Rect<i32> {
+    pub fn scroll_area(&self, can_gc: CanGc) -> Rect<i32> {
         // "1. Let document be the element’s node document.""
         let document = self.owner_doc();
 
@@ -819,10 +826,10 @@ impl Node {
         let viewport = Size2D::new(window.InnerWidth(), window.InnerHeight());
 
         let in_quirks_mode = document.quirks_mode() == QuirksMode::Quirks;
-        let is_root = self.downcast::<Element>().map_or(false, |e| e.is_root());
+        let is_root = self.downcast::<Element>().is_some_and(|e| e.is_root());
         let is_body_element = self
             .downcast::<HTMLBodyElement>()
-            .map_or(false, |e| e.is_the_html_body_element());
+            .is_some_and(|e| e.is_the_html_body_element());
 
         // "4. If the element is the root element and document is not in quirks mode
         // return max(viewport scrolling area width/height, viewport width/height)."
@@ -830,7 +837,7 @@ impl Node {
         // element is not potentially scrollable, return max(viewport scrolling area
         // width, viewport width)."
         if (is_root && !in_quirks_mode) || (is_body_element && in_quirks_mode) {
-            let viewport_scrolling_area = window.scrolling_area_query(None);
+            let viewport_scrolling_area = window.scrolling_area_query(None, can_gc);
             return Rect::new(
                 viewport_scrolling_area.origin,
                 viewport_scrolling_area.size.max(viewport),
@@ -840,7 +847,7 @@ impl Node {
         // "6. If the element does not have any associated box return zero and terminate
         // these steps."
         // "7. Return the width of the element’s scrolling area."
-        window.scrolling_area_query(Some(self))
+        window.scrolling_area_query(Some(self), can_gc)
     }
 
     pub fn scroll_offset(&self) -> Vector2D<f32> {
@@ -976,8 +983,10 @@ impl Node {
                     NeedsSelectorFlags::No,
                     MatchingForInvalidation::No,
                 );
-                Ok(self
-                    .traverse_preorder(ShadowIncluding::No)
+                let mut descendants = self.traverse_preorder(ShadowIncluding::No);
+                // Skip the root of the tree.
+                assert!(&*descendants.next().unwrap() == self);
+                Ok(descendants
                     .filter_map(DomRoot::downcast)
                     .find(|element| matches_selector_list(&selectors, element, &mut ctx)))
             },
@@ -1113,30 +1122,19 @@ impl Node {
 
     pub fn summarize(&self) -> NodeInfo {
         let USVString(base_uri) = self.BaseURI();
+        let node_type = self.NodeType();
         NodeInfo {
-            uniqueId: self.unique_id(),
-            baseURI: base_uri,
+            unique_id: self.unique_id(),
+            base_uri,
             parent: self
                 .GetParentNode()
                 .map_or("".to_owned(), |node| node.unique_id()),
-            nodeType: self.NodeType(),
-            namespaceURI: String::new(), //FIXME
-            nodeName: String::from(self.NodeName()),
-            numChildren: self.ChildNodes().Length() as usize,
-
-            //FIXME doctype nodes only
-            name: String::new(),
-            publicId: String::new(),
-            systemId: String::new(),
+            node_type,
+            is_top_level_document: node_type == NodeConstants::DOCUMENT_NODE,
+            node_name: String::from(self.NodeName()),
+            node_value: self.GetNodeValue().map(|v| v.into()),
+            num_children: self.ChildNodes().Length() as usize,
             attrs: self.downcast().map(Element::summarize).unwrap_or(vec![]),
-
-            isDocumentElement: self
-                .owner_doc()
-                .GetDocumentElement()
-                .map_or(false, |elem| elem.upcast::<Node>() == self),
-
-            shortValue: self.GetNodeValue().map(String::from).unwrap_or_default(), //FIXME: truncate
-            incompleteValue: false, //FIXME: reflect truncation
         }
     }
 
@@ -1272,8 +1270,8 @@ impl Node {
         })
     }
 
-    pub fn style(&self) -> Option<Arc<ComputedValues>> {
-        if !window_from_node(self).layout_reflow(QueryMsg::StyleQuery) {
+    pub fn style(&self, can_gc: CanGc) -> Option<Arc<ComputedValues>> {
+        if !window_from_node(self).layout_reflow(QueryMsg::StyleQuery, can_gc) {
             return None;
         }
         self.style_data
@@ -1300,16 +1298,7 @@ where
 /// returns it.
 #[allow(unsafe_code)]
 pub unsafe fn from_untrusted_node_address(candidate: UntrustedNodeAddress) -> DomRoot<Node> {
-    // https://github.com/servo/servo/issues/6383
-    let candidate = candidate.0 as usize;
-    //        let object: *mut JSObject = jsfriendapi::bindgen::JS_GetAddressableObject(runtime,
-    //                                                                                  candidate);
-    let object = candidate as *mut JSObject;
-    if object.is_null() {
-        panic!("Attempted to create a `Dom<Node>` from an invalid pointer!")
-    }
-    let boxed_node = conversions::private_from_object(object) as *const Node;
-    DomRoot::from_ref(&*boxed_node)
+    DomRoot::from_ref(Node::from_untrusted_node_address(candidate))
 }
 
 #[allow(unsafe_code)]
@@ -1325,7 +1314,7 @@ pub trait LayoutNodeHelpers<'dom> {
     fn owner_doc_for_layout(self) -> LayoutDom<'dom, Document>;
     fn containing_shadow_root_for_layout(self) -> Option<LayoutDom<'dom, ShadowRoot>>;
 
-    fn is_element_for_layout(self) -> bool;
+    fn is_element_for_layout(&self) -> bool;
     unsafe fn get_flag(self, flag: NodeFlags) -> bool;
     unsafe fn set_flag(self, flag: NodeFlags, value: bool);
 
@@ -1387,8 +1376,8 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
     }
 
     #[inline]
-    fn is_element_for_layout(self) -> bool {
-        self.is::<Element>()
+    fn is_element_for_layout(&self) -> bool {
+        (*self).is::<Element>()
     }
 
     #[inline]
@@ -1794,7 +1783,7 @@ impl Node {
         N: DerivedFrom<Node> + DomObject + DomObjectWrap,
     {
         let window = document.window();
-        reflect_dom_object_with_proto(node, window, proto)
+        reflect_dom_object_with_proto(node, window, proto, CanGc::note())
     }
 
     pub fn new_inherited(doc: &Document) -> Node {
@@ -2110,6 +2099,8 @@ impl Node {
             MutationObserver::queue_a_mutation_record(parent, mutation);
         }
         node.owner_doc().remove_script_and_layout_blocker();
+
+        ScriptThread::note_rendering_opportunity(window_from_node(parent).pipeline_id());
     }
 
     /// <https://dom.spec.whatwg.org/#concept-node-replace-all>
@@ -2190,7 +2181,7 @@ impl Node {
         parent.owner_doc().add_script_and_layout_blocker();
         assert!(node
             .GetParentNode()
-            .map_or(false, |node_parent| &*node_parent == parent));
+            .is_some_and(|node_parent| &*node_parent == parent));
         let cached_index = {
             if parent.ranges.is_empty() {
                 None
@@ -2233,6 +2224,7 @@ impl Node {
             MutationObserver::queue_a_mutation_record(parent, mutation);
         }
         parent.owner_doc().remove_script_and_layout_blocker();
+        ScriptThread::note_rendering_opportunity(window_from_node(parent).pipeline_id());
     }
 
     /// <https://dom.spec.whatwg.org/#concept-node-clone>
@@ -2240,6 +2232,7 @@ impl Node {
         node: &Node,
         maybe_doc: Option<&Document>,
         clone_children: CloneChildrenFlag,
+        can_gc: CanGc,
     ) -> DomRoot<Node> {
         // Step 1.
         let document = match maybe_doc {
@@ -2304,7 +2297,9 @@ impl Node {
                     loader,
                     None,
                     None,
+                    document.status_code(),
                     Default::default(),
+                    can_gc,
                 );
                 DomRoot::upcast::<Node>(document)
             },
@@ -2322,6 +2317,7 @@ impl Node {
                     ElementCreator::ScriptCreated,
                     CustomElementCreationMode::Asynchronous,
                     None,
+                    can_gc,
                 );
                 DomRoot::upcast::<Node>(element)
             },
@@ -2365,7 +2361,7 @@ impl Node {
         // Step 6.
         if clone_children == CloneChildrenFlag::CloneChildren {
             for child in node.children() {
-                let child_copy = Node::clone(&child, Some(&document), clone_children);
+                let child_copy = Node::clone(&child, Some(&document), clone_children, can_gc);
                 let _inserted_node = Node::pre_insert(&child_copy, &copy, None);
             }
         }
@@ -2424,6 +2420,24 @@ impl Node {
                 .as_ref()
                 .map_or(ns!(), |elem| elem.locate_namespace(prefix)),
         }
+    }
+
+    /// If the given untrusted node address represents a valid DOM node in the given runtime,
+    /// returns it.
+    ///
+    /// # Safety
+    ///
+    /// Callers should ensure they pass an UntrustedNodeAddress that points to a valid [`JSObject`]
+    /// in memory that represents a [`Node`].
+    #[allow(unsafe_code)]
+    pub unsafe fn from_untrusted_node_address(candidate: UntrustedNodeAddress) -> &'static Self {
+        // https://github.com/servo/servo/issues/6383
+        let candidate = candidate.0 as usize;
+        let object = candidate as *mut JSObject;
+        if object.is_null() {
+            panic!("Attempted to create a `Node` from an invalid pointer!")
+        }
+        &*(conversions::private_from_object(object) as *const Self)
     }
 }
 
@@ -2795,7 +2809,7 @@ impl NodeMethods for Node {
                 }
                 while children
                     .peek()
-                    .map_or(false, |(_, sibling)| sibling.is::<Text>())
+                    .is_some_and(|(_, sibling)| sibling.is::<Text>())
                 {
                     let (index, sibling) = children.next().unwrap();
                     sibling
@@ -2815,7 +2829,7 @@ impl NodeMethods for Node {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-node-clonenode>
-    fn CloneNode(&self, deep: bool) -> Fallible<DomRoot<Node>> {
+    fn CloneNode(&self, deep: bool, can_gc: CanGc) -> Fallible<DomRoot<Node>> {
         if deep && self.is::<ShadowRoot>() {
             return Err(Error::NotSupported);
         }
@@ -2827,6 +2841,7 @@ impl NodeMethods for Node {
             } else {
                 CloneChildrenFlag::DoNotCloneChildren
             },
+            can_gc,
         ))
     }
 
@@ -3491,11 +3506,23 @@ impl From<ElementTypeId> for LayoutElementType {
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLInputElement) => {
                 LayoutElementType::HTMLInputElement
             },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLOptGroupElement) => {
+                LayoutElementType::HTMLOptGroupElement
+            },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLOptionElement) => {
+                LayoutElementType::HTMLOptionElement
+            },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLObjectElement) => {
                 LayoutElementType::HTMLObjectElement
             },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLParagraphElement) => {
                 LayoutElementType::HTMLParagraphElement
+            },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLPreElement) => {
+                LayoutElementType::HTMLPreElement
+            },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLSelectElement) => {
+                LayoutElementType::HTMLSelectElement
             },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLTableCellElement) => {
                 LayoutElementType::HTMLTableCellElement

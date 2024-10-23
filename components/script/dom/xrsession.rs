@@ -3,23 +3,29 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, PI};
-use std::mem;
 use std::rc::Rc;
+use std::{mem, ptr};
 
+use base::cross_process_instant::CrossProcessInstant;
 use dom_struct::dom_struct;
 use euclid::{RigidTransform3D, Transform3D, Vector3D};
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::router::ROUTER;
-use metrics::ToMs;
+use js::jsapi::JSObject;
+use js::jsval::JSVal;
+use js::typedarray::Float32Array;
 use profile_traits::ipc;
+use servo_atoms::Atom;
 use webxr_api::{
     self, util, ApiSpace, ContextId as WebXRContextId, Display, EntityTypes, EnvironmentBlendMode,
-    Event as XREvent, Frame, FrameUpdateEvent, HitTestId, HitTestSource, Ray, SelectEvent,
-    SelectKind, Session, SessionId, View, Viewer, Visibility,
+    Event as XREvent, Frame, FrameUpdateEvent, HitTestId, HitTestSource, InputFrame, InputId, Ray,
+    SelectEvent, SelectKind, Session, SessionId, View, Viewer, Visibility,
 };
 
 use super::bindings::trace::HashMapTracedValues;
+use crate::dom::bindings::buffer_source::create_buffer_source;
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::Navigator_Binding::NavigatorMethods;
@@ -27,34 +33,42 @@ use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::Wind
 use crate::dom::bindings::codegen::Bindings::XRHitTestSourceBinding::{
     XRHitTestOptionsInit, XRHitTestTrackableType,
 };
+use crate::dom::bindings::codegen::Bindings::XRInputSourceArrayBinding::XRInputSourceArray_Binding::XRInputSourceArrayMethods;
 use crate::dom::bindings::codegen::Bindings::XRReferenceSpaceBinding::XRReferenceSpaceType;
 use crate::dom::bindings::codegen::Bindings::XRRenderStateBinding::{
     XRRenderStateInit, XRRenderStateMethods,
 };
 use crate::dom::bindings::codegen::Bindings::XRSessionBinding::{
-    XREnvironmentBlendMode, XRFrameRequestCallback, XRSessionMethods, XRVisibilityState,
+    XREnvironmentBlendMode, XRFrameRequestCallback, XRInteractionMode, XRSessionMethods,
+    XRVisibilityState,
 };
 use crate::dom::bindings::codegen::Bindings::XRSystemBinding::XRSessionMode;
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
 use crate::dom::bindings::root::{Dom, DomRoot, MutDom, MutNullableDom};
+use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::performance::reduce_timing_resolution;
 use crate::dom::promise::Promise;
+use crate::dom::xrboundedreferencespace::XRBoundedReferenceSpace;
 use crate::dom::xrframe::XRFrame;
 use crate::dom::xrhittestsource::XRHitTestSource;
 use crate::dom::xrinputsourcearray::XRInputSourceArray;
 use crate::dom::xrinputsourceevent::XRInputSourceEvent;
 use crate::dom::xrreferencespace::XRReferenceSpace;
+use crate::dom::xrreferencespaceevent::XRReferenceSpaceEvent;
 use crate::dom::xrrenderstate::XRRenderState;
+use crate::dom::xrrigidtransform::XRRigidTransform;
 use crate::dom::xrsessionevent::XRSessionEvent;
 use crate::dom::xrspace::XRSpace;
 use crate::realms::InRealm;
+use crate::script_runtime::JSContext;
 use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct XRSession {
@@ -92,6 +106,13 @@ pub struct XRSession {
     /// Opaque framebuffers need to know the session is "outside of a requestAnimationFrame"
     /// <https://immersive-web.github.io/webxr/#opaque-framebuffer>
     outside_raf: Cell<bool>,
+    #[ignore_malloc_size_of = "defined in webxr"]
+    #[no_trace]
+    input_frames: DomRefCell<HashMap<InputId, InputFrame>>,
+    framerate: Cell<f32>,
+    #[ignore_malloc_size_of = "promises are hard"]
+    update_framerate_promise: DomRefCell<Option<Rc<Promise>>>,
+    reference_spaces: DomRefCell<Vec<Dom<XRReferenceSpace>>>,
 }
 
 impl XRSession {
@@ -122,6 +143,10 @@ impl XRSession {
             next_hit_test_id: Cell::new(HitTestId(0)),
             pending_hit_test_promises: DomRefCell::new(HashMapTracedValues::new()),
             outside_raf: Cell::new(true),
+            input_frames: DomRefCell::new(HashMap::new()),
+            framerate: Cell::new(0.0),
+            update_framerate_promise: DomRefCell::new(None),
+            reference_spaces: DomRefCell::new(Vec::new()),
         }
     }
 
@@ -179,24 +204,15 @@ impl XRSession {
         let (task_source, canceller) = window
             .task_manager()
             .dom_manipulation_task_source_with_canceller();
-        ROUTER.add_route(
-            frame_receiver.to_opaque(),
+        ROUTER.add_typed_route(
+            frame_receiver,
             Box::new(move |message| {
-                #[allow(unused)]
-                let mut frame: Frame = message.to().unwrap();
-                #[cfg(feature = "xr-profile")]
-                {
-                    let received = time::precise_time_ns();
-                    println!(
-                        "WEBXR PROFILING [raf receive]:\t{}ms",
-                        (received - frame.sent_time) as f64 / 1_000_000.
-                    );
-                    frame.sent_time = received;
-                }
+                let frame: Frame = message.unwrap();
+                let time = CrossProcessInstant::now();
                 let this = this.clone();
                 let _ = task_source.queue_with_canceller(
                     task!(xr_raf_callback: move || {
-                        this.root().raf_callback(frame);
+                        this.root().raf_callback(frame, time);
                     }),
                     &canceller,
                 );
@@ -219,13 +235,13 @@ impl XRSession {
             .dom_manipulation_task_source_with_canceller();
         let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
 
-        ROUTER.add_route(
-            receiver.to_opaque(),
+        ROUTER.add_typed_route(
+            receiver.to_ipc_receiver(),
             Box::new(move |message| {
                 let this = this.clone();
                 let _ = task_source.queue_with_canceller(
                     task!(xr_event_callback: move || {
-                        this.root().event_callback(message.to().unwrap());
+                        this.root().event_callback(message.unwrap(), CanGc::note());
                     }),
                     &canceller,
                 );
@@ -260,13 +276,13 @@ impl XRSession {
         let _ = task_source.queue_with_canceller(
             task!(session_initial_inputs: move || {
                 let this = this.root();
-                this.input_sources.add_input_sources(&this, &initial_inputs);
+                this.input_sources.add_input_sources(&this, &initial_inputs, CanGc::note());
             }),
             &canceller,
         );
     }
 
-    fn event_callback(&self, event: XREvent) {
+    fn event_callback(&self, event: XREvent, can_gc: CanGc) {
         match event {
             XREvent::SessionEnd => {
                 // https://immersive-web.github.io/webxr/#shut-down-the-session
@@ -281,7 +297,8 @@ impl XRSession {
                     promise.resolve_native(&());
                 }
                 // Step 7
-                let event = XRSessionEvent::new(&self.global(), atom!("end"), false, false, self);
+                let event =
+                    XRSessionEvent::new(&self.global(), atom!("end"), false, false, self, can_gc);
                 event.upcast::<Event>().fire(self.upcast());
             },
             XREvent::Select(input, kind, ty, frame) => {
@@ -304,6 +321,7 @@ impl XRSession {
                             false,
                             &frame,
                             &source,
+                            can_gc,
                         );
                         event.upcast::<Event>().fire(self.upcast());
                     } else {
@@ -315,6 +333,7 @@ impl XRSession {
                                 false,
                                 &frame,
                                 &source,
+                                can_gc,
                             );
                             event.upcast::<Event>().fire(self.upcast());
                         }
@@ -325,6 +344,7 @@ impl XRSession {
                             false,
                             &frame,
                             &source,
+                            can_gc,
                         );
                         event.upcast::<Event>().fire(self.upcast());
                     }
@@ -344,6 +364,7 @@ impl XRSession {
                     false,
                     false,
                     self,
+                    can_gc,
                 );
                 event.upcast::<Event>().fire(self.upcast());
                 // The page may be visible again, dirty the layers
@@ -351,27 +372,54 @@ impl XRSession {
                 self.dirty_layers();
             },
             XREvent::AddInput(info) => {
-                self.input_sources.add_input_sources(self, &[info]);
+                self.input_sources.add_input_sources(self, &[info], can_gc);
             },
             XREvent::RemoveInput(id) => {
-                self.input_sources.remove_input_source(self, id);
+                self.input_sources.remove_input_source(self, id, can_gc);
             },
             XREvent::UpdateInput(id, source) => {
-                self.input_sources.add_remove_input_source(self, id, source);
+                self.input_sources
+                    .add_remove_input_source(self, id, source, can_gc);
+            },
+            XREvent::InputChanged(id, frame) => {
+                self.input_frames.borrow_mut().insert(id, frame);
+            },
+            XREvent::ReferenceSpaceChanged(base_space, transform) => {
+                self.reference_spaces
+                    .borrow()
+                    .iter()
+                    .filter(|space| {
+                        let base = match space.ty() {
+                            XRReferenceSpaceType::Local => webxr_api::BaseSpace::Local,
+                            XRReferenceSpaceType::Viewer => webxr_api::BaseSpace::Viewer,
+                            XRReferenceSpaceType::Local_floor => webxr_api::BaseSpace::Floor,
+                            XRReferenceSpaceType::Bounded_floor => {
+                                webxr_api::BaseSpace::BoundedFloor
+                            },
+                            _ => panic!("unsupported reference space found"),
+                        };
+                        base == base_space
+                    })
+                    .for_each(|space| {
+                        let offset = XRRigidTransform::new(&self.global(), transform, can_gc);
+                        let event = XRReferenceSpaceEvent::new(
+                            &self.global(),
+                            atom!("reset"),
+                            false,
+                            false,
+                            space,
+                            Some(&*offset),
+                            can_gc,
+                        );
+                        event.upcast::<Event>().fire(space.upcast());
+                    });
             },
         }
     }
 
     /// <https://immersive-web.github.io/webxr/#xr-animation-frame>
-    fn raf_callback(&self, mut frame: Frame) {
+    fn raf_callback(&self, mut frame: Frame, time: CrossProcessInstant) {
         debug!("WebXR RAF callback {:?}", frame);
-        #[cfg(feature = "xr-profile")]
-        let raf_start = time::precise_time_ns();
-        #[cfg(feature = "xr-profile")]
-        println!(
-            "WEBXR PROFILING [raf queued]:\t{}ms",
-            (raf_start - frame.sent_time) as f64 / 1_000_000.
-        );
 
         // Step 1-2 happen in the xebxr device thread
 
@@ -420,10 +468,10 @@ impl XRSession {
             assert!(current.is_empty());
             mem::swap(&mut *self.raf_callback_list.borrow_mut(), &mut current);
         }
-        let start = self.global().as_window().get_navigation_start();
-        let time = reduce_timing_resolution((frame.time_ns - start).to_ms());
 
+        let time = self.global().performance().to_dom_high_res_time_stamp(time);
         let frame = XRFrame::new(&self.global(), self, frame);
+
         // Step 8-9
         frame.set_active(true);
         frame.set_animation_frame(true);
@@ -438,10 +486,7 @@ impl XRSession {
         self.outside_raf.set(false);
         let len = self.current_raf_callback_list.borrow().len();
         for i in 0..len {
-            let callback = self.current_raf_callback_list.borrow()[i]
-                .1
-                .as_ref()
-                .map(Rc::clone);
+            let callback = self.current_raf_callback_list.borrow()[i].1.clone();
             if let Some(callback) = callback {
                 let _ = callback.Call__(time, &frame, ExceptionHandling::Report);
             }
@@ -457,12 +502,6 @@ impl XRSession {
 
         // TODO: how does this fit the webxr spec?
         self.session.borrow_mut().render_animation_frame();
-
-        #[cfg(feature = "xr-profile")]
-        println!(
-            "WEBXR PROFILING [raf execute]:\t{}ms",
-            (time::precise_time_ns() - raf_start) as f64 / 1_000_000.
-        );
     }
 
     fn update_inline_projection_matrix(&self) {
@@ -535,7 +574,13 @@ impl XRSession {
 
     /// <https://immersive-web.github.io/webxr/#xrframe-apply-frame-updates>
     fn apply_frame_updates(&self, _frame: &XRFrame) {
-        // TODO: add a comment about why this is empty right now!
+        // <https://www.w3.org/TR/webxr-gamepads-module-1/#xrframe-apply-gamepad-frame-updates>
+        for (id, frame) in self.input_frames.borrow_mut().drain() {
+            let source = self.input_sources.find(id);
+            if let Some(source) = source {
+                source.update_gamepad_state(frame);
+            }
+        }
     }
 
     fn handle_frame_event(&self, event: FrameUpdateEvent) {
@@ -552,6 +597,25 @@ impl XRSession {
             },
             _ => self.session.borrow_mut().apply_event(event),
         }
+    }
+
+    /// <https://www.w3.org/TR/webxr/#apply-the-nominal-frame-rate>
+    fn apply_nominal_framerate(&self, rate: f32) {
+        if self.framerate.get() == rate || self.ended.get() {
+            return;
+        }
+
+        self.framerate.set(rate);
+
+        let event = XRSessionEvent::new(
+            &self.global(),
+            Atom::from("frameratechange"),
+            false,
+            false,
+            self,
+            CanGc::note(),
+        );
+        event.upcast::<Event>().fire(self.upcast());
     }
 }
 
@@ -591,6 +655,9 @@ impl XRSessionMethods for XRSession {
         SetOninputsourceschange
     );
 
+    // https://www.w3.org/TR/webxr/#dom-xrsession-onframeratechange
+    event_handler!(frameratechange, GetOnframeratechange, SetOnframeratechange);
+
     // https://immersive-web.github.io/webxr/#dom-xrsession-renderstate
     fn RenderState(&self) -> DomRoot<XRRenderState> {
         self.active_render_state.get()
@@ -616,16 +683,8 @@ impl XRSessionMethods for XRSession {
 
         // https://immersive-web.github.io/layers/#updaterenderstatechanges
         // Step 1.
-        if init.baseLayer.is_some() {
-            if self.has_layers_feature() {
-                return Err(Error::NotSupported);
-            }
-            // https://github.com/immersive-web/layers/issues/189
-            if init.layers.is_some() {
-                return Err(Error::Type(String::from(
-                    "Cannot set WebXR layers and baseLayer",
-                )));
-            }
+        if init.baseLayer.is_some() && (self.has_layers_feature() || init.layers.is_some()) {
+            return Err(Error::NotSupported);
         }
 
         if let Some(Some(ref layers)) = init.layers {
@@ -684,11 +743,16 @@ impl XRSessionMethods for XRSession {
             pending.set_depth_near(near);
         }
         if let Some(far) = init.depthFar {
+            let mut far = *far;
             // Step 9 from #apply-the-pending-render-state
             // this may need to be changed if backends wish to impose
             // further constraints
-            // currently the maximum is infinity, so we do nothing
-            pending.set_depth_far(*far);
+            // currently the maximum is infinity, so just check that
+            // the value is non-negative
+            if far < 0. {
+                far = 0.;
+            }
+            pending.set_depth_far(far);
         }
         if let Some(fov) = init.inlineVerticalFieldOfView {
             let mut fov = *fov;
@@ -761,17 +825,29 @@ impl XRSessionMethods for XRSession {
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrsession-requestreferencespace>
-    fn RequestReferenceSpace(&self, ty: XRReferenceSpaceType, comp: InRealm) -> Rc<Promise> {
-        let p = Promise::new_in_current_realm(comp);
+    fn RequestReferenceSpace(
+        &self,
+        ty: XRReferenceSpaceType,
+        comp: InRealm,
+        can_gc: CanGc,
+    ) -> Rc<Promise> {
+        let p = Promise::new_in_current_realm(comp, can_gc);
 
         // https://immersive-web.github.io/webxr/#create-a-reference-space
 
         // XXXManishearth reject based on session type
         // https://github.com/immersive-web/webxr/blob/master/spatial-tracking-explainer.md#practical-usage-guidelines
 
+        if !self.is_immersive() &&
+            (ty == XRReferenceSpaceType::Bounded_floor || ty == XRReferenceSpaceType::Unbounded)
+        {
+            p.reject_error(Error::NotSupported);
+            return p;
+        }
+
         match ty {
-            XRReferenceSpaceType::Bounded_floor | XRReferenceSpaceType::Unbounded => {
-                // XXXManishearth eventually support these
+            XRReferenceSpaceType::Unbounded => {
+                // XXXmsub2 figure out how to support this
                 p.reject_error(Error::NotSupported)
             },
             ty => {
@@ -790,7 +866,19 @@ impl XRSessionMethods for XRSession {
                         return p;
                     }
                 }
-                p.resolve_native(&XRReferenceSpace::new(&self.global(), self, ty));
+                if ty == XRReferenceSpaceType::Bounded_floor {
+                    let space = XRBoundedReferenceSpace::new(&self.global(), self, can_gc);
+                    self.reference_spaces
+                        .borrow_mut()
+                        .push(Dom::from_ref(space.reference_space()));
+                    p.resolve_native(&space);
+                } else {
+                    let space = XRReferenceSpace::new(&self.global(), self, ty, can_gc);
+                    self.reference_spaces
+                        .borrow_mut()
+                        .push(Dom::from_ref(&*space));
+                    p.resolve_native(&space);
+                }
             },
         }
         p
@@ -802,9 +890,9 @@ impl XRSessionMethods for XRSession {
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrsession-end>
-    fn End(&self) -> Rc<Promise> {
+    fn End(&self, can_gc: CanGc) -> Rc<Promise> {
         let global = self.global();
-        let p = Promise::new(&global);
+        let p = Promise::new(&global, can_gc);
         if self.ended.get() && self.end_promises.borrow().is_empty() {
             // If the session has completely ended and all end promises have been resolved,
             // don't queue up more end promises
@@ -825,12 +913,17 @@ impl XRSessionMethods for XRSession {
         self.ended.set(true);
         global.as_window().Navigator().Xr().end_session(self);
         self.session.borrow_mut().end_session();
+        // Disconnect any still-attached XRInputSources
+        for source in 0..self.input_sources.Length() {
+            self.input_sources
+                .remove_input_source(self, InputId(source), can_gc);
+        }
         p
     }
 
     // https://immersive-web.github.io/hit-test/#dom-xrsession-requesthittestsource
-    fn RequestHitTestSource(&self, options: &XRHitTestOptionsInit) -> Rc<Promise> {
-        let p = Promise::new(&self.global());
+    fn RequestHitTestSource(&self, options: &XRHitTestOptionsInit, can_gc: CanGc) -> Rc<Promise> {
+        let p = Promise::new(&self.global(), can_gc);
 
         if !self
             .session
@@ -883,6 +976,110 @@ impl XRSessionMethods for XRSession {
         self.session.borrow().request_hit_test(source);
 
         p
+    }
+
+    /// <https://www.w3.org/TR/webxr-ar-module-1/#dom-xrsession-interactionmode>
+    fn InteractionMode(&self) -> XRInteractionMode {
+        // Until Servo supports WebXR sessions on mobile phones or similar non-XR devices,
+        // this should always be world space
+        XRInteractionMode::World_space
+    }
+
+    /// <https://www.w3.org/TR/webxr/#dom-xrsession-framerate>
+    fn GetFrameRate(&self) -> Option<Finite<f32>> {
+        let session = self.session.borrow();
+        if self.mode == XRSessionMode::Inline || session.supported_frame_rates().is_empty() {
+            None
+        } else {
+            Finite::new(self.framerate.get())
+        }
+    }
+
+    /// <https://www.w3.org/TR/webxr/#dom-xrsession-supportedframerates>
+    fn GetSupportedFrameRates(&self, cx: JSContext) -> Option<Float32Array> {
+        let session = self.session.borrow();
+        if self.mode == XRSessionMode::Inline || session.supported_frame_rates().is_empty() {
+            None
+        } else {
+            let framerates = session.supported_frame_rates();
+            rooted!(in (*cx) let mut array = ptr::null_mut::<JSObject>());
+            Some(
+                create_buffer_source(cx, framerates, array.handle_mut())
+                    .expect("Failed to construct supported frame rates array"),
+            )
+        }
+    }
+
+    /// <https://www.w3.org/TR/webxr/#dom-xrsession-enabledfeatures>
+    fn EnabledFeatures(&self, cx: JSContext) -> JSVal {
+        let session = self.session.borrow();
+        let features = session.granted_features();
+        to_frozen_array(features, cx)
+    }
+
+    /// <https://www.w3.org/TR/webxr/#dom-xrsession-issystemkeyboardsupported>
+    fn IsSystemKeyboardSupported(&self) -> bool {
+        // Support for this only exists on Meta headsets (no desktop support)
+        // so this will always be false until that changes
+        false
+    }
+
+    /// <https://www.w3.org/TR/webxr/#dom-xrsession-updatetargetframerate>
+    fn UpdateTargetFrameRate(
+        &self,
+        rate: Finite<f32>,
+        comp: InRealm,
+        can_gc: CanGc,
+    ) -> Rc<Promise> {
+        let promise = Promise::new_in_current_realm(comp, can_gc);
+        {
+            let session = self.session.borrow();
+            let supported_frame_rates = session.supported_frame_rates();
+
+            if self.mode == XRSessionMode::Inline ||
+                supported_frame_rates.is_empty() ||
+                self.ended.get()
+            {
+                promise.reject_error(Error::InvalidState);
+                return promise;
+            }
+
+            if !supported_frame_rates.contains(&*rate) {
+                promise.reject_error(Error::Type("Provided framerate not supported".into()));
+                return promise;
+            }
+        }
+
+        *self.update_framerate_promise.borrow_mut() = Some(promise.clone());
+
+        let this = Trusted::new(self);
+        let global = self.global();
+        let window = global.as_window();
+        let (task_source, canceller) = window
+            .task_manager()
+            .dom_manipulation_task_source_with_canceller();
+        let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
+
+        ROUTER.add_typed_route(
+            receiver.to_ipc_receiver(),
+            Box::new(move |message| {
+                let this = this.clone();
+                let _ = task_source.queue_with_canceller(
+                    task!(update_session_framerate: move || {
+                        let session = this.root();
+                        session.apply_nominal_framerate(message.unwrap());
+                        if let Some(promise) = session.update_framerate_promise.borrow_mut().take() {
+                            promise.resolve_native(&());
+                        };
+                    }),
+                    &canceller,
+                );
+            }),
+        );
+
+        self.session.borrow_mut().update_frame_rate(*rate, sender);
+
+        promise
     }
 }
 

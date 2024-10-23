@@ -12,7 +12,7 @@ use euclid::SideOffsets2D;
 use serde::Serialize;
 use style::logical_geometry::{LogicalMargin, WritingMode};
 use style::properties::ComputedValues;
-use style::values::computed::{LengthPercentageOrAuto, MaxSize, Size};
+use style::values::computed::{Inset, LengthPercentageOrAuto, Margin, MaxSize, Size};
 
 use crate::fragment::Fragment;
 
@@ -147,14 +147,12 @@ impl MarginCollapseInfo {
     ) -> (CollapsibleMargins, Au) {
         let state = match self.state {
             MarginCollapseState::AccumulatingCollapsibleTopMargin => {
+                let content_block_size = fragment.style().content_block_size();
                 may_collapse_through = may_collapse_through &&
-                    match fragment.style().content_block_size() {
-                        Size::Auto => true,
-                        Size::LengthPercentage(ref lp) => {
-                            lp.is_definitely_zero() ||
-                                lp.maybe_to_used_value(containing_block_size).is_none()
-                        },
-                    };
+                    content_block_size.is_definitely_zero() ||
+                    content_block_size
+                        .maybe_to_used_value(containing_block_size)
+                        .is_none();
 
                 if may_collapse_through {
                     if fragment.style.min_block_size().is_auto() ||
@@ -470,6 +468,29 @@ impl MaybeAuto {
     }
 
     #[inline]
+    pub fn from_inset(length: &Inset, containing_length: Au) -> MaybeAuto {
+        match length {
+            Inset::Auto => MaybeAuto::Auto,
+            Inset::LengthPercentage(ref lp) => {
+                MaybeAuto::Specified(lp.to_used_value(containing_length))
+            },
+            Inset::AnchorFunction(_) => unreachable!("anchor() should be disabled"),
+            Inset::AnchorSizeFunction(_) => unreachable!("anchor-size() should be disabled"),
+        }
+    }
+
+    #[inline]
+    pub fn from_margin(length: &Margin, containing_length: Au) -> MaybeAuto {
+        match length {
+            Margin::Auto => MaybeAuto::Auto,
+            Margin::LengthPercentage(ref lp) => {
+                MaybeAuto::Specified(lp.to_used_value(containing_length))
+            },
+            Margin::AnchorSizeFunction(_) => unreachable!("anchor-size() should be disabled"),
+        }
+    }
+
+    #[inline]
     pub fn from_option(au: Option<Au>) -> MaybeAuto {
         match au {
             Some(l) => MaybeAuto::Specified(l),
@@ -522,12 +543,7 @@ impl MaybeAuto {
 ///
 /// `style_length`: content size as given in the CSS.
 pub fn style_length(style_length: &Size, container_size: Option<Au>) -> MaybeAuto {
-    match style_length {
-        Size::Auto => MaybeAuto::Auto,
-        Size::LengthPercentage(ref lp) => {
-            MaybeAuto::from_option(lp.0.maybe_to_used_value(container_size.map(|l| l.into())))
-        },
-    }
+    MaybeAuto::from_option(style_length.maybe_to_used_value(container_size))
 }
 
 #[inline]
@@ -569,10 +585,10 @@ pub fn specified_margin_from_style(
     LogicalMargin::from_physical(
         writing_mode,
         SideOffsets2D::new(
-            MaybeAuto::from_style(&margin_style.margin_top, Au(0)).specified_or_zero(),
-            MaybeAuto::from_style(&margin_style.margin_right, Au(0)).specified_or_zero(),
-            MaybeAuto::from_style(&margin_style.margin_bottom, Au(0)).specified_or_zero(),
-            MaybeAuto::from_style(&margin_style.margin_left, Au(0)).specified_or_zero(),
+            MaybeAuto::from_margin(&margin_style.margin_top, Au(0)).specified_or_zero(),
+            MaybeAuto::from_margin(&margin_style.margin_right, Au(0)).specified_or_zero(),
+            MaybeAuto::from_margin(&margin_style.margin_bottom, Au(0)).specified_or_zero(),
+            MaybeAuto::from_margin(&margin_style.margin_left, Au(0)).specified_or_zero(),
         ),
     )
 }
@@ -595,17 +611,10 @@ impl SizeConstraint {
         max_size: &MaxSize,
         border: Option<Au>,
     ) -> SizeConstraint {
-        let mut min_size = match min_size {
-            Size::Auto => Au(0),
-            Size::LengthPercentage(ref lp) => {
-                lp.maybe_to_used_value(container_size).unwrap_or(Au(0))
-            },
-        };
-
-        let mut max_size = match max_size {
-            MaxSize::None => None,
-            MaxSize::LengthPercentage(ref lp) => lp.maybe_to_used_value(container_size),
-        };
+        let mut min_size = min_size
+            .maybe_to_used_value(container_size)
+            .unwrap_or(Au(0));
+        let mut max_size = max_size.maybe_to_used_value(container_size);
 
         // Make sure max size is not smaller than min size.
         max_size = max_size.map(|x| max(x, min_size));

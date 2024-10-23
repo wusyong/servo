@@ -6,7 +6,10 @@ use std::default::Default;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use base::cross_process_instant::CrossProcessInstant;
+use base::id::{PipelineId, PipelineNamespace};
 use crossbeam_channel::Receiver;
 use devtools_traits::{DevtoolScriptControlMsg, WorkerId};
 use dom_struct::dom_struct;
@@ -14,17 +17,15 @@ use ipc_channel::ipc::IpcSender;
 use js::jsval::UndefinedValue;
 use js::panic::maybe_resume_unwind;
 use js::rust::{HandleValue, ParentRuntime};
-use msg::constellation_msg::{PipelineId, PipelineNamespace};
 use net_traits::request::{
     CredentialsMode, Destination, ParserMetadata, RequestBuilder as NetRequestInit,
 };
 use net_traits::IpcSend;
-use parking_lot::Mutex;
 use script_traits::WorkerGlobalScopeInit;
 use servo_url::{MutableOrigin, ServoUrl};
-use time::precise_time_ns;
 use uuid::Uuid;
 
+use super::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeOptions;
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
     ImageBitmapOptions, ImageBitmapSource,
@@ -44,7 +45,7 @@ use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::crypto::Crypto;
 use crate::dom::dedicatedworkerglobalscope::DedicatedWorkerGlobalScope;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::identityhub::Identities;
+use crate::dom::identityhub::IdentityHub;
 use crate::dom::performance::Performance;
 use crate::dom::promise::Promise;
 use crate::dom::serviceworkerglobalscope::ServiceWorkerGlobalScope;
@@ -53,10 +54,7 @@ use crate::dom::workerlocation::WorkerLocation;
 use crate::dom::workernavigator::WorkerNavigator;
 use crate::fetch;
 use crate::realms::{enter_realm, InRealm};
-use crate::script_runtime::{
-    get_reports, CommonScriptMsg, ContextForRequestInterrupt, JSContext, Runtime, ScriptChan,
-    ScriptPort,
-};
+use crate::script_runtime::{CanGc, CommonScriptMsg, JSContext, Runtime, ScriptChan, ScriptPort};
 use crate::task::TaskCanceller;
 use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
 use crate::task_source::file_reading::FileReadingTaskSource;
@@ -114,17 +112,17 @@ pub struct WorkerGlobalScope {
 
     #[ignore_malloc_size_of = "Defined in ipc-channel"]
     #[no_trace]
-    /// Optional `IpcSender` for sending the `DevtoolScriptControlMsg`
-    /// to the server from within the worker
-    from_devtools_sender: Option<IpcSender<DevtoolScriptControlMsg>>,
+    /// A `Sender` for sending messages to devtools. This is unused but is stored here to
+    /// keep the channel alive.
+    _devtools_sender: Option<IpcSender<DevtoolScriptControlMsg>>,
 
-    #[ignore_malloc_size_of = "Defined in std"]
+    #[ignore_malloc_size_of = "Defined in crossbeam"]
     #[no_trace]
-    /// This `Receiver` will be ignored later if the corresponding
-    /// `IpcSender` doesn't exist
-    from_devtools_receiver: Receiver<DevtoolScriptControlMsg>,
+    /// A `Receiver` for receiving messages from devtools.
+    devtools_receiver: Option<Receiver<DevtoolScriptControlMsg>>,
 
-    navigation_start_precise: u64,
+    #[no_trace]
+    navigation_start: CrossProcessInstant,
     performance: MutNullableDom<Performance>,
 }
 
@@ -136,12 +134,18 @@ impl WorkerGlobalScope {
         worker_type: WorkerType,
         worker_url: ServoUrl,
         runtime: Runtime,
-        from_devtools_receiver: Receiver<DevtoolScriptControlMsg>,
+        devtools_receiver: Receiver<DevtoolScriptControlMsg>,
         closing: Arc<AtomicBool>,
-        gpu_id_hub: Arc<Mutex<Identities>>,
+        gpu_id_hub: Arc<IdentityHub>,
     ) -> Self {
         // Install a pipeline-namespace in the current thread.
         PipelineNamespace::auto_install();
+
+        let devtools_receiver = match init.from_devtools_sender {
+            Some(..) => Some(devtools_receiver),
+            None => None,
+        };
+
         Self {
             globalscope: GlobalScope::new_inherited(
                 init.pipeline_id,
@@ -167,18 +171,15 @@ impl WorkerGlobalScope {
             runtime: DomRefCell::new(Some(runtime)),
             location: Default::default(),
             navigator: Default::default(),
-            from_devtools_sender: init.from_devtools_sender,
-            from_devtools_receiver,
-            navigation_start_precise: precise_time_ns(),
+            devtools_receiver,
+            _devtools_sender: init.from_devtools_sender,
+            navigation_start: CrossProcessInstant::now(),
             performance: Default::default(),
         }
     }
 
     /// Clear various items when the worker event-loop shuts-down.
-    pub fn clear_js_runtime(&self, cx_for_interrupt: ContextForRequestInterrupt) {
-        // Ensure parent thread can no longer request interrupt
-        // using our JSContext that will soon be destroyed
-        cx_for_interrupt.revoke();
+    pub fn clear_js_runtime(&self) {
         self.upcast::<GlobalScope>()
             .remove_web_messaging_and_dedicated_workers_infra();
 
@@ -195,12 +196,8 @@ impl WorkerGlobalScope {
             .prepare_for_new_child()
     }
 
-    pub fn from_devtools_sender(&self) -> Option<IpcSender<DevtoolScriptControlMsg>> {
-        self.from_devtools_sender.clone()
-    }
-
-    pub fn from_devtools_receiver(&self) -> &Receiver<DevtoolScriptControlMsg> {
-        &self.from_devtools_receiver
+    pub fn devtools_receiver(&self) -> Option<&Receiver<DevtoolScriptControlMsg>> {
+        self.devtools_receiver.as_ref()
     }
 
     #[allow(unsafe_code)]
@@ -345,7 +342,7 @@ impl WorkerGlobalScopeMethods for WorkerGlobalScope {
         self.upcast::<GlobalScope>().set_timeout_or_interval(
             callback,
             args,
-            timeout,
+            Duration::from_millis(timeout.max(0) as u64),
             IsInterval::NonInterval,
         )
     }
@@ -371,7 +368,7 @@ impl WorkerGlobalScopeMethods for WorkerGlobalScope {
         self.upcast::<GlobalScope>().set_timeout_or_interval(
             callback,
             args,
-            timeout,
+            Duration::from_millis(timeout.max(0) as u64),
             IsInterval::Interval,
         )
     }
@@ -392,10 +389,11 @@ impl WorkerGlobalScopeMethods for WorkerGlobalScope {
         &self,
         image: ImageBitmapSource,
         options: &ImageBitmapOptions,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
         let p = self
             .upcast::<GlobalScope>()
-            .create_image_bitmap(image, options);
+            .create_image_bitmap(image, options, can_gc);
         p
     }
 
@@ -406,15 +404,16 @@ impl WorkerGlobalScopeMethods for WorkerGlobalScope {
         input: RequestOrUSVString,
         init: RootedTraceableBox<RequestInit>,
         comp: InRealm,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
-        fetch::Fetch(self.upcast(), input, init, comp)
+        fetch::Fetch(self.upcast(), input, init, comp, can_gc)
     }
 
     // https://w3c.github.io/hr-time/#the-performance-attribute
     fn Performance(&self) -> DomRoot<Performance> {
         self.performance.or_init(|| {
             let global_scope = self.upcast::<GlobalScope>();
-            Performance::new(global_scope, self.navigation_start_precise)
+            Performance::new(global_scope, self.navigation_start)
         })
     }
 
@@ -431,6 +430,17 @@ impl WorkerGlobalScopeMethods for WorkerGlobalScope {
     // https://w3c.github.io/webappsec-secure-contexts/#dom-windoworworkerglobalscope-issecurecontext
     fn IsSecureContext(&self) -> bool {
         self.upcast::<GlobalScope>().is_secure_context()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-structuredclone>
+    fn StructuredClone(
+        &self,
+        cx: JSContext,
+        value: HandleValue,
+        options: RootedTraceableBox<StructuredSerializeOptions>,
+    ) -> Fallible<js::jsval::JSVal> {
+        self.upcast::<GlobalScope>()
+            .structured_clone(cx, value, options)
     }
 }
 
@@ -457,7 +467,7 @@ impl WorkerGlobalScope {
                     println!("evaluate_script failed");
                     unsafe {
                         let ar = enter_realm(self);
-                        report_pending_exception(cx, true, InRealm::Entered(&ar));
+                        report_pending_exception(cx, true, InRealm::Entered(&ar), CanGc::note());
                     }
                 }
             },
@@ -529,8 +539,7 @@ impl WorkerGlobalScope {
             CommonScriptMsg::Task(_, task, _, _) => task.run_box(),
             CommonScriptMsg::CollectReports(reports_chan) => {
                 let cx = self.get_cx();
-                let path_seg = format!("url({})", self.get_url());
-                let reports = unsafe { get_reports(*cx, path_seg) };
+                let reports = cx.get_reports(format!("url({})", self.get_url()));
                 reports_chan.send(reports);
             },
         }

@@ -26,6 +26,7 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 use crate::task_source::TaskSource;
 
 #[dom_struct]
@@ -95,8 +96,9 @@ impl AnalyserNode {
         window: &Window,
         context: &BaseAudioContext,
         options: &AnalyserOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<AnalyserNode>> {
-        Self::new_with_proto(window, None, context, options)
+        Self::new_with_proto(window, None, context, options, can_gc)
     }
 
     #[allow(crown::unrooted_must_root)]
@@ -105,22 +107,23 @@ impl AnalyserNode {
         proto: Option<HandleObject>,
         context: &BaseAudioContext,
         options: &AnalyserOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<AnalyserNode>> {
         let (node, recv) = AnalyserNode::new_inherited(window, context, options)?;
-        let object = reflect_dom_object_with_proto(Box::new(node), window, proto);
+        let object = reflect_dom_object_with_proto(Box::new(node), window, proto, can_gc);
         let (source, canceller) = window
             .task_manager()
             .dom_manipulation_task_source_with_canceller();
         let this = Trusted::new(&*object);
 
-        ROUTER.add_route(
-            recv.to_opaque(),
+        ROUTER.add_typed_route(
+            recv,
             Box::new(move |block| {
                 let this = this.clone();
                 let _ = source.queue_with_canceller(
                     task!(append_analysis_block: move || {
                         let this = this.root();
-                        this.push_block(block.to().unwrap())
+                        this.push_block(block.unwrap())
                     }),
                     &canceller,
                 );
@@ -129,23 +132,23 @@ impl AnalyserNode {
         Ok(object)
     }
 
-    /// <https://webaudio.github.io/web-audio-api/#dom-analysernode-analysernode>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        context: &BaseAudioContext,
-        options: &AnalyserOptions,
-    ) -> Fallible<DomRoot<AnalyserNode>> {
-        AnalyserNode::new_with_proto(window, proto, context, options)
-    }
-
     pub fn push_block(&self, block: Block) {
         self.engine.borrow_mut().push(block)
     }
 }
 
 impl AnalyserNodeMethods for AnalyserNode {
+    /// <https://webaudio.github.io/web-audio-api/#dom-analysernode-analysernode>
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        context: &BaseAudioContext,
+        options: &AnalyserOptions,
+    ) -> Fallible<DomRoot<AnalyserNode>> {
+        AnalyserNode::new_with_proto(window, proto, context, options, can_gc)
+    }
+
     #[allow(unsafe_code)]
     /// <https://webaudio.github.io/web-audio-api/#dom-analysernode-getfloatfrequencydata>
     fn GetFloatFrequencyData(&self, mut array: CustomAutoRooterGuard<Float32Array>) {

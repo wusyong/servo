@@ -7,8 +7,8 @@
 use std::{cmp, fmt};
 
 use app_units::Au;
+use base::print_tree::PrintTree;
 use euclid::default::Point2D;
-use gfx_traits::print_tree::PrintTree;
 use log::{debug, trace};
 use serde::Serialize;
 use style::computed_values::{border_collapse, border_spacing, table_layout};
@@ -307,17 +307,14 @@ impl Flow for TableFlow {
             for specified_inline_size in &kid.as_mut_table_colgroup().inline_sizes {
                 self.column_intrinsic_inline_sizes
                     .push(ColumnIntrinsicInlineSize {
-                        minimum_length: match *specified_inline_size {
-                            Size::Auto => Au(0),
-                            Size::LengthPercentage(ref lp) => {
-                                lp.maybe_to_used_value(None).unwrap_or(Au(0))
-                            },
-                        },
+                        minimum_length: specified_inline_size
+                            .maybe_to_used_value(None)
+                            .unwrap_or(Au(0)),
                         percentage: match *specified_inline_size {
-                            Size::Auto => 0.0,
                             Size::LengthPercentage(ref lp) => {
                                 lp.0.to_percentage().map_or(0.0, |p| p.0)
                             },
+                            _ => 0.0,
                         },
                         preferred: Au(0),
                         constrained: false,
@@ -823,10 +820,9 @@ fn perform_border_collapse_for_row(
 
     // Compute block-start borders.
     let block_start_borders = &mut child_table_row.final_collapsed_borders.block_start;
-    *block_start_borders = child_table_row
-        .preliminary_collapsed_borders
-        .block_start
-        .clone();
+
+    block_start_borders.clone_from(&child_table_row.preliminary_collapsed_borders.block_start);
+
     for (i, this_border) in block_start_borders.iter_mut().enumerate() {
         match previous_block_borders {
             PreviousBlockCollapsedBorders::FromPreviousRow(ref previous_block_borders) => {
@@ -1351,14 +1347,9 @@ impl<'table> TableCellStyleInfo<'table> {
         };
         {
             let cell_flow = &self.cell.block_flow;
-            let initial = ComputedValues::initial_values();
 
             let build_dl = |sty: &ComputedValues, state: &mut &mut DisplayListBuildState| {
                 let background = sty.get_background();
-                // Don't redraw backgrounds that we've already drawn
-                if std::ptr::eq(background, initial.get_background()) {
-                    return;
-                }
                 let background_color = sty.resolve_color(background.background_color.clone());
                 cell_flow.build_display_list_for_background_if_applicable_with_background(
                     state,

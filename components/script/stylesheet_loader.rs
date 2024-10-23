@@ -3,15 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
 
+use base::id::PipelineId;
 use cssparser::SourceLocation;
 use encoding_rs::UTF_8;
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
 use mime::{self, Mime};
-use msg::constellation_msg::PipelineId;
-use net_traits::request::{CorsSettings, Destination, Referrer, RequestBuilder};
+use net_traits::request::{CorsSettings, Destination, Referrer, RequestBuilder, RequestId};
 use net_traits::{
     FetchMetadata, FetchResponseListener, FilteredMetadata, Metadata, NetworkError, ReferrerPolicy,
     ResourceFetchTiming, ResourceTimingType,
@@ -43,7 +40,8 @@ use crate::dom::node::{containing_shadow_root, document_from_node, window_from_n
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::shadowroot::ShadowRoot;
 use crate::fetch::create_a_potential_cors_request;
-use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
+use crate::script_runtime::CanGc;
 
 pub trait StylesheetOwner {
     /// Returns whether this element was inserted by the parser (i.e., it should
@@ -93,18 +91,17 @@ pub struct StylesheetContext {
 impl PreInvoke for StylesheetContext {}
 
 impl FetchResponseListener for StylesheetContext {
-    fn process_request_body(&mut self) {}
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self) {}
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
-        if let Ok(FetchMetadata::Filtered { ref filtered, .. }) = metadata {
-            match *filtered {
-                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => {
-                    self.origin_clean = false;
-                },
-                _ => {},
-            }
+    fn process_response(&mut self, _: RequestId, metadata: Result<FetchMetadata, NetworkError>) {
+        if let Ok(FetchMetadata::Filtered {
+            filtered: FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_),
+            ..
+        }) = metadata
+        {
+            self.origin_clean = false;
         }
 
         self.metadata = metadata.ok().map(|m| match m {
@@ -113,11 +110,15 @@ impl FetchResponseListener for StylesheetContext {
         });
     }
 
-    fn process_response_chunk(&mut self, mut payload: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, mut payload: Vec<u8>) {
         self.data.append(&mut payload);
     }
 
-    fn process_response_eof(&mut self, status: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        status: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         let elem = self.elem.root();
         let document = self.document.root();
         let mut successful = false;
@@ -127,7 +128,7 @@ impl FetchResponseListener for StylesheetContext {
                 Some(meta) => meta,
                 None => return,
             };
-            let is_css = metadata.content_type.map_or(false, |ct| {
+            let is_css = metadata.content_type.is_some_and(|ct| {
                 let mime: Mime = ct.into_inner().into();
                 mime.type_() == mime::TEXT && mime.subtype() == mime::CSS
             });
@@ -201,7 +202,7 @@ impl FetchResponseListener for StylesheetContext {
 
             // FIXME: Revisit once consensus is reached at:
             // https://github.com/whatwg/html/issues/1142
-            successful = metadata.status.map_or(false, |(code, _)| code == 200);
+            successful = metadata.status == http::StatusCode::OK;
         }
 
         let owner = elem
@@ -213,7 +214,7 @@ impl FetchResponseListener for StylesheetContext {
             document.decrement_script_blocking_stylesheet_count();
         }
 
-        document.finish_load(LoadType::Stylesheet(self.url.clone()));
+        document.finish_load(LoadType::Stylesheet(self.url.clone()), CanGc::note());
 
         if let Some(any_failed) = owner.load_finished(successful) {
             let event = if any_failed {
@@ -279,7 +280,7 @@ impl<'a> StylesheetLoader<'a> {
             .elem
             .downcast::<HTMLLinkElement>()
             .map(HTMLLinkElement::get_request_generation_id);
-        let context = ::std::sync::Arc::new(Mutex::new(StylesheetContext {
+        let context = StylesheetContext {
             elem: Trusted::new(self.elem),
             source,
             url: url.clone(),
@@ -290,24 +291,7 @@ impl<'a> StylesheetLoader<'a> {
             origin_clean: true,
             request_generation_id: gen,
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
-        }));
-
-        let (action_sender, action_receiver) = ipc::channel().unwrap();
-        let (task_source, canceller) = document
-            .window()
-            .task_manager()
-            .networking_task_source_with_canceller();
-        let listener = NetworkListener {
-            context,
-            task_source,
-            canceller: Some(canceller),
         };
-        ROUTER.add_route(
-            action_receiver.to_opaque(),
-            Box::new(move |message| {
-                listener.notify_fetch(message.to().unwrap());
-            }),
-        );
 
         let owner = self
             .elem
@@ -331,8 +315,9 @@ impl<'a> StylesheetLoader<'a> {
             referrer_policy,
             integrity_metadata,
         );
+        let request = document.prepare_request(request);
 
-        document.fetch_async(LoadType::Stylesheet(url), request, action_sender);
+        document.fetch(LoadType::Stylesheet(url), request, context);
     }
 }
 

@@ -4,11 +4,15 @@
 
 use app_units::Au;
 use style::color::AbsoluteColor;
+use style::computed_values::image_rendering::T as ComputedImageRendering;
 use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::text_decoration_style::T as ComputedTextDecorationStyle;
 use style::computed_values::transform_style::T as ComputedTransformStyle;
-use style::values::computed::{Filter as ComputedFilter, Length};
-use webrender_api::{units, FilterOp, LineStyle, MixBlendMode, Shadow, TransformStyle};
+use style::values::computed::Filter as ComputedFilter;
+use style::values::specified::border::BorderImageRepeatKeyword;
+use webrender_api::{
+    units, FilterOp, ImageRendering, LineStyle, MixBlendMode, RepeatMode, Shadow, TransformStyle,
+};
 
 use crate::geom::{PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize};
 
@@ -80,13 +84,6 @@ impl ToWebRender for ComputedTransformStyle {
     }
 }
 
-impl ToWebRender for PhysicalPoint<Length> {
-    type Type = units::LayoutPoint;
-    fn to_webrender(&self) -> Self::Type {
-        units::LayoutPoint::new(self.x.px(), self.y.px())
-    }
-}
-
 impl ToWebRender for PhysicalPoint<Au> {
     type Type = units::LayoutPoint;
     fn to_webrender(&self) -> Self::Type {
@@ -94,27 +91,10 @@ impl ToWebRender for PhysicalPoint<Au> {
     }
 }
 
-impl ToWebRender for PhysicalSize<Length> {
-    type Type = units::LayoutSize;
-    fn to_webrender(&self) -> Self::Type {
-        units::LayoutSize::new(self.width.px(), self.height.px())
-    }
-}
-
 impl ToWebRender for PhysicalSize<Au> {
     type Type = units::LayoutSize;
     fn to_webrender(&self) -> Self::Type {
         units::LayoutSize::new(self.width.to_f32_px(), self.height.to_f32_px())
-    }
-}
-
-impl ToWebRender for PhysicalRect<Length> {
-    type Type = units::LayoutRect;
-    fn to_webrender(&self) -> Self::Type {
-        units::LayoutRect::from_origin_and_size(
-            self.origin.to_webrender(),
-            self.size.to_webrender(),
-        )
     }
 }
 
@@ -149,6 +129,31 @@ impl ToWebRender for ComputedTextDecorationStyle {
             ComputedTextDecorationStyle::Dashed => LineStyle::Dashed,
             ComputedTextDecorationStyle::Wavy => LineStyle::Wavy,
             _ => LineStyle::Solid,
+        }
+    }
+}
+
+impl ToWebRender for BorderImageRepeatKeyword {
+    type Type = RepeatMode;
+
+    fn to_webrender(&self) -> Self::Type {
+        match *self {
+            BorderImageRepeatKeyword::Stretch => RepeatMode::Stretch,
+            BorderImageRepeatKeyword::Repeat => RepeatMode::Repeat,
+            BorderImageRepeatKeyword::Round => RepeatMode::Round,
+            BorderImageRepeatKeyword::Space => RepeatMode::Space,
+        }
+    }
+}
+
+impl ToWebRender for ComputedImageRendering {
+    type Type = ImageRendering;
+
+    fn to_webrender(&self) -> Self::Type {
+        match self {
+            ComputedImageRendering::Auto => ImageRendering::Auto,
+            ComputedImageRendering::CrispEdges => ImageRendering::CrispEdges,
+            ComputedImageRendering::Pixelated => ImageRendering::Pixelated,
         }
     }
 }

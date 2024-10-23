@@ -38,8 +38,8 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageevent::MessageEvent;
-use crate::script_runtime::CommonScriptMsg;
 use crate::script_runtime::ScriptThreadEventCategory::WebSocketEvent;
+use crate::script_runtime::{CanGc, CommonScriptMsg};
 use crate::task::{TaskCanceller, TaskOnce};
 use crate::task_source::websocket::WebsocketTaskSource;
 use crate::task_source::TaskSource;
@@ -134,19 +134,69 @@ impl WebSocket {
         proto: Option<HandleObject>,
         url: ServoUrl,
         sender: IpcSender<WebSocketDomAction>,
+        can_gc: CanGc,
     ) -> DomRoot<WebSocket> {
         reflect_dom_object_with_proto(
             Box::new(WebSocket::new_inherited(url, sender)),
             global,
             proto,
+            can_gc,
         )
     }
 
+    // https://html.spec.whatwg.org/multipage/#dom-websocket-send
+    fn send_impl(&self, data_byte_len: u64) -> Fallible<bool> {
+        let return_after_buffer = match self.ready_state.get() {
+            WebSocketRequestState::Connecting => {
+                return Err(Error::InvalidState);
+            },
+            WebSocketRequestState::Open => false,
+            WebSocketRequestState::Closing | WebSocketRequestState::Closed => true,
+        };
+
+        let address = Trusted::new(self);
+
+        match data_byte_len.checked_add(self.buffered_amount.get()) {
+            None => panic!(),
+            Some(new_amount) => self.buffered_amount.set(new_amount),
+        };
+
+        if return_after_buffer {
+            return Ok(false);
+        }
+
+        if !self.clearing_buffer.get() && self.ready_state.get() == WebSocketRequestState::Open {
+            self.clearing_buffer.set(true);
+
+            let task = Box::new(BufferedAmountTask { address });
+
+            let pipeline_id = self.global().pipeline_id();
+            self.global()
+                .script_chan()
+                // TODO: Use a dedicated `websocket-task-source` task source instead.
+                .send(CommonScriptMsg::Task(
+                    WebSocketEvent,
+                    task,
+                    Some(pipeline_id),
+                    WebsocketTaskSource::NAME,
+                ))
+                .unwrap();
+        }
+
+        Ok(true)
+    }
+
+    pub fn origin(&self) -> ImmutableOrigin {
+        self.url.origin()
+    }
+}
+
+impl WebSocketMethods for WebSocket {
     /// <https://html.spec.whatwg.org/multipage/#dom-websocket>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         url: DOMString,
         protocols: Option<StringOrStringSequence>,
     ) -> Fallible<DomRoot<WebSocket>> {
@@ -200,7 +250,7 @@ impl WebSocket {
             ProfiledIpc::IpcReceiver<WebSocketNetworkEvent>,
         ) = ProfiledIpc::channel(global.time_profiler_chan().clone()).unwrap();
 
-        let ws = WebSocket::new(global, proto, url_record.clone(), dom_action_sender);
+        let ws = WebSocket::new(global, proto, url_record.clone(), dom_action_sender, can_gc);
         let address = Trusted::new(&*ws);
 
         // Step 8.
@@ -218,9 +268,9 @@ impl WebSocket {
 
         let task_source = global.websocket_task_source();
         let canceller = global.task_canceller(WebsocketTaskSource::NAME);
-        ROUTER.add_route(
-            dom_event_receiver.to_opaque(),
-            Box::new(move |message| match message.to().unwrap() {
+        ROUTER.add_typed_route(
+            dom_event_receiver.to_ipc_receiver(),
+            Box::new(move |message| match message.unwrap() {
                 WebSocketNetworkEvent::ConnectionEstablished { protocol_in_use } => {
                     let open_thread = ConnectionEstablishedTask {
                         address: address.clone(),
@@ -254,54 +304,6 @@ impl WebSocket {
         Ok(ws)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-send
-    fn send_impl(&self, data_byte_len: u64) -> Fallible<bool> {
-        let return_after_buffer = match self.ready_state.get() {
-            WebSocketRequestState::Connecting => {
-                return Err(Error::InvalidState);
-            },
-            WebSocketRequestState::Open => false,
-            WebSocketRequestState::Closing | WebSocketRequestState::Closed => true,
-        };
-
-        let address = Trusted::new(self);
-
-        match data_byte_len.checked_add(self.buffered_amount.get()) {
-            None => panic!(),
-            Some(new_amount) => self.buffered_amount.set(new_amount),
-        };
-
-        if return_after_buffer {
-            return Ok(false);
-        }
-
-        if !self.clearing_buffer.get() && self.ready_state.get() == WebSocketRequestState::Open {
-            self.clearing_buffer.set(true);
-
-            let task = Box::new(BufferedAmountTask { address });
-
-            let pipeline_id = self.global().pipeline_id();
-            self.global()
-                .script_chan()
-                // TODO: Use a dedicated `websocket-task-source` task source instead.
-                .send(CommonScriptMsg::Task(
-                    WebSocketEvent,
-                    task,
-                    Some(pipeline_id),
-                    WebsocketTaskSource::NAME,
-                ))
-                .unwrap();
-        }
-
-        Ok(true)
-    }
-
-    pub fn origin(&self) -> ImmutableOrigin {
-        self.url.origin()
-    }
-}
-
-impl WebSocketMethods for WebSocket {
     // https://html.spec.whatwg.org/multipage/#handler-websocket-onopen
     event_handler!(open, GetOnopen, SetOnopen);
 
@@ -537,6 +539,7 @@ impl TaskOnce for CloseTask {
             clean_close,
             code,
             reason,
+            CanGc::note(),
         );
         close_event.upcast::<Event>().fire(ws.upcast());
     }
@@ -573,8 +576,11 @@ impl TaskOnce for MessageReceivedTask {
                 MessageData::Text(text) => text.to_jsval(*cx, message.handle_mut()),
                 MessageData::Binary(data) => match ws.binary_type.get() {
                     BinaryType::Blob => {
-                        let blob =
-                            Blob::new(&global, BlobImpl::new_from_bytes(data, "".to_owned()));
+                        let blob = Blob::new(
+                            &global,
+                            BlobImpl::new_from_bytes(data, "".to_owned()),
+                            CanGc::note(),
+                        );
                         blob.to_jsval(*cx, message.handle_mut());
                     },
                     BinaryType::Arraybuffer => {
@@ -597,6 +603,7 @@ impl TaskOnce for MessageReceivedTask {
                 Some(&ws.origin().ascii_serialization()),
                 None,
                 vec![],
+                CanGc::note(),
             );
         }
     }

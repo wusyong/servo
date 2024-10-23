@@ -31,10 +31,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use app_units::Au;
+use base::print_tree::PrintTree;
 use bitflags::bitflags;
 use euclid::default::{Point2D, Rect, Size2D, Vector2D};
-use gfx_traits::print_tree::PrintTree;
-use gfx_traits::StackingContextId;
 use log::debug;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
@@ -54,7 +53,9 @@ use webrender_api::units::LayoutTransform;
 use crate::block::{BlockFlow, FormattingContextType};
 use crate::context::LayoutContext;
 use crate::display_list::items::ClippingAndScrolling;
-use crate::display_list::{DisplayListBuildState, StackingContextCollectionState};
+use crate::display_list::{
+    DisplayListBuildState, StackingContextCollectionState, StackingContextId,
+};
 use crate::flex::FlexFlow;
 use crate::floats::{Floats, SpeculatedFloatPlacement};
 use crate::flow_list::{FlowList, FlowListIterator, MutFlowListIterator};
@@ -73,8 +74,11 @@ use crate::table_wrapper::TableWrapperFlow;
 /// This marker trait indicates that a type is a struct with `#[repr(C)]` whose first field
 /// is of type `BaseFlow` or some type that also implements this trait.
 ///
-/// In other words, the memory representation of `BaseFlow` must be a prefix
-/// of the memory representation of types implementing `HasBaseFlow`.
+/// # Safety
+///
+/// The memory representation of `BaseFlow` must be a prefix of the memory representation of types
+/// implementing `HasBaseFlow`. If this isn't the case, calling [`GetBaseFlow::base`] or
+/// [`GetBaseFlow::mut_base`] could lead to memory errors.
 #[allow(unsafe_code)]
 pub unsafe trait HasBaseFlow {}
 

@@ -5,13 +5,13 @@
 use std::cmp::max;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::{fmt, i32, isize, mem};
+use std::{fmt, mem};
 
 use app_units::{Au, MIN_AU};
+use base::print_tree::PrintTree;
 use bitflags::bitflags;
 use euclid::default::{Point2D, Rect, Size2D};
-use gfx::font::FontMetrics;
-use gfx_traits::print_tree::PrintTree;
+use fonts::{FontContext, FontMetrics};
 use log::debug;
 use range::{int_range_index, Range, RangeIndex};
 use script_layout_interface::wrapper_traits::PseudoElementType;
@@ -22,7 +22,8 @@ use style::computed_values::overflow_x::T as StyleOverflow;
 use style::computed_values::position::T as Position;
 use style::computed_values::text_align::T as TextAlign;
 use style::computed_values::text_justify::T as TextJustify;
-use style::computed_values::white_space::T as WhiteSpace;
+use style::computed_values::text_wrap_mode::T as TextWrapMode;
+use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::logical_geometry::{LogicalRect, LogicalSize, WritingMode};
 use style::properties::ComputedValues;
 use style::servo::restyle_damage::ServoRestyleDamage;
@@ -32,7 +33,7 @@ use style::values::specified::text::TextOverflowSide;
 use unicode_bidi as bidi;
 
 use crate::block::AbsoluteAssignBSizesTraversal;
-use crate::context::{LayoutContext, LayoutFontContext};
+use crate::context::LayoutContext;
 use crate::display_list::items::{DisplayListSection, OpaqueNode};
 use crate::display_list::{
     BorderPaintingMode, DisplayListBuildState, StackingContextCollectionState,
@@ -622,7 +623,7 @@ impl LineBreaker {
             if fragment.suppress_line_break_before() || !fragment.is_on_glyph_run_boundary() {
                 false
             } else {
-                fragment.white_space().allow_wrap()
+                fragment.text_wrap_mode() == TextWrapMode::Wrap
             }
         };
 
@@ -663,7 +664,7 @@ impl LineBreaker {
 
         // If we must flush the line after finishing this fragment due to `white-space: pre`,
         // detect that.
-        let line_flush_mode = if fragment.white_space().preserve_newlines() {
+        let line_flush_mode = if fragment.white_space_collapse() != WhiteSpaceCollapse::Collapse {
             if fragment.requires_line_break_afterward_if_wrapping_on_newlines() {
                 LineFlushMode::Flush
             } else {
@@ -687,7 +688,7 @@ impl LineBreaker {
 
         // If the wrapping mode prevents us from splitting, then back up and split at the last
         // known good split point.
-        if !fragment.white_space().allow_wrap() {
+        if fragment.text_wrap_mode() == TextWrapMode::Nowrap {
             debug!(
                 "LineBreaker: fragment can't split; falling back to last known good split point"
             );
@@ -1034,13 +1035,13 @@ impl InlineFlow {
         let is_ltr = fragments.fragments[0].style().writing_mode.is_bidi_ltr();
         let line_align = match (line_align, is_ltr) {
             (TextAlign::Left, true) |
-            (TextAlign::ServoLeft, true) |
+            (TextAlign::MozLeft, true) |
             (TextAlign::Right, false) |
-            (TextAlign::ServoRight, false) => TextAlign::Start,
+            (TextAlign::MozRight, false) => TextAlign::Start,
             (TextAlign::Left, false) |
-            (TextAlign::ServoLeft, false) |
+            (TextAlign::MozLeft, false) |
             (TextAlign::Right, true) |
-            (TextAlign::ServoRight, true) => TextAlign::End,
+            (TextAlign::MozRight, true) => TextAlign::End,
             _ => line_align,
         };
 
@@ -1052,11 +1053,11 @@ impl InlineFlow {
                 InlineFlow::justify_inline_fragments(fragments, line, slack_inline_size)
             },
             TextAlign::Justify | TextAlign::Start => {},
-            TextAlign::Center | TextAlign::ServoCenter => {
+            TextAlign::Center | TextAlign::MozCenter => {
                 inline_start_position_for_fragment += slack_inline_size.scale_by(0.5)
             },
             TextAlign::End => inline_start_position_for_fragment += slack_inline_size,
-            TextAlign::Left | TextAlign::ServoLeft | TextAlign::Right | TextAlign::ServoRight => {
+            TextAlign::Left | TextAlign::MozLeft | TextAlign::Right | TextAlign::MozRight => {
                 unreachable!()
             },
         }
@@ -1238,7 +1239,7 @@ impl InlineFlow {
     /// `style` is the style of the block.
     pub fn minimum_line_metrics(
         &self,
-        font_context: &mut LayoutFontContext,
+        font_context: &FontContext,
         style: &ComputedValues,
     ) -> LineMetrics {
         InlineFlow::minimum_line_metrics_for_fragments(
@@ -1254,7 +1255,7 @@ impl InlineFlow {
     /// `style` is the style of the block that these fragments belong to.
     pub fn minimum_line_metrics_for_fragments(
         fragments: &[Fragment],
-        font_context: &mut LayoutFontContext,
+        font_context: &FontContext,
         style: &ComputedValues,
     ) -> LineMetrics {
         // As a special case, if this flow contains only hypothetical fragments, then the entire
@@ -1494,10 +1495,18 @@ impl Flow for InlineFlow {
         let mut intrinsic_sizes_for_nonbroken_run = IntrinsicISizesContribution::new();
         for fragment in &mut self.fragments.fragments {
             let intrinsic_sizes_for_fragment = fragment.compute_intrinsic_inline_sizes().finish();
-            match fragment.style.get_inherited_text().white_space {
-                WhiteSpace::Nowrap => intrinsic_sizes_for_nonbroken_run
-                    .union_nonbreaking_inline(&intrinsic_sizes_for_fragment),
-                WhiteSpace::Pre => {
+            let style_text = fragment.style.get_inherited_text();
+            match (style_text.white_space_collapse, style_text.text_wrap_mode) {
+                (WhiteSpaceCollapse::Collapse, TextWrapMode::Nowrap) => {
+                    intrinsic_sizes_for_nonbroken_run
+                        .union_nonbreaking_inline(&intrinsic_sizes_for_fragment)
+                },
+                (
+                    WhiteSpaceCollapse::Preserve |
+                    WhiteSpaceCollapse::PreserveBreaks |
+                    WhiteSpaceCollapse::BreakSpaces,
+                    TextWrapMode::Nowrap,
+                ) => {
                     intrinsic_sizes_for_nonbroken_run
                         .union_nonbreaking_inline(&intrinsic_sizes_for_fragment);
 
@@ -1512,7 +1521,12 @@ impl Flow for InlineFlow {
                         intrinsic_sizes_for_inline_run = IntrinsicISizesContribution::new();
                     }
                 },
-                WhiteSpace::PreWrap | WhiteSpace::PreLine => {
+                (
+                    WhiteSpaceCollapse::Preserve |
+                    WhiteSpaceCollapse::PreserveBreaks |
+                    WhiteSpaceCollapse::BreakSpaces,
+                    TextWrapMode::Wrap,
+                ) => {
                     // Flush the intrinsic sizes we were gathering up for the nonbroken run, if
                     // necessary.
                     intrinsic_sizes_for_inline_run
@@ -1532,7 +1546,7 @@ impl Flow for InlineFlow {
                         intrinsic_sizes_for_inline_run = IntrinsicISizesContribution::new();
                     }
                 },
-                WhiteSpace::Normal => {
+                (WhiteSpaceCollapse::Collapse, TextWrapMode::Wrap) => {
                     // Flush the intrinsic sizes we were gathering up for the nonbroken run, if
                     // necessary.
                     intrinsic_sizes_for_inline_run
@@ -1757,10 +1771,7 @@ impl Flow for InlineFlow {
                         first_fragment.style.logical_border_width())
                     .start;
                     containing_block_positions.push(
-                        // TODO(servo#30577) revert once underlying bug is fixed
-                        // padding_box_origin.to_physical(self.base.writing_mode, container_size),
-                        padding_box_origin
-                            .to_physical_or_warn(self.base.writing_mode, container_size),
+                        padding_box_origin.to_physical(self.base.writing_mode, container_size),
                     );
                 },
                 SpecificFragmentInfo::InlineBlock(_) if fragment.is_positioned() => {

@@ -6,11 +6,11 @@ pub mod resources;
 
 use std::fmt::{Debug, Error, Formatter};
 
+use base::id::{PipelineId, TopLevelBrowsingContextId, WebViewId};
 use crossbeam_channel::{Receiver, Sender};
 use ipc_channel::ipc::IpcSender;
 use keyboard_types::KeyboardEvent;
 use log::warn;
-use msg::constellation_msg::{InputMethodType, PipelineId, TopLevelBrowsingContextId, WebViewId};
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
@@ -214,6 +214,10 @@ pub enum EmbedderMsg {
     ReadyToPresent(Vec<WebViewId>),
     /// The given event was delivered to a pipeline in the given browser.
     EventDelivered(CompositorEventVariant),
+    /// Request to play a haptic effect on a connected gamepad.
+    PlayGamepadHapticEffect(usize, GamepadHapticEffectType, IpcSender<bool>),
+    /// Request to stop a haptic effect on a connected gamepad.
+    StopGamepadHapticEffect(usize, IpcSender<bool>),
 }
 
 /// The variant of CompositorEvent that was delivered to a pipeline.
@@ -268,6 +272,8 @@ impl Debug for EmbedderMsg {
             EmbedderMsg::ShowContextMenu(..) => write!(f, "ShowContextMenu"),
             EmbedderMsg::ReadyToPresent(..) => write!(f, "ReadyToPresent"),
             EmbedderMsg::EventDelivered(..) => write!(f, "HitTestedEvent"),
+            EmbedderMsg::PlayGamepadHapticEffect(..) => write!(f, "PlayGamepadHapticEffect"),
+            EmbedderMsg::StopGamepadHapticEffect(..) => write!(f, "StopGamepadHapticEffect"),
         }
     }
 }
@@ -367,4 +373,39 @@ pub enum PermissionPrompt {
 pub enum PermissionRequest {
     Granted,
     Denied,
+}
+
+/// Used to specify the kind of input method editor appropriate to edit a field.
+/// This is a subset of htmlinputelement::InputType because some variants of InputType
+/// don't make sense in this context.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum InputMethodType {
+    Color,
+    Date,
+    DatetimeLocal,
+    Email,
+    Month,
+    Number,
+    Password,
+    Search,
+    Tel,
+    Text,
+    Time,
+    Url,
+    Week,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// <https://w3.org/TR/gamepad/#dom-gamepadhapticeffecttype-dual-rumble>
+pub struct DualRumbleEffectParams {
+    pub duration: f64,
+    pub start_delay: f64,
+    pub strong_magnitude: f64,
+    pub weak_magnitude: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// <https://w3.org/TR/gamepad/#dom-gamepadhapticeffecttype>
+pub enum GamepadHapticEffectType {
+    DualRumble(DualRumbleEffectParams),
 }

@@ -6,7 +6,7 @@ use std::cell::Cell;
 
 use dom_struct::dom_struct;
 use js::typedarray::{Float64, Float64Array};
-use script_traits::GamepadUpdateType;
+use script_traits::{GamepadSupportedHapticEffects, GamepadUpdateType};
 
 use super::bindings::buffer_source::HeapBufferSource;
 use crate::dom::bindings::codegen::Bindings::GamepadBinding::{GamepadHand, GamepadMethods};
@@ -20,9 +20,10 @@ use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::gamepadbuttonlist::GamepadButtonList;
 use crate::dom::gamepadevent::{GamepadEvent, GamepadEventType};
+use crate::dom::gamepadhapticactuator::GamepadHapticActuator;
 use crate::dom::gamepadpose::GamepadPose;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 // This value is for determining when to consider a gamepad as having a user gesture
 // from an axis tilt. This matches the threshold in Chromium.
@@ -49,6 +50,7 @@ pub struct Gamepad {
     axis_bounds: (f64, f64),
     button_bounds: (f64, f64),
     exposed: Cell<bool>,
+    vibration_actuator: Dom<GamepadHapticActuator>,
 }
 
 impl Gamepad {
@@ -65,6 +67,7 @@ impl Gamepad {
         hand: GamepadHand,
         axis_bounds: (f64, f64),
         button_bounds: (f64, f64),
+        vibration_actuator: &GamepadHapticActuator,
     ) -> Gamepad {
         Self {
             reflector_: Reflector::new(),
@@ -81,17 +84,33 @@ impl Gamepad {
             axis_bounds,
             button_bounds,
             exposed: Cell::new(false),
+            vibration_actuator: Dom::from_ref(vibration_actuator),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         global: &GlobalScope,
         gamepad_id: u32,
         id: String,
+        mapping_type: String,
         axis_bounds: (f64, f64),
         button_bounds: (f64, f64),
+        supported_haptic_effects: GamepadSupportedHapticEffects,
+        xr: bool,
+        can_gc: CanGc,
     ) -> DomRoot<Gamepad> {
-        Self::new_with_proto(global, gamepad_id, id, axis_bounds, button_bounds)
+        Self::new_with_proto(
+            global,
+            gamepad_id,
+            id,
+            mapping_type,
+            axis_bounds,
+            button_bounds,
+            supported_haptic_effects,
+            xr,
+            can_gc,
+        )
     }
 
     /// When we construct a new gamepad, we initialize the number of buttons and
@@ -99,30 +118,40 @@ impl Gamepad {
     /// The spec says UAs *may* do this for fingerprint mitigation, and it also
     /// happens to simplify implementation
     /// <https://www.w3.org/TR/gamepad/#fingerprinting-mitigation>
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
         gamepad_id: u32,
         id: String,
+        mapping_type: String,
         axis_bounds: (f64, f64),
         button_bounds: (f64, f64),
+        supported_haptic_effects: GamepadSupportedHapticEffects,
+        xr: bool,
+        can_gc: CanGc,
     ) -> DomRoot<Gamepad> {
         let button_list = GamepadButtonList::init_buttons(global);
+        let vibration_actuator =
+            GamepadHapticActuator::new(global, gamepad_id, supported_haptic_effects, can_gc);
+        let index = if xr { -1 } else { 0 };
         let gamepad = reflect_dom_object_with_proto(
             Box::new(Gamepad::new_inherited(
                 gamepad_id,
                 id,
-                0,
+                index,
                 true,
                 0.,
-                String::from("standard"),
+                mapping_type,
                 &button_list,
                 None,
                 GamepadHand::_empty,
                 axis_bounds,
                 button_bounds,
+                &vibration_actuator,
             )),
             global,
             None,
+            can_gc,
         );
         gamepad.init_axes();
         gamepad
@@ -165,6 +194,11 @@ impl GamepadMethods for Gamepad {
         DomRoot::from_ref(&*self.buttons)
     }
 
+    // https://w3c.github.io/gamepad/#dom-gamepad-vibrationactuator
+    fn VibrationActuator(&self) -> DomRoot<GamepadHapticActuator> {
+        DomRoot::from_ref(&*self.vibration_actuator)
+    }
+
     // https://w3c.github.io/gamepad/extensions.html#gamepadhand-enum
     fn Hand(&self) -> GamepadHand {
         self.hand
@@ -182,7 +216,7 @@ impl Gamepad {
         self.gamepad_id
     }
 
-    pub fn update_connected(&self, connected: bool, has_gesture: bool) {
+    pub fn update_connected(&self, connected: bool, has_gesture: bool, can_gc: CanGc) {
         if self.connected.get() == connected {
             return;
         }
@@ -195,7 +229,7 @@ impl Gamepad {
         };
 
         if has_gesture {
-            self.notify_event(event_type);
+            self.notify_event(event_type, can_gc);
         }
     }
 
@@ -211,8 +245,8 @@ impl Gamepad {
         self.timestamp.set(timestamp);
     }
 
-    pub fn notify_event(&self, event_type: GamepadEventType) {
-        let event = GamepadEvent::new_with_type(&self.global(), event_type, self);
+    pub fn notify_event(&self, event_type: GamepadEventType, can_gc: CanGc) {
+        let event = GamepadEvent::new_with_type(&self.global(), event_type, self, can_gc);
         event
             .upcast::<Event>()
             .fire(self.global().as_window().upcast::<EventTarget>());
@@ -285,6 +319,10 @@ impl Gamepad {
     /// <https://www.w3.org/TR/gamepad/#dfn-exposed>
     pub fn set_exposed(&self, exposed: bool) {
         self.exposed.set(exposed);
+    }
+
+    pub fn vibration_actuator(&self) -> &GamepadHapticActuator {
+        &self.vibration_actuator
     }
 }
 

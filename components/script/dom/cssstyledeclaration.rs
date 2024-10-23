@@ -3,10 +3,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cmp::Ordering;
+use std::sync::LazyLock;
 
 use dom_struct::dom_struct;
 use html5ever::local_name;
-use lazy_static::lazy_static;
 use servo_arc::Arc;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
@@ -30,6 +30,7 @@ use crate::dom::cssrule::CSSRule;
 use crate::dom::element::Element;
 use crate::dom::node::{document_from_node, stylesheets_owner_from_node, window_from_node, Node};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // http://dev.w3.org/csswg/cssom/#the-cssstyledeclaration-interface
 #[dom_struct]
@@ -245,7 +246,7 @@ impl CSSStyleDeclaration {
         )
     }
 
-    fn get_computed_style(&self, property: PropertyId) -> DOMString {
+    fn get_computed_style(&self, property: PropertyId, can_gc: CanGc) -> DOMString {
         match self.owner {
             CSSStyleOwner::CSSRule(..) => {
                 panic!("get_computed_style called on CSSStyleDeclaration with a CSSRule owner")
@@ -256,7 +257,7 @@ impl CSSStyleDeclaration {
                     return DOMString::new();
                 }
                 let addr = node.to_trusted_node_address();
-                window_from_node(node).resolved_style_query(addr, self.pseudo, property)
+                window_from_node(node).resolved_style_query(addr, self.pseudo, property, can_gc)
             },
         }
     }
@@ -264,7 +265,7 @@ impl CSSStyleDeclaration {
     fn get_property_value(&self, id: PropertyId) -> DOMString {
         if self.readonly {
             // Readonly style declarations are used for getComputedStyle.
-            return self.get_computed_style(id);
+            return self.get_computed_style(id, CanGc::note());
         }
 
         let mut string = String::new();
@@ -344,35 +345,33 @@ impl CSSStyleDeclaration {
     }
 }
 
-lazy_static! {
-    static ref ENABLED_LONGHAND_PROPERTIES: Vec<LonghandId> = {
-        // The 'all' shorthand contains all the enabled longhands with 2 exceptions:
-        // 'direction' and 'unicode-bidi', so these must be added afterward.
-        let mut enabled_longhands: Vec<LonghandId> = ShorthandId::All.longhands().collect();
-        if PropertyId::NonCustom(LonghandId::Direction.into()).enabled_for_all_content() {
-            enabled_longhands.push(LonghandId::Direction);
-        }
-        if PropertyId::NonCustom(LonghandId::UnicodeBidi.into()).enabled_for_all_content() {
-            enabled_longhands.push(LonghandId::UnicodeBidi);
-        }
+pub static ENABLED_LONGHAND_PROPERTIES: LazyLock<Vec<LonghandId>> = LazyLock::new(|| {
+    // The 'all' shorthand contains all the enabled longhands with 2 exceptions:
+    // 'direction' and 'unicode-bidi', so these must be added afterward.
+    let mut enabled_longhands: Vec<LonghandId> = ShorthandId::All.longhands().collect();
+    if PropertyId::NonCustom(LonghandId::Direction.into()).enabled_for_all_content() {
+        enabled_longhands.push(LonghandId::Direction);
+    }
+    if PropertyId::NonCustom(LonghandId::UnicodeBidi.into()).enabled_for_all_content() {
+        enabled_longhands.push(LonghandId::UnicodeBidi);
+    }
 
-        // Sort lexicographically, but with vendor-prefixed properties after standard ones.
-        enabled_longhands.sort_unstable_by(|a, b| {
-            let a = a.name();
-            let b = b.name();
-            let is_a_vendor_prefixed = a.starts_with('-');
-            let is_b_vendor_prefixed = b.starts_with('-');
-            if is_a_vendor_prefixed == is_b_vendor_prefixed {
-                a.partial_cmp(b).unwrap()
-            } else if is_b_vendor_prefixed {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        });
-        enabled_longhands
-    };
-}
+    // Sort lexicographically, but with vendor-prefixed properties after standard ones.
+    enabled_longhands.sort_unstable_by(|a, b| {
+        let a = a.name();
+        let b = b.name();
+        let is_a_vendor_prefixed = a.starts_with('-');
+        let is_b_vendor_prefixed = b.starts_with('-');
+        if is_a_vendor_prefixed == is_b_vendor_prefixed {
+            a.partial_cmp(b).unwrap()
+        } else if is_b_vendor_prefixed {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    });
+    enabled_longhands
+});
 
 impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-length

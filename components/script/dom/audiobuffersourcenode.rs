@@ -28,6 +28,7 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct AudioBufferSourceNode {
@@ -99,8 +100,9 @@ impl AudioBufferSourceNode {
         window: &Window,
         context: &BaseAudioContext,
         options: &AudioBufferSourceOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
-        Self::new_with_proto(window, None, context, options)
+        Self::new_with_proto(window, None, context, options, can_gc)
     }
 
     #[allow(crown::unrooted_must_root)]
@@ -109,23 +111,30 @@ impl AudioBufferSourceNode {
         proto: Option<HandleObject>,
         context: &BaseAudioContext,
         options: &AudioBufferSourceOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
         let node = AudioBufferSourceNode::new_inherited(window, context, options)?;
-        Ok(reflect_dom_object_with_proto(Box::new(node), window, proto))
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        context: &BaseAudioContext,
-        options: &AudioBufferSourceOptions,
-    ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
-        AudioBufferSourceNode::new_with_proto(window, proto, context, options)
+        Ok(reflect_dom_object_with_proto(
+            Box::new(node),
+            window,
+            proto,
+            can_gc,
+        ))
     }
 }
 
 impl AudioBufferSourceNodeMethods for AudioBufferSourceNode {
+    // https://webaudio.github.io/web-audio-api/#dom-audiobuffersourcenode-audiobuffersourcenode
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        context: &BaseAudioContext,
+        options: &AudioBufferSourceOptions,
+    ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
+        AudioBufferSourceNode::new_with_proto(window, proto, context, options, can_gc)
+    }
+
     // https://webaudio.github.io/web-audio-api/#dom-audiobuffersourcenode-buffer
     fn GetBuffer(&self) -> Fallible<Option<DomRoot<AudioBuffer>>> {
         Ok(self.buffer.get())

@@ -5,7 +5,7 @@
 #![allow(crown::unrooted_must_root)]
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::vec_deque::VecDeque;
 use std::collections::HashMap;
 use std::thread;
@@ -41,6 +41,7 @@ use crate::dom::node::Node;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::servoparser::{create_element_for_token, ElementAttribute, ParsingAlgorithm};
 use crate::dom::virtualmethods::vtable_for;
+use crate::script_runtime::CanGc;
 
 type ParseNodeId = usize;
 
@@ -171,7 +172,7 @@ enum ToHtmlTokenizerMsg {
 }
 
 fn create_buffer_queue(mut buffers: VecDeque<SendTendril<UTF8>>) -> BufferQueue {
-    let mut buffer_queue = BufferQueue::default();
+    let buffer_queue = BufferQueue::default();
     while let Some(st) = buffers.pop_front() {
         buffer_queue.push_back(StrTendril::from(st));
     }
@@ -214,7 +215,7 @@ pub struct Tokenizer {
     #[no_trace]
     html_tokenizer_sender: Sender<ToHtmlTokenizerMsg>,
     #[ignore_malloc_size_of = "Defined in std"]
-    nodes: HashMap<ParseNodeId, Dom<Node>>,
+    nodes: RefCell<HashMap<ParseNodeId, Dom<Node>>>,
     #[no_trace]
     url: ServoUrl,
     parsing_algorithm: ParsingAlgorithm,
@@ -236,17 +237,17 @@ impl Tokenizer {
             None => ParsingAlgorithm::Normal,
         };
 
-        let mut tokenizer = Tokenizer {
+        let tokenizer = Tokenizer {
             document: Dom::from_ref(document),
             receiver: tokenizer_receiver,
             html_tokenizer_sender: to_html_tokenizer_sender,
-            nodes: HashMap::new(),
+            nodes: RefCell::new(HashMap::new()),
             url,
             parsing_algorithm: algorithm,
         };
         tokenizer.insert_node(0, Dom::from_ref(document.upcast()));
 
-        let mut sink = Sink::new(to_tokenizer_sender.clone());
+        let sink = Sink::new(to_tokenizer_sender.clone());
         let mut ctxt_parse_node = None;
         let mut form_parse_node = None;
         let mut fragment_context_is_some = false;
@@ -283,8 +284,11 @@ impl Tokenizer {
         tokenizer
     }
 
-    #[must_use]
-    pub fn feed(&mut self, input: &mut BufferQueue) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
+    pub fn feed(
+        &self,
+        input: &BufferQueue,
+        can_gc: CanGc,
+    ) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
         let mut send_tendrils = VecDeque::new();
         while let Some(str) = input.pop_front() {
             send_tendrils.push_back(SendTendril::from(str));
@@ -304,10 +308,12 @@ impl Tokenizer {
                 .recv()
                 .expect("Unexpected channel panic in main thread.")
             {
-                ToTokenizerMsg::ProcessOperation(parse_op) => self.process_operation(parse_op),
+                ToTokenizerMsg::ProcessOperation(parse_op) => {
+                    self.process_operation(parse_op, can_gc)
+                },
                 ToTokenizerMsg::TokenizerResultDone { updated_input } => {
                     let buffer_queue = create_buffer_queue(updated_input);
-                    *input = buffer_queue;
+                    input.replace_with(buffer_queue);
                     return TokenizerResult::Done;
                 },
                 ToTokenizerMsg::TokenizerResultScript {
@@ -315,16 +321,16 @@ impl Tokenizer {
                     updated_input,
                 } => {
                     let buffer_queue = create_buffer_queue(updated_input);
-                    *input = buffer_queue;
+                    input.replace_with(buffer_queue);
                     let script = self.get_node(&script.id);
                     return TokenizerResult::Script(DomRoot::from_ref(script.downcast().unwrap()));
                 },
-                ToTokenizerMsg::End => unreachable!(),
+                _ => unreachable!(),
             };
         }
     }
 
-    pub fn end(&mut self) {
+    pub fn end(&self, can_gc: CanGc) {
         self.html_tokenizer_sender
             .send(ToHtmlTokenizerMsg::End)
             .unwrap();
@@ -334,9 +340,15 @@ impl Tokenizer {
                 .recv()
                 .expect("Unexpected channel panic in main thread.")
             {
-                ToTokenizerMsg::ProcessOperation(parse_op) => self.process_operation(parse_op),
+                ToTokenizerMsg::ProcessOperation(parse_op) => {
+                    self.process_operation(parse_op, can_gc)
+                },
+                ToTokenizerMsg::TokenizerResultDone { updated_input: _ } |
+                ToTokenizerMsg::TokenizerResultScript {
+                    script: _,
+                    updated_input: _,
+                } => continue,
                 ToTokenizerMsg::End => return,
-                _ => unreachable!(),
             };
         }
     }
@@ -345,21 +357,23 @@ impl Tokenizer {
         &self.url
     }
 
-    pub fn set_plaintext_state(&mut self) {
+    pub fn set_plaintext_state(&self) {
         self.html_tokenizer_sender
             .send(ToHtmlTokenizerMsg::SetPlainTextState)
             .unwrap();
     }
 
-    fn insert_node(&mut self, id: ParseNodeId, node: Dom<Node>) {
-        assert!(self.nodes.insert(id, node).is_none());
+    fn insert_node(&self, id: ParseNodeId, node: Dom<Node>) {
+        assert!(self.nodes.borrow_mut().insert(id, node).is_none());
     }
 
-    fn get_node<'a>(&'a self, id: &ParseNodeId) -> &'a Dom<Node> {
-        self.nodes.get(id).expect("Node not found!")
+    fn get_node<'a>(&'a self, id: &ParseNodeId) -> Ref<'a, Dom<Node>> {
+        Ref::map(self.nodes.borrow(), |nodes| {
+            nodes.get(id).expect("Node not found!")
+        })
     }
 
-    fn append_before_sibling(&mut self, sibling: ParseNodeId, node: NodeOrText) {
+    fn append_before_sibling(&self, sibling: ParseNodeId, node: NodeOrText, can_gc: CanGc) {
         let node = match node {
             NodeOrText::Node(n) => {
                 HtmlNodeOrText::AppendNode(Dom::from_ref(&**self.get_node(&n.id)))
@@ -371,10 +385,10 @@ impl Tokenizer {
             .GetParentNode()
             .expect("append_before_sibling called on node without parent");
 
-        super::insert(parent, Some(sibling), node, self.parsing_algorithm);
+        super::insert(parent, Some(sibling), node, self.parsing_algorithm, can_gc);
     }
 
-    fn append(&mut self, parent: ParseNodeId, node: NodeOrText) {
+    fn append(&self, parent: ParseNodeId, node: NodeOrText, can_gc: CanGc) {
         let node = match node {
             NodeOrText::Node(n) => {
                 HtmlNodeOrText::AppendNode(Dom::from_ref(&**self.get_node(&n.id)))
@@ -383,7 +397,7 @@ impl Tokenizer {
         };
 
         let parent = &**self.get_node(&parent);
-        super::insert(parent, None, node, self.parsing_algorithm);
+        super::insert(parent, None, node, self.parsing_algorithm, can_gc);
     }
 
     fn has_parent_node(&self, node: ParseNodeId) -> bool {
@@ -399,7 +413,7 @@ impl Tokenizer {
         x.is_in_same_home_subtree(y)
     }
 
-    fn process_operation(&mut self, op: ParseOperation) {
+    fn process_operation(&self, op: ParseOperation, can_gc: CanGc) {
         let document = DomRoot::from_ref(&**self.get_node(&0));
         let document = document
             .downcast::<Document>()
@@ -410,7 +424,7 @@ impl Tokenizer {
                 let template = target
                     .downcast::<HTMLTemplateElement>()
                     .expect("Tried to extract contents from non-template element while parsing");
-                self.insert_node(contents, Dom::from_ref(template.Content().upcast()));
+                self.insert_node(contents, Dom::from_ref(template.Content(can_gc).upcast()));
             },
             ParseOperation::CreateElement {
                 node,
@@ -428,6 +442,7 @@ impl Tokenizer {
                     &self.document,
                     ElementCreator::ParserCreated(current_line),
                     ParsingAlgorithm::Normal,
+                    can_gc,
                 );
                 self.insert_node(node, Dom::from_ref(element.upcast()));
             },
@@ -436,10 +451,10 @@ impl Tokenizer {
                 self.insert_node(node, Dom::from_ref(comment.upcast()));
             },
             ParseOperation::AppendBeforeSibling { sibling, node } => {
-                self.append_before_sibling(sibling, node);
+                self.append_before_sibling(sibling, node, can_gc);
             },
             ParseOperation::Append { parent, node } => {
-                self.append(parent, node);
+                self.append(parent, node, can_gc);
             },
             ParseOperation::AppendBasedOnParentNode {
                 element,
@@ -447,9 +462,9 @@ impl Tokenizer {
                 node,
             } => {
                 if self.has_parent_node(element) {
-                    self.append_before_sibling(element, node);
+                    self.append_before_sibling(element, node, can_gc);
                 } else {
-                    self.append(prev_element, node);
+                    self.append(prev_element, node, can_gc);
                 }
             },
             ParseOperation::AppendDoctypeToDocument {
@@ -470,8 +485,8 @@ impl Tokenizer {
                     .expect("Appending failed");
             },
             ParseOperation::AddAttrsIfMissing { target, attrs } => {
-                let elem = self
-                    .get_node(&target)
+                let node = self.get_node(&target);
+                let elem = node
                     .downcast::<Element>()
                     .expect("tried to set attrs on non-Element in HTML parsing");
                 for attr in attrs {
@@ -480,11 +495,12 @@ impl Tokenizer {
             },
             ParseOperation::RemoveFromParent { target } => {
                 if let Some(ref parent) = self.get_node(&target).GetParentNode() {
-                    parent.RemoveChild(self.get_node(&target)).unwrap();
+                    parent.RemoveChild(&self.get_node(&target)).unwrap();
                 }
             },
             ParseOperation::MarkScriptAlreadyStarted { node } => {
-                let script = self.get_node(&node).downcast::<HTMLScriptElement>();
+                let node = self.get_node(&node);
+                let script = node.downcast::<HTMLScriptElement>();
                 if let Some(script) = script {
                     script.set_already_started(true)
                 }
@@ -526,7 +542,7 @@ impl Tokenizer {
                 }
             },
             ParseOperation::Pop { node } => {
-                vtable_for(self.get_node(&node)).pop();
+                vtable_for(&self.get_node(&node)).pop();
             },
             ParseOperation::CreatePI { node, target, data } => {
                 let pi = ProcessingInstruction::new(
@@ -556,7 +572,7 @@ fn run(
         ..Default::default()
     };
 
-    let mut html_tokenizer = if fragment_context_is_some {
+    let html_tokenizer = if fragment_context_is_some {
         let tb =
             TreeBuilder::new_for_fragment(sink, ctxt_parse_node.unwrap(), form_parse_node, options);
 
@@ -576,8 +592,8 @@ fn run(
             .expect("Unexpected channel panic in html parser thread")
         {
             ToHtmlTokenizerMsg::Feed { input } => {
-                let mut input = create_buffer_queue(input);
-                let res = html_tokenizer.feed(&mut input);
+                let input = create_buffer_queue(input);
+                let res = html_tokenizer.feed(&input);
 
                 // Gather changes to 'input' and place them in 'updated_input',
                 // which will be sent to the main thread to update feed method's 'input'
@@ -612,8 +628,8 @@ struct ParseNodeData {
 }
 
 pub struct Sink {
-    current_line: u64,
-    parse_node_data: HashMap<ParseNodeId, ParseNodeData>,
+    current_line: Cell<u64>,
+    parse_node_data: RefCell<HashMap<ParseNodeId, ParseNodeData>>,
     next_parse_node_id: Cell<ParseNodeId>,
     document_node: ParseNode,
     sender: Sender<ToTokenizerMsg>,
@@ -621,9 +637,9 @@ pub struct Sink {
 
 impl Sink {
     fn new(sender: Sender<ToTokenizerMsg>) -> Sink {
-        let mut sink = Sink {
-            current_line: 1,
-            parse_node_data: HashMap::new(),
+        let sink = Sink {
+            current_line: Cell::new(1),
+            parse_node_data: RefCell::new(HashMap::new()),
             next_parse_node_id: Cell::new(1),
             document_node: ParseNode {
                 id: 0,
@@ -636,7 +652,7 @@ impl Sink {
         sink
     }
 
-    fn new_parse_node(&mut self) -> ParseNode {
+    fn new_parse_node(&self) -> ParseNode {
         let id = self.next_parse_node_id.get();
         let data = ParseNodeData::default();
         self.insert_parse_node_data(id, data);
@@ -653,20 +669,20 @@ impl Sink {
             .unwrap();
     }
 
-    fn insert_parse_node_data(&mut self, id: ParseNodeId, data: ParseNodeData) {
-        assert!(self.parse_node_data.insert(id, data).is_none());
+    fn insert_parse_node_data(&self, id: ParseNodeId, data: ParseNodeData) {
+        assert!(self.parse_node_data.borrow_mut().insert(id, data).is_none());
     }
 
-    fn get_parse_node_data<'a>(&'a self, id: &'a ParseNodeId) -> &'a ParseNodeData {
-        self.parse_node_data
-            .get(id)
-            .expect("Parse Node data not found!")
+    fn get_parse_node_data<'a>(&'a self, id: &'a ParseNodeId) -> Ref<'a, ParseNodeData> {
+        Ref::map(self.parse_node_data.borrow(), |data| {
+            data.get(id).expect("Parse Node data not found!")
+        })
     }
 
-    fn get_parse_node_data_mut<'a>(&'a mut self, id: &'a ParseNodeId) -> &'a mut ParseNodeData {
-        self.parse_node_data
-            .get_mut(id)
-            .expect("Parse Node data not found!")
+    fn get_parse_node_data_mut<'a>(&'a self, id: &'a ParseNodeId) -> RefMut<'a, ParseNodeData> {
+        RefMut::map(self.parse_node_data.borrow_mut(), |data| {
+            data.get_mut(id).expect("Parse Node data not found!")
+        })
     }
 }
 
@@ -678,18 +694,19 @@ impl TreeSink for Sink {
     }
 
     type Handle = ParseNode;
+    type ElemName<'a> = ExpandedName<'a> where Self: 'a;
 
-    fn get_document(&mut self) -> Self::Handle {
+    fn get_document(&self) -> Self::Handle {
         self.document_node.clone()
     }
 
-    fn get_template_contents(&mut self, target: &Self::Handle) -> Self::Handle {
+    fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
         if let Some(ref contents) = self.get_parse_node_data(&target.id).contents {
             return contents.clone();
         }
         let node = self.new_parse_node();
         {
-            let data = self.get_parse_node_data_mut(&target.id);
+            let mut data = self.get_parse_node_data_mut(&target.id);
             data.contents = Some(node.clone());
         }
         self.send_op(ParseOperation::GetTemplateContents {
@@ -712,7 +729,7 @@ impl TreeSink for Sink {
     }
 
     fn create_element(
-        &mut self,
+        &self,
         name: QualName,
         html_attrs: Vec<HtmlAttribute>,
         _flags: ElementFlags,
@@ -720,7 +737,7 @@ impl TreeSink for Sink {
         let mut node = self.new_parse_node();
         node.qual_name = Some(name.clone());
         {
-            let node_data = self.get_parse_node_data_mut(&node.id);
+            let mut node_data = self.get_parse_node_data_mut(&node.id);
             node_data.is_integration_point = html_attrs.iter().any(|attr| {
                 let attr_value = &String::from(attr.value.clone());
                 (attr.name.local == local_name!("encoding") && attr.name.ns == ns!()) &&
@@ -740,12 +757,12 @@ impl TreeSink for Sink {
             node: node.id,
             name,
             attrs,
-            current_line: self.current_line,
+            current_line: self.current_line.get(),
         });
         node
     }
 
-    fn create_comment(&mut self, text: StrTendril) -> Self::Handle {
+    fn create_comment(&self, text: StrTendril) -> Self::Handle {
         let node = self.new_parse_node();
         self.send_op(ParseOperation::CreateComment {
             text: String::from(text),
@@ -754,7 +771,7 @@ impl TreeSink for Sink {
         node
     }
 
-    fn create_pi(&mut self, target: StrTendril, data: StrTendril) -> ParseNode {
+    fn create_pi(&self, target: StrTendril, data: StrTendril) -> ParseNode {
         let node = self.new_parse_node();
         self.send_op(ParseOperation::CreatePI {
             node: node.id,
@@ -765,7 +782,7 @@ impl TreeSink for Sink {
     }
 
     fn associate_with_form(
-        &mut self,
+        &self,
         target: &Self::Handle,
         form: &Self::Handle,
         nodes: (&Self::Handle, Option<&Self::Handle>),
@@ -780,7 +797,7 @@ impl TreeSink for Sink {
     }
 
     fn append_before_sibling(
-        &mut self,
+        &self,
         sibling: &Self::Handle,
         new_node: HtmlNodeOrText<Self::Handle>,
     ) {
@@ -795,7 +812,7 @@ impl TreeSink for Sink {
     }
 
     fn append_based_on_parent_node(
-        &mut self,
+        &self,
         elem: &Self::Handle,
         prev_elem: &Self::Handle,
         child: HtmlNodeOrText<Self::Handle>,
@@ -811,11 +828,11 @@ impl TreeSink for Sink {
         });
     }
 
-    fn parse_error(&mut self, msg: Cow<'static, str>) {
+    fn parse_error(&self, msg: Cow<'static, str>) {
         debug!("Parse error: {}", msg);
     }
 
-    fn set_quirks_mode(&mut self, mode: QuirksMode) {
+    fn set_quirks_mode(&self, mode: QuirksMode) {
         let mode = match mode {
             QuirksMode::Quirks => ServoQuirksMode::Quirks,
             QuirksMode::LimitedQuirks => ServoQuirksMode::LimitedQuirks,
@@ -824,7 +841,7 @@ impl TreeSink for Sink {
         self.send_op(ParseOperation::SetQuirksMode { mode });
     }
 
-    fn append(&mut self, parent: &Self::Handle, child: HtmlNodeOrText<Self::Handle>) {
+    fn append(&self, parent: &Self::Handle, child: HtmlNodeOrText<Self::Handle>) {
         let child = match child {
             HtmlNodeOrText::AppendNode(node) => NodeOrText::Node(node),
             HtmlNodeOrText::AppendText(text) => NodeOrText::Text(String::from(text)),
@@ -836,7 +853,7 @@ impl TreeSink for Sink {
     }
 
     fn append_doctype_to_document(
-        &mut self,
+        &self,
         name: StrTendril,
         public_id: StrTendril,
         system_id: StrTendril,
@@ -848,7 +865,7 @@ impl TreeSink for Sink {
         });
     }
 
-    fn add_attrs_if_missing(&mut self, target: &Self::Handle, html_attrs: Vec<HtmlAttribute>) {
+    fn add_attrs_if_missing(&self, target: &Self::Handle, html_attrs: Vec<HtmlAttribute>) {
         let attrs = html_attrs
             .into_iter()
             .map(|attr| Attribute {
@@ -862,19 +879,19 @@ impl TreeSink for Sink {
         });
     }
 
-    fn remove_from_parent(&mut self, target: &Self::Handle) {
+    fn remove_from_parent(&self, target: &Self::Handle) {
         self.send_op(ParseOperation::RemoveFromParent { target: target.id });
     }
 
-    fn mark_script_already_started(&mut self, node: &Self::Handle) {
+    fn mark_script_already_started(&self, node: &Self::Handle) {
         self.send_op(ParseOperation::MarkScriptAlreadyStarted { node: node.id });
     }
 
-    fn complete_script(&mut self, _: &Self::Handle) -> NextParserState {
+    fn complete_script(&self, _: &Self::Handle) -> NextParserState {
         panic!("complete_script should not be called here!");
     }
 
-    fn reparent_children(&mut self, parent: &Self::Handle, new_parent: &Self::Handle) {
+    fn reparent_children(&self, parent: &Self::Handle, new_parent: &Self::Handle) {
         self.send_op(ParseOperation::ReparentChildren {
             parent: parent.id,
             new_parent: new_parent.id,
@@ -888,11 +905,11 @@ impl TreeSink for Sink {
         node_data.is_integration_point
     }
 
-    fn set_current_line(&mut self, line_number: u64) {
-        self.current_line = line_number;
+    fn set_current_line(&self, line_number: u64) {
+        self.current_line.set(line_number);
     }
 
-    fn pop(&mut self, node: &Self::Handle) {
+    fn pop(&self, node: &Self::Handle) {
         self.send_op(ParseOperation::Pop { node: node.id });
     }
 }

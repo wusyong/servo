@@ -16,6 +16,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct VTTRegion {
@@ -45,17 +46,21 @@ impl VTTRegion {
         }
     }
 
-    fn new(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<Self> {
-        reflect_dom_object_with_proto(Box::new(Self::new_inherited()), global, proto)
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(window: &Window, proto: Option<HandleObject>) -> Fallible<DomRoot<Self>> {
-        Ok(VTTRegion::new(&window.global(), proto))
+    fn new(global: &GlobalScope, proto: Option<HandleObject>, can_gc: CanGc) -> DomRoot<Self> {
+        reflect_dom_object_with_proto(Box::new(Self::new_inherited()), global, proto, can_gc)
     }
 }
 
 impl VTTRegionMethods for VTTRegion {
+    // https://w3c.github.io/webvtt/#dom-vttregion-vttregion
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<Self>> {
+        Ok(VTTRegion::new(&window.global(), proto, can_gc))
+    }
+
     // https://w3c.github.io/webvtt/#dom-vttregion-id
     fn Id(&self) -> DOMString {
         self.id.borrow().clone()

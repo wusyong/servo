@@ -48,19 +48,18 @@ use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::{
     WebGLRenderingContextMethods,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
-    ArrayBufferViewOrArrayBuffer, Float32ArrayOrUnrestrictedFloatSequence, Int32ArrayOrLongSequence,
+    ArrayBufferViewOrArrayBuffer, Float32ArrayOrUnrestrictedFloatSequence,
+    HTMLCanvasElementOrOffscreenCanvas, Int32ArrayOrLongSequence,
 };
 use crate::dom::bindings::conversions::{DerivedFrom, ToJSValConvertible};
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
-use crate::dom::bindings::root::{Dom, DomOnceCell, DomRoot, LayoutDom, MutNullableDom};
+use crate::dom::bindings::root::{DomOnceCell, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::cors_setting_for_element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
-use crate::dom::htmlcanvaselement::{
-    utils as canvas_utils, HTMLCanvasElement, LayoutCanvasRenderingContextHelpers,
-};
+use crate::dom::htmlcanvaselement::{utils as canvas_utils, LayoutCanvasRenderingContextHelpers};
 use crate::dom::node::{document_from_node, window_from_node, Node, NodeDamage};
 use crate::dom::promise::Promise;
 use crate::dom::vertexarrayobject::VertexAttribData;
@@ -88,7 +87,7 @@ use crate::dom::webgluniformlocation::WebGLUniformLocation;
 use crate::dom::webglvertexarrayobject::WebGLVertexArrayObject;
 use crate::dom::webglvertexarrayobjectoes::WebGLVertexArrayObjectOES;
 use crate::dom::window::Window;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 // From the GLES 2.0.25 spec, page 85:
 //
@@ -182,7 +181,7 @@ pub struct WebGLRenderingContext {
     #[ignore_malloc_size_of = "Defined in surfman"]
     #[no_trace]
     limits: GLLimits,
-    canvas: Dom<HTMLCanvasElement>,
+    canvas: HTMLCanvasElementOrOffscreenCanvas,
     #[ignore_malloc_size_of = "Defined in canvas_traits"]
     #[no_trace]
     last_error: Cell<Option<WebGLError>>,
@@ -218,7 +217,7 @@ pub struct WebGLRenderingContext {
 impl WebGLRenderingContext {
     pub fn new_inherited(
         window: &Window,
-        canvas: &HTMLCanvasElement,
+        canvas: &HTMLCanvasElementOrOffscreenCanvas,
         webgl_version: WebGLVersion,
         size: Size2D<u32>,
         attrs: GLContextAttributes,
@@ -248,7 +247,7 @@ impl WebGLRenderingContext {
                 webgl_version,
                 glsl_version: ctx_data.glsl_version,
                 limits: ctx_data.limits,
-                canvas: Dom::from_ref(canvas),
+                canvas: canvas.clone(),
                 last_error: Cell::new(None),
                 texture_packing_alignment: Cell::new(4),
                 texture_unpacking_settings: Cell::new(TextureUnpacking::CONVERT_COLORSPACE),
@@ -285,10 +284,11 @@ impl WebGLRenderingContext {
     #[allow(crown::unrooted_must_root)]
     pub fn new(
         window: &Window,
-        canvas: &HTMLCanvasElement,
+        canvas: &HTMLCanvasElementOrOffscreenCanvas,
         webgl_version: WebGLVersion,
         size: Size2D<u32>,
         attrs: GLContextAttributes,
+        can_gc: CanGc,
     ) -> Option<DomRoot<WebGLRenderingContext>> {
         match WebGLRenderingContext::new_inherited(window, canvas, webgl_version, size, attrs) {
             Ok(ctx) => Some(reflect_dom_object(Box::new(ctx), window)),
@@ -300,8 +300,16 @@ impl WebGLRenderingContext {
                     EventBubbles::DoesNotBubble,
                     EventCancelable::Cancelable,
                     DOMString::from(msg),
+                    can_gc,
                 );
-                event.upcast::<Event>().fire(canvas.upcast());
+                match canvas {
+                    HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => {
+                        event.upcast::<Event>().fire(canvas.upcast());
+                    },
+                    HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(canvas) => {
+                        event.upcast::<Event>().fire(canvas.upcast());
+                    },
+                }
                 None
             },
         }
@@ -395,7 +403,12 @@ impl WebGLRenderingContext {
     }
 
     pub fn onscreen(&self) -> bool {
-        self.canvas.upcast::<Node>().is_connected()
+        match self.canvas {
+            HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                canvas.upcast::<Node>().is_connected()
+            },
+            HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => false,
+        }
     }
 
     #[inline]
@@ -535,12 +548,14 @@ impl WebGLRenderingContext {
             return;
         }
 
-        self.canvas
-            .upcast::<Node>()
-            .dirty(NodeDamage::OtherNodeDamage);
-
-        let document = document_from_node(&*self.canvas);
-        document.add_dirty_webgl_canvas(self);
+        match self.canvas {
+            HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                canvas.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+                let document = document_from_node(&**canvas);
+                document.add_dirty_webgl_canvas(self);
+            },
+            HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => {},
+        }
     }
 
     fn vertex_attrib(&self, indx: u32, x: f32, y: f32, z: f32, w: f32) {
@@ -648,7 +663,15 @@ impl WebGLRenderingContext {
                 false,
             ),
             TexImageSource::HTMLImageElement(image) => {
-                let document = document_from_node(&*self.canvas);
+                let document = match self.canvas {
+                    HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                        document_from_node(&**canvas)
+                    },
+                    HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(ref _canvas) => {
+                        // TODO: Support retrieving image pixels here for OffscreenCanvas
+                        return Ok(None);
+                    },
+                };
                 if !image.same_origin(document.origin()) {
                     return Err(Error::Security);
                 }
@@ -658,7 +681,13 @@ impl WebGLRenderingContext {
                     None => return Ok(None),
                 };
 
-                let window = window_from_node(&*self.canvas);
+                let window = match self.canvas {
+                    HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                        window_from_node(&**canvas)
+                    },
+                    // This is marked as unreachable as we should have returned already
+                    HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => unreachable!(),
+                };
                 let cors_setting = cors_setting_for_element(image.upcast());
 
                 let img =
@@ -1208,7 +1237,7 @@ impl WebGLRenderingContext {
     }
 
     pub fn is_vertex_array(&self, vao: Option<&WebGLVertexArrayObjectOES>) -> bool {
-        vao.map_or(false, |vao| {
+        vao.is_some_and(|vao| {
             // The default vertex array has no id and should never be passed around.
             assert!(vao.id().is_some());
             self.validate_ownership(vao).is_ok() && vao.ever_bound() && !vao.is_deleted()
@@ -1216,7 +1245,7 @@ impl WebGLRenderingContext {
     }
 
     pub fn is_vertex_array_webgl2(&self, vao: Option<&WebGLVertexArrayObject>) -> bool {
-        vao.map_or(false, |vao| {
+        vao.is_some_and(|vao| {
             // The default vertex array has no id and should never be passed around.
             assert!(vao.id().is_some());
             self.validate_ownership(vao).is_ok() && vao.ever_bound() && !vao.is_deleted()
@@ -1959,8 +1988,8 @@ impl Drop for WebGLRenderingContext {
 
 impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.1
-    fn Canvas(&self) -> DomRoot<HTMLCanvasElement> {
-        DomRoot::from_ref(&*self.canvas)
+    fn Canvas(&self) -> HTMLCanvasElementOrOffscreenCanvas {
+        self.canvas.clone()
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.11
@@ -2913,11 +2942,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             return;
         }
         self.current_vao().unbind_buffer(buffer);
-        if self
-            .bound_buffer_array
-            .get()
-            .map_or(false, |b| buffer == &*b)
-        {
+        if self.bound_buffer_array.get().is_some_and(|b| buffer == &*b) {
             self.bound_buffer_array.set(None);
             buffer.decrement_attached_counter(Operation::Infallible);
         }
@@ -3517,7 +3542,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.5
     fn IsBuffer(&self, buffer: Option<&WebGLBuffer>) -> bool {
-        buffer.map_or(false, |buf| {
+        buffer.is_some_and(|buf| {
             self.validate_ownership(buf).is_ok() && buf.target().is_some() && !buf.is_deleted()
         })
     }
@@ -3529,35 +3554,31 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.6
     fn IsFramebuffer(&self, frame_buffer: Option<&WebGLFramebuffer>) -> bool {
-        frame_buffer.map_or(false, |buf| {
+        frame_buffer.is_some_and(|buf| {
             self.validate_ownership(buf).is_ok() && buf.target().is_some() && !buf.is_deleted()
         })
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
     fn IsProgram(&self, program: Option<&WebGLProgram>) -> bool {
-        program.map_or(false, |p| {
-            self.validate_ownership(p).is_ok() && !p.is_deleted()
-        })
+        program.is_some_and(|p| self.validate_ownership(p).is_ok() && !p.is_deleted())
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7
     fn IsRenderbuffer(&self, render_buffer: Option<&WebGLRenderbuffer>) -> bool {
-        render_buffer.map_or(false, |buf| {
+        render_buffer.is_some_and(|buf| {
             self.validate_ownership(buf).is_ok() && buf.ever_bound() && !buf.is_deleted()
         })
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
     fn IsShader(&self, shader: Option<&WebGLShader>) -> bool {
-        shader.map_or(false, |s| {
-            self.validate_ownership(s).is_ok() && !s.is_deleted()
-        })
+        shader.is_some_and(|s| self.validate_ownership(s).is_ok() && !s.is_deleted())
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
     fn IsTexture(&self, texture: Option<&WebGLTexture>) -> bool {
-        texture.map_or(false, |tex| {
+        texture.is_some_and(|tex| {
             self.validate_ownership(tex).is_ok() && tex.target().is_some() && !tex.is_invalid()
         })
     }
@@ -4292,16 +4313,14 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
         let unpacking_alignment = self.texture_unpacking_alignment.get();
 
-        let expected_byte_length = match {
-            self.validate_tex_image_2d_data(
-                width,
-                height,
-                format,
-                data_type,
-                unpacking_alignment,
-                pixels.as_ref(),
-            )
-        } {
+        let expected_byte_length = match self.validate_tex_image_2d_data(
+            width,
+            height,
+            format,
+            data_type,
+            unpacking_alignment,
+            pixels.as_ref(),
+        ) {
             Ok(byte_length) => byte_length,
             Err(()) => return Ok(()),
         };
@@ -4479,16 +4498,14 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
         let unpacking_alignment = self.texture_unpacking_alignment.get();
 
-        let expected_byte_length = match {
-            self.validate_tex_image_2d_data(
-                width,
-                height,
-                format,
-                data_type,
-                unpacking_alignment,
-                pixels.as_ref(),
-            )
-        } {
+        let expected_byte_length = match self.validate_tex_image_2d_data(
+            width,
+            height,
+            format,
+            data_type,
+            unpacking_alignment,
+            pixels.as_ref(),
+        ) {
             Ok(byte_length) => byte_length,
             Err(()) => return Ok(()),
         };
@@ -4671,9 +4688,9 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-webglrenderingcontextbase-makexrcompatible>
-    fn MakeXRCompatible(&self) -> Rc<Promise> {
+    fn MakeXRCompatible(&self, can_gc: CanGc) -> Rc<Promise> {
         // XXXManishearth Fill in with compatibility checks when rust-webxr supports this
-        let p = Promise::new(&self.global());
+        let p = Promise::new(&self.global(), can_gc);
         p.resolve_native(&());
         p
     }
@@ -4854,7 +4871,7 @@ impl TextureUnit {
             (&self.tex_3d, WebGL2RenderingContextConstants::TEXTURE_3D),
         ];
         for &(slot, target) in &fields {
-            if slot.get().map_or(false, |t| texture == &*t) {
+            if slot.get().is_some_and(|t| texture == &*t) {
                 slot.set(None);
                 return Some(target);
             }
@@ -4969,6 +4986,7 @@ fn array_buffer_type_to_sized_type(type_: Type) -> Option<SizedDataType> {
         Type::Int16 => Some(SizedDataType::Int16),
         Type::Int32 => Some(SizedDataType::Int32),
         Type::Float32 => Some(SizedDataType::Float32),
+        Type::Float16 |
         Type::Float64 |
         Type::BigInt64 |
         Type::BigUint64 |

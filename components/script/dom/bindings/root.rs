@@ -169,7 +169,7 @@ impl<T: Castable> DomRoot<T> {
         U: Castable,
         T: DerivedFrom<U>,
     {
-        unsafe { mem::transmute(root) }
+        unsafe { mem::transmute::<DomRoot<T>, DomRoot<U>>(root) }
     }
 
     /// Cast a DOM object root downwards to one of the interfaces it might implement.
@@ -178,7 +178,7 @@ impl<T: Castable> DomRoot<T> {
         U: DerivedFrom<T>,
     {
         if root.is::<U>() {
-            Some(unsafe { mem::transmute(root) })
+            Some(unsafe { mem::transmute::<DomRoot<T>, DomRoot<U>>(root) })
         } else {
             None
         }
@@ -238,7 +238,7 @@ pub struct RootCollection {
     roots: UnsafeCell<Vec<*const dyn JSTraceable>>,
 }
 
-thread_local!(static STACK_ROOTS: Cell<Option<*const RootCollection>> = Cell::new(None));
+thread_local!(static STACK_ROOTS: Cell<Option<*const RootCollection>> = const { Cell::new(None) });
 
 pub struct ThreadLocalStackRoots<'a>(PhantomData<&'a u32>);
 
@@ -274,7 +274,10 @@ impl RootCollection {
     unsafe fn unroot(&self, object: *const dyn JSTraceable) {
         assert_in_script();
         let roots = &mut *self.roots.get();
-        match roots.iter().rposition(|r| std::ptr::eq(*r, object)) {
+        match roots
+            .iter()
+            .rposition(|r| std::ptr::addr_eq(*r as *const (), object as *const ()))
+        {
             Some(idx) => {
                 roots.remove(idx);
             },
@@ -336,6 +339,10 @@ impl<T> MallocSizeOf for Dom<T> {
 
 impl<T> Dom<T> {
     /// Returns `LayoutDom<T>` containing the same pointer.
+    ///
+    /// # Safety
+    ///
+    /// The `self` parameter to this method must meet all the requirements of [`ptr::NonNull::as_ref`].
     pub unsafe fn to_layout(&self) -> LayoutDom<T> {
         assert_in_layout();
         LayoutDom {

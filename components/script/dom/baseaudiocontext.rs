@@ -8,10 +8,10 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use base::id::PipelineId;
 use dom_struct::dom_struct;
 use js::rust::CustomAutoRooterGuard;
 use js::typedarray::ArrayBuffer;
-use msg::constellation_msg::PipelineId;
 use servo_media::audio::context::{
     AudioContext, AudioContextOptions, OfflineAudioContextOptions, ProcessingState,
     RealTimeAudioContextOptions,
@@ -42,6 +42,7 @@ use crate::dom::bindings::codegen::Bindings::ChannelMergerNodeBinding::ChannelMe
 use crate::dom::bindings::codegen::Bindings::ChannelSplitterNodeBinding::ChannelSplitterOptions;
 use crate::dom::bindings::codegen::Bindings::ConstantSourceNodeBinding::ConstantSourceOptions;
 use crate::dom::bindings::codegen::Bindings::GainNodeBinding::GainOptions;
+use crate::dom::bindings::codegen::Bindings::IIRFilterNodeBinding::IIRFilterOptions;
 use crate::dom::bindings::codegen::Bindings::OscillatorNodeBinding::OscillatorOptions;
 use crate::dom::bindings::codegen::Bindings::PannerNodeBinding::PannerOptions;
 use crate::dom::bindings::codegen::Bindings::StereoPannerNodeBinding::StereoPannerOptions;
@@ -58,12 +59,14 @@ use crate::dom::constantsourcenode::ConstantSourceNode;
 use crate::dom::domexception::{DOMErrorName, DOMException};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::gainnode::GainNode;
+use crate::dom::iirfilternode::IIRFilterNode;
 use crate::dom::oscillatornode::OscillatorNode;
 use crate::dom::pannernode::PannerNode;
 use crate::dom::promise::Promise;
 use crate::dom::stereopannernode::StereoPannerNode;
 use crate::dom::window::Window;
 use crate::realms::InRealm;
+use crate::script_runtime::CanGc;
 use crate::task_source::TaskSource;
 
 #[allow(dead_code)]
@@ -79,6 +82,8 @@ struct DecodeResolver {
     pub error_callback: Option<Rc<DecodeErrorCallback>>,
 }
 
+type BoxedSliceOfPromises = Box<[Rc<Promise>]>;
+
 #[dom_struct]
 pub struct BaseAudioContext {
     eventtarget: EventTarget,
@@ -90,7 +95,7 @@ pub struct BaseAudioContext {
     listener: MutNullableDom<AudioListener>,
     /// Resume promises which are soon to be fulfilled by a queued task.
     #[ignore_malloc_size_of = "promises are hard"]
-    in_flight_resume_promises_queue: DomRefCell<VecDeque<(Box<[Rc<Promise>]>, ErrorResult)>>,
+    in_flight_resume_promises_queue: DomRefCell<VecDeque<(BoxedSliceOfPromises, ErrorResult)>>,
     /// <https://webaudio.github.io/web-audio-api/#pendingresumepromises>
     #[ignore_malloc_size_of = "promises are hard"]
     pending_resume_promises: DomRefCell<Vec<Rc<Promise>>>,
@@ -112,7 +117,7 @@ impl BaseAudioContext {
     pub fn new_inherited(
         options: BaseAudioContextOptions,
         pipeline_id: PipelineId,
-    ) -> BaseAudioContext {
+    ) -> Fallible<BaseAudioContext> {
         let (sample_rate, channel_count) = match options {
             BaseAudioContextOptions::AudioContext(ref opt) => (opt.sample_rate, 2),
             BaseAudioContextOptions::OfflineAudioContext(ref opt) => {
@@ -122,11 +127,14 @@ impl BaseAudioContext {
 
         let client_context_id =
             ClientContextId::build(pipeline_id.namespace_id.0, pipeline_id.index.0.get());
-        BaseAudioContext {
+        let audio_context_impl = ServoMedia::get()
+            .unwrap()
+            .create_audio_context(&client_context_id, options.into())
+            .map_err(|_| Error::NotSupported)?;
+
+        Ok(BaseAudioContext {
             eventtarget: EventTarget::new_inherited(),
-            audio_context_impl: ServoMedia::get()
-                .unwrap()
-                .create_audio_context(&client_context_id, options.into()),
+            audio_context_impl,
             destination: Default::default(),
             listener: Default::default(),
             in_flight_resume_promises_queue: Default::default(),
@@ -135,7 +143,7 @@ impl BaseAudioContext {
             sample_rate,
             state: Cell::new(AudioContextState::Suspended),
             channel_count: channel_count.into(),
-        }
+        })
     }
 
     /// Tells whether this is an OfflineAudioContext or not.
@@ -262,6 +270,10 @@ impl BaseAudioContext {
             },
         }
     }
+
+    pub fn channel_count(&self) -> u32 {
+        self.channel_count
+    }
 }
 
 impl BaseAudioContextMethods for BaseAudioContext {
@@ -282,9 +294,9 @@ impl BaseAudioContextMethods for BaseAudioContext {
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-resume>
-    fn Resume(&self, comp: InRealm) -> Rc<Promise> {
+    fn Resume(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         // Step 1.
-        let promise = Promise::new_in_current_realm(comp);
+        let promise = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 2.
         if self.audio_context_impl.lock().unwrap().state() == ProcessingState::Closed {
@@ -335,64 +347,95 @@ impl BaseAudioContextMethods for BaseAudioContext {
     event_handler!(statechange, GetOnstatechange, SetOnstatechange);
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createoscillator>
-    fn CreateOscillator(&self) -> Fallible<DomRoot<OscillatorNode>> {
-        OscillatorNode::new(self.global().as_window(), self, &OscillatorOptions::empty())
+    fn CreateOscillator(&self, can_gc: CanGc) -> Fallible<DomRoot<OscillatorNode>> {
+        OscillatorNode::new(
+            self.global().as_window(),
+            self,
+            &OscillatorOptions::empty(),
+            can_gc,
+        )
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-creategain>
-    fn CreateGain(&self) -> Fallible<DomRoot<GainNode>> {
-        GainNode::new(self.global().as_window(), self, &GainOptions::empty())
+    fn CreateGain(&self, can_gc: CanGc) -> Fallible<DomRoot<GainNode>> {
+        GainNode::new(
+            self.global().as_window(),
+            self,
+            &GainOptions::empty(),
+            can_gc,
+        )
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createpanner>
-    fn CreatePanner(&self) -> Fallible<DomRoot<PannerNode>> {
-        PannerNode::new(self.global().as_window(), self, &PannerOptions::empty())
+    fn CreatePanner(&self, can_gc: CanGc) -> Fallible<DomRoot<PannerNode>> {
+        PannerNode::new(
+            self.global().as_window(),
+            self,
+            &PannerOptions::empty(),
+            can_gc,
+        )
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createanalyser>
-    fn CreateAnalyser(&self) -> Fallible<DomRoot<AnalyserNode>> {
-        AnalyserNode::new(self.global().as_window(), self, &AnalyserOptions::empty())
+    fn CreateAnalyser(&self, can_gc: CanGc) -> Fallible<DomRoot<AnalyserNode>> {
+        AnalyserNode::new(
+            self.global().as_window(),
+            self,
+            &AnalyserOptions::empty(),
+            can_gc,
+        )
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createbiquadfilter>
-    fn CreateBiquadFilter(&self) -> Fallible<DomRoot<BiquadFilterNode>> {
+    fn CreateBiquadFilter(&self, can_gc: CanGc) -> Fallible<DomRoot<BiquadFilterNode>> {
         BiquadFilterNode::new(
             self.global().as_window(),
             self,
             &BiquadFilterOptions::empty(),
+            can_gc,
         )
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createstereopanner>
-    fn CreateStereoPanner(&self) -> Fallible<DomRoot<StereoPannerNode>> {
+    fn CreateStereoPanner(&self, can_gc: CanGc) -> Fallible<DomRoot<StereoPannerNode>> {
         StereoPannerNode::new(
             self.global().as_window(),
             self,
             &StereoPannerOptions::empty(),
+            can_gc,
         )
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createconstantsource>
-    fn CreateConstantSource(&self) -> Fallible<DomRoot<ConstantSourceNode>> {
+    fn CreateConstantSource(&self, can_gc: CanGc) -> Fallible<DomRoot<ConstantSourceNode>> {
         ConstantSourceNode::new(
             self.global().as_window(),
             self,
             &ConstantSourceOptions::empty(),
+            can_gc,
         )
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createchannelmerger>
-    fn CreateChannelMerger(&self, count: u32) -> Fallible<DomRoot<ChannelMergerNode>> {
+    fn CreateChannelMerger(
+        &self,
+        count: u32,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<ChannelMergerNode>> {
         let mut opts = ChannelMergerOptions::empty();
         opts.numberOfInputs = count;
-        ChannelMergerNode::new(self.global().as_window(), self, &opts)
+        ChannelMergerNode::new(self.global().as_window(), self, &opts, can_gc)
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createchannelsplitter>
-    fn CreateChannelSplitter(&self, count: u32) -> Fallible<DomRoot<ChannelSplitterNode>> {
+    fn CreateChannelSplitter(
+        &self,
+        count: u32,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<ChannelSplitterNode>> {
         let mut opts = ChannelSplitterOptions::empty();
         opts.numberOfOutputs = count;
-        ChannelSplitterNode::new(self.global().as_window(), self, &opts)
+        ChannelSplitterNode::new(self.global().as_window(), self, &opts, can_gc)
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createbuffer>
@@ -401,6 +444,7 @@ impl BaseAudioContextMethods for BaseAudioContext {
         number_of_channels: u32,
         length: u32,
         sample_rate: Finite<f32>,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<AudioBuffer>> {
         if number_of_channels == 0 ||
             number_of_channels > MAX_CHANNEL_COUNT ||
@@ -415,15 +459,17 @@ impl BaseAudioContextMethods for BaseAudioContext {
             length,
             *sample_rate,
             None,
+            can_gc,
         ))
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createbuffersource
-    fn CreateBufferSource(&self) -> Fallible<DomRoot<AudioBufferSourceNode>> {
+    fn CreateBufferSource(&self, can_gc: CanGc) -> Fallible<DomRoot<AudioBufferSourceNode>> {
         AudioBufferSourceNode::new(
             self.global().as_window(),
             self,
             &AudioBufferSourceOptions::empty(),
+            can_gc,
         )
     }
 
@@ -434,9 +480,10 @@ impl BaseAudioContextMethods for BaseAudioContext {
         decode_success_callback: Option<Rc<DecodeSuccessCallback>>,
         decode_error_callback: Option<Rc<DecodeErrorCallback>>,
         comp: InRealm,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
         // Step 1.
-        let promise = Promise::new_in_current_realm(comp);
+        let promise = Promise::new_in_current_realm(comp, can_gc);
         let global = self.global();
         let window = global.as_window();
 
@@ -504,7 +551,8 @@ impl BaseAudioContextMethods for BaseAudioContext {
                                 decoded_audio.len() as u32 /* number of channels */,
                                 length as u32,
                                 this.sample_rate,
-                                Some(decoded_audio.as_slice()));
+                                Some(decoded_audio.as_slice()),
+                                CanGc::note());
                             let mut resolvers = this.decode_resolvers.borrow_mut();
                             assert!(resolvers.contains_key(&uuid_));
                             let resolver = resolvers.remove(&uuid_).unwrap();
@@ -547,6 +595,21 @@ impl BaseAudioContextMethods for BaseAudioContext {
 
         // Step 4.
         promise
+    }
+
+    /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createiirfilter>
+    fn CreateIIRFilter(
+        &self,
+        feedforward: Vec<Finite<f64>>,
+        feedback: Vec<Finite<f64>>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<IIRFilterNode>> {
+        let opts = IIRFilterOptions {
+            parent: AudioNodeOptions::empty(),
+            feedback,
+            feedforward,
+        };
+        IIRFilterNode::new(self.global().as_window(), self, &opts, can_gc)
     }
 }
 

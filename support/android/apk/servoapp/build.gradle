@@ -7,18 +7,18 @@ import java.util.regex.Pattern
 
 android {
     compileSdk 33
-    buildToolsVersion "33.0.2"
+    buildToolsVersion = "34.0.0"
 
-    namespace 'org.mozilla.servo'
+    namespace 'org.servo.servoshell'
 
     buildDir = rootDir.absolutePath + "/../../../target/android/gradle/servoapp"
 
     defaultConfig {
-        applicationId "org.mozilla.servo"
+        applicationId "org.servo.servoshell"
         minSdk 30
         targetSdk 30
-        versionCode 1
-        versionName "1.0.0"
+        versionCode generatedVersionCode
+        versionName "0.0.1" // TODO: Parse Servo's TOML and add git SHA.
     }
 
     compileOptions {
@@ -27,7 +27,7 @@ android {
     }
 
     // Share all of that with servoview
-    flavorDimensions "default"
+    flavorDimensions = ["default"]
 
     productFlavors {
         basic {
@@ -50,12 +50,25 @@ android {
     }
 
 
+    def signingKeyInfo = getSigningKeyInfo()
+
+    if (signingKeyInfo) {
+        signingConfigs {
+            release {
+               storeFile signingKeyInfo.storeFile
+               storePassword signingKeyInfo.storePassword
+               keyAlias signingKeyInfo.keyAlias
+               keyPassword signingKeyInfo.keyPassword
+            }
+        }
+    }
+
     buildTypes {
         debug {
         }
 
         release {
-            signingConfig signingConfigs.debug // Change this to sign with a production key
+            signingConfig signingKeyInfo ? signingConfigs.release : signingConfigs.debug
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
@@ -113,8 +126,8 @@ android {
 
     // Ignore default 'debug' and 'release' build types
     variantFilter { variant ->
-        if(variant.buildType.name.equals('release') || variant.buildType.name.equals('debug')) {
-            variant.setIgnore(true);
+        if(variant.buildType.name == 'release' || variant.buildType.name == 'debug') {
+            variant.setIgnore(true)
         }
     }
 

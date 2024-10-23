@@ -4,41 +4,42 @@
 
 use std::convert::From;
 use std::fmt;
-use std::ops::{Add, AddAssign, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 
 use app_units::Au;
 use serde::Serialize;
-use style::logical_geometry::{
-    BlockFlowDirection, InlineBaseDirection, PhysicalCorner, WritingMode,
+use style::logical_geometry::{BlockFlowDirection, InlineBaseDirection, WritingMode};
+use style::values::computed::{
+    CSSPixelLength, LengthPercentage, MaxSize as StyleMaxSize, Size as StyleSize,
 };
-use style::values::computed::{CSSPixelLength, Length, LengthPercentage};
 use style::values::generics::length::GenericLengthPercentageOrAuto as AutoOr;
 use style::Zero;
 use style_traits::CSSPixel;
 
+use crate::sizing::ContentSizes;
 use crate::ContainingBlock;
 
 pub type PhysicalPoint<U> = euclid::Point2D<U, CSSPixel>;
 pub type PhysicalSize<U> = euclid::Size2D<U, CSSPixel>;
+pub type PhysicalVec<U> = euclid::Vector2D<U, CSSPixel>;
 pub type PhysicalRect<U> = euclid::Rect<U, CSSPixel>;
 pub type PhysicalSides<U> = euclid::SideOffsets2D<U, CSSPixel>;
-pub type LengthOrAuto = AutoOr<Length>;
 pub type AuOrAuto = AutoOr<Au>;
 pub type LengthPercentageOrAuto<'a> = AutoOr<&'a LengthPercentage>;
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Serialize)]
 pub struct LogicalVec2<T> {
     pub inline: T,
     pub block: T,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Copy, Serialize)]
 pub struct LogicalRect<T> {
     pub start_corner: LogicalVec2<T>,
     pub size: LogicalVec2<T>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct LogicalSides<T> {
     pub inline_start: T,
     pub inline_end: T,
@@ -54,6 +55,15 @@ impl<T: fmt::Debug> fmt::Debug for LogicalVec2<T> {
         f.write_str(", b: ")?;
         self.block.fmt(f)?;
         f.write_str(" }")
+    }
+}
+
+impl<T: Default> Default for LogicalVec2<T> {
+    fn default() -> Self {
+        Self {
+            inline: T::default(),
+            block: T::default(),
+        }
     }
 }
 
@@ -79,13 +89,9 @@ impl<T: Clone> LogicalVec2<T> {
     }
 }
 
-impl<T> Add<&'_ LogicalVec2<T>> for &'_ LogicalVec2<T>
-where
-    T: Add<Output = T> + Copy,
-{
+impl<T: Add<Output = T> + Copy> Add<LogicalVec2<T>> for LogicalVec2<T> {
     type Output = LogicalVec2<T>;
-
-    fn add(self, other: &'_ LogicalVec2<T>) -> Self::Output {
+    fn add(self, other: Self) -> Self::Output {
         LogicalVec2 {
             inline: self.inline + other.inline,
             block: self.block + other.block,
@@ -93,13 +99,9 @@ where
     }
 }
 
-impl<T> Sub<&'_ LogicalVec2<T>> for &'_ LogicalVec2<T>
-where
-    T: Sub<Output = T> + Copy,
-{
+impl<T: Sub<Output = T> + Copy> Sub<LogicalVec2<T>> for LogicalVec2<T> {
     type Output = LogicalVec2<T>;
-
-    fn sub(self, other: &'_ LogicalVec2<T>) -> Self::Output {
+    fn sub(self, other: Self) -> Self::Output {
         LogicalVec2 {
             inline: self.inline - other.inline,
             block: self.block - other.block,
@@ -107,41 +109,27 @@ where
     }
 }
 
-impl<T> AddAssign<&'_ LogicalVec2<T>> for LogicalVec2<T>
-where
-    T: AddAssign<T> + Copy,
-{
-    fn add_assign(&mut self, other: &'_ LogicalVec2<T>) {
+impl<T: AddAssign<T> + Copy> AddAssign<LogicalVec2<T>> for LogicalVec2<T> {
+    fn add_assign(&mut self, other: LogicalVec2<T>) {
         self.inline += other.inline;
         self.block += other.block;
     }
 }
 
-impl<T> AddAssign<LogicalVec2<T>> for LogicalVec2<T>
-where
-    T: AddAssign<T> + Copy,
-{
-    fn add_assign(&mut self, other: LogicalVec2<T>) {
-        self.add_assign(&other);
-    }
-}
-
-impl<T> SubAssign<&'_ LogicalVec2<T>> for LogicalVec2<T>
-where
-    T: SubAssign<T> + Copy,
-{
-    fn sub_assign(&mut self, other: &'_ LogicalVec2<T>) {
+impl<T: SubAssign<T> + Copy> SubAssign<LogicalVec2<T>> for LogicalVec2<T> {
+    fn sub_assign(&mut self, other: LogicalVec2<T>) {
         self.inline -= other.inline;
         self.block -= other.block;
     }
 }
 
-impl<T> SubAssign<LogicalVec2<T>> for LogicalVec2<T>
-where
-    T: SubAssign<T> + Copy,
-{
-    fn sub_assign(&mut self, other: LogicalVec2<T>) {
-        self.sub_assign(&other);
+impl<T: Neg<Output = T> + Copy> Neg for LogicalVec2<T> {
+    type Output = LogicalVec2<T>;
+    fn neg(self) -> Self::Output {
+        Self {
+            inline: -self.inline,
+            block: -self.block,
+        }
     }
 }
 
@@ -160,40 +148,6 @@ impl<T: Clone> LogicalVec2<AutoOr<T>> {
     }
 }
 
-impl LogicalVec2<LengthPercentageOrAuto<'_>> {
-    pub fn percentages_relative_to(
-        &self,
-        containing_block: &ContainingBlock,
-    ) -> LogicalVec2<LengthOrAuto> {
-        LogicalVec2 {
-            inline: self
-                .inline
-                .percentage_relative_to(containing_block.inline_size.into()),
-            block: self.block.maybe_percentage_relative_to(
-                containing_block.block_size.map(|t| t.into()).non_auto(),
-            ),
-        }
-    }
-}
-
-impl LogicalVec2<Option<&'_ LengthPercentage>> {
-    pub fn percentages_relative_to(
-        &self,
-        containing_block: &ContainingBlock,
-    ) -> LogicalVec2<Option<Length>> {
-        LogicalVec2 {
-            inline: self
-                .inline
-                .map(|lp| lp.percentage_relative_to(containing_block.inline_size.into())),
-            block: self.block.and_then(|lp| {
-                lp.maybe_percentage_relative_to(
-                    containing_block.block_size.map(|t| t.into()).non_auto(),
-                )
-            }),
-        }
-    }
-}
-
 impl<T: Zero> LogicalRect<T> {
     pub fn zero() -> Self {
         Self {
@@ -203,21 +157,21 @@ impl<T: Zero> LogicalRect<T> {
     }
 }
 
-impl fmt::Debug for LogicalRect<Length> {
+impl fmt::Debug for LogicalRect<Au> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "Rect(i{}×b{} @ (i{},b{}))",
-            self.size.inline.px(),
-            self.size.block.px(),
-            self.start_corner.inline.px(),
-            self.start_corner.block.px(),
+            self.size.inline.to_f32_px(),
+            self.size.block.to_f32_px(),
+            self.start_corner.inline.to_f32_px(),
+            self.start_corner.block.to_f32_px(),
         )
     }
 }
 
 impl<T: Clone> LogicalVec2<T> {
-    pub fn to_physical(&self, mode: WritingMode) -> PhysicalSize<T> {
+    pub fn to_physical_size(&self, mode: WritingMode) -> PhysicalSize<T> {
         // https://drafts.csswg.org/css-writing-modes/#logical-to-physical
         let (x, y) = if mode.is_horizontal() {
             (&self.inline, &self.block)
@@ -225,6 +179,47 @@ impl<T: Clone> LogicalVec2<T> {
             (&self.block, &self.inline)
         };
         PhysicalSize::new(x.clone(), y.clone())
+    }
+}
+
+impl<T: Copy + Neg<Output = T>> LogicalVec2<T> {
+    pub fn to_physical_vector(&self, mode: WritingMode) -> PhysicalVec<T> {
+        if mode.is_horizontal() {
+            if mode.is_bidi_ltr() {
+                PhysicalVec::new(self.inline, self.block)
+            } else {
+                PhysicalVec::new(-self.inline, self.block)
+            }
+        } else if mode.is_inline_tb() {
+            PhysicalVec::new(self.block, self.inline)
+        } else {
+            PhysicalVec::new(-self.block, self.inline)
+        }
+    }
+}
+
+impl LogicalVec2<Au> {
+    #[inline]
+    pub fn to_physical_point(
+        &self,
+        containing_block: Option<&ContainingBlock>,
+    ) -> PhysicalPoint<Au> {
+        let mode = containing_block.map_or_else(WritingMode::horizontal_tb, |containing_block| {
+            containing_block.style.writing_mode
+        });
+        if mode.is_vertical() {
+            // TODO: Bottom-to-top writing modes are not supported yet.
+            PhysicalPoint::new(self.block, self.inline)
+        } else {
+            let y = self.block;
+            let x = match containing_block {
+                Some(containing_block) if !mode.is_bidi_ltr() => {
+                    containing_block.inline_size - self.inline
+                },
+                _ => self.inline,
+            };
+            PhysicalPoint::new(x, y)
+        }
     }
 }
 
@@ -339,10 +334,7 @@ impl<T> LogicalSides<T> {
     }
 }
 
-impl<T> LogicalSides<T>
-where
-    T: Copy,
-{
+impl<T: Copy> LogicalSides<T> {
     pub fn start_offset(&self) -> LogicalVec2<T> {
         LogicalVec2 {
             inline: self.inline_start,
@@ -352,14 +344,14 @@ where
 }
 
 impl LogicalSides<&'_ LengthPercentage> {
-    pub fn percentages_relative_to(&self, basis: Length) -> LogicalSides<Length> {
-        self.map(|s| s.percentage_relative_to(basis))
+    pub fn percentages_relative_to(&self, basis: Au) -> LogicalSides<Au> {
+        self.map(|value| value.to_used_value(basis))
     }
 }
 
 impl LogicalSides<LengthPercentageOrAuto<'_>> {
-    pub fn percentages_relative_to(&self, basis: Length) -> LogicalSides<LengthOrAuto> {
-        self.map(|s| s.percentage_relative_to(basis))
+    pub fn percentages_relative_to(&self, basis: Au) -> LogicalSides<AuOrAuto> {
+        self.map(|value| value.map(|value| value.to_used_value(basis)))
     }
 }
 
@@ -369,13 +361,10 @@ impl<T: Clone> LogicalSides<AutoOr<T>> {
     }
 }
 
-impl<T> Add<&'_ LogicalSides<T>> for &'_ LogicalSides<T>
-where
-    T: Add<Output = T> + Copy,
-{
+impl<T: Add<Output = T> + Copy> Add<LogicalSides<T>> for LogicalSides<T> {
     type Output = LogicalSides<T>;
 
-    fn add(self, other: &'_ LogicalSides<T>) -> Self::Output {
+    fn add(self, other: Self) -> Self::Output {
         LogicalSides {
             inline_start: self.inline_start + other.inline_start,
             inline_end: self.inline_end + other.inline_end,
@@ -385,9 +374,34 @@ where
     }
 }
 
+impl<T: Sub<Output = T> + Copy> Sub<LogicalSides<T>> for LogicalSides<T> {
+    type Output = LogicalSides<T>;
+
+    fn sub(self, other: Self) -> Self::Output {
+        LogicalSides {
+            inline_start: self.inline_start - other.inline_start,
+            inline_end: self.inline_end - other.inline_end,
+            block_start: self.block_start - other.block_start,
+            block_end: self.block_end - other.block_end,
+        }
+    }
+}
+
+impl<T: Neg<Output = T> + Copy> Neg for LogicalSides<T> {
+    type Output = LogicalSides<T>;
+    fn neg(self) -> Self::Output {
+        Self {
+            inline_start: -self.inline_start,
+            inline_end: -self.inline_end,
+            block_start: -self.block_start,
+            block_end: -self.block_end,
+        }
+    }
+}
+
 impl<T: Zero> LogicalSides<T> {
     pub(crate) fn zero() -> LogicalSides<T> {
-        LogicalSides {
+        Self {
             inline_start: T::zero(),
             inline_end: T::zero(),
             block_start: T::zero(),
@@ -398,7 +412,7 @@ impl<T: Zero> LogicalSides<T> {
 
 impl From<LogicalSides<CSSPixelLength>> for LogicalSides<Au> {
     fn from(value: LogicalSides<CSSPixelLength>) -> Self {
-        LogicalSides {
+        Self {
             inline_start: value.inline_start.into(),
             inline_end: value.inline_end.into(),
             block_start: value.block_start.into(),
@@ -409,7 +423,7 @@ impl From<LogicalSides<CSSPixelLength>> for LogicalSides<Au> {
 
 impl From<LogicalSides<Au>> for LogicalSides<CSSPixelLength> {
     fn from(value: LogicalSides<Au>) -> Self {
-        LogicalSides {
+        Self {
             inline_start: value.inline_start.into(),
             inline_end: value.inline_end.into(),
             block_start: value.block_start.into(),
@@ -438,7 +452,7 @@ impl<T> LogicalRect<T> {
         T: Add<Output = T> + Copy,
         T: Sub<Output = T> + Copy,
     {
-        LogicalRect {
+        Self {
             start_corner: LogicalVec2 {
                 inline: self.start_corner.inline - sides.inline_start,
                 block: self.start_corner.block - sides.block_start,
@@ -466,27 +480,33 @@ impl<T> LogicalRect<T> {
             },
         }
     }
+}
 
-    pub fn to_physical(
-        &self,
-        mode: WritingMode,
-        // Will be needed for other writing modes
-        // FIXME: what if the containing block has a different mode?
-        // https://drafts.csswg.org/css-writing-modes/#orthogonal-flows
-        _containing_block: &PhysicalRect<T>,
-    ) -> PhysicalRect<T>
-    where
-        T: Clone,
-    {
-        // Top-left corner
-        let (tl_x, tl_y) = match mode.start_start_physical_corner() {
-            PhysicalCorner::TopLeft => (&self.start_corner.inline, &self.start_corner.block),
-            _ => unimplemented!(),
+impl LogicalRect<Au> {
+    pub fn to_physical(&self, containing_block: Option<&ContainingBlock<'_>>) -> PhysicalRect<Au> {
+        let mode = containing_block.map_or_else(WritingMode::horizontal_tb, |containing_block| {
+            containing_block.style.writing_mode
+        });
+        let (x, y, width, height) = if mode.is_vertical() {
+            // TODO: Bottom-to-top writing modes are not supported.
+            (
+                self.start_corner.block,
+                self.start_corner.inline,
+                self.size.block,
+                self.size.inline,
+            )
+        } else {
+            let y = self.start_corner.block;
+            let x = match containing_block {
+                Some(containing_block) if !mode.is_bidi_ltr() => {
+                    containing_block.inline_size - self.max_inline_position()
+                },
+                _ => self.start_corner.inline,
+            };
+            (x, y, self.size.inline, self.size.block)
         };
-        PhysicalRect::new(
-            PhysicalPoint::new(tl_x.clone(), tl_y.clone()),
-            self.size.to_physical(mode),
-        )
+
+        PhysicalRect::new(PhysicalPoint::new(x, y), PhysicalSize::new(width, height))
     }
 }
 
@@ -526,16 +546,283 @@ impl From<LogicalRect<CSSPixelLength>> for LogicalRect<Au> {
     }
 }
 
-/// Convert a `PhysicalRect<Length>` (one that uses CSSPixel as the unit) to an untyped `Rect<Au>`.
-pub fn physical_rect_to_au_rect(rect: PhysicalRect<Length>) -> euclid::default::Rect<Au> {
-    euclid::default::Rect::new(
-        euclid::default::Point2D::new(
-            Au::from_f32_px(rect.origin.x.px()),
-            Au::from_f32_px(rect.origin.y.px()),
-        ),
-        euclid::default::Size2D::new(
-            Au::from_f32_px(rect.size.width.px()),
-            Au::from_f32_px(rect.size.height.px()),
-        ),
-    )
+pub(crate) trait ToLogical<Unit, LogicalType> {
+    fn to_logical(&self, writing_mode: WritingMode) -> LogicalType;
+}
+
+impl<Unit: Copy> ToLogical<Unit, LogicalVec2<Unit>> for PhysicalSize<Unit> {
+    fn to_logical(&self, writing_mode: WritingMode) -> LogicalVec2<Unit> {
+        LogicalVec2::from_physical_size(self, writing_mode)
+    }
+}
+
+impl<Unit: Copy> ToLogical<Unit, LogicalSides<Unit>> for PhysicalSides<Unit> {
+    fn to_logical(&self, writing_mode: WritingMode) -> LogicalSides<Unit> {
+        LogicalSides::from_physical(self, writing_mode)
+    }
+}
+
+pub(crate) trait ToLogicalWithContainingBlock<LogicalType> {
+    fn to_logical(&self, containing_block: &ContainingBlock) -> LogicalType;
+}
+
+impl ToLogicalWithContainingBlock<LogicalVec2<Au>> for PhysicalPoint<Au> {
+    fn to_logical(&self, containing_block: &ContainingBlock) -> LogicalVec2<Au> {
+        let writing_mode = containing_block.style.writing_mode;
+        // TODO: Bottom-to-top and right-to-left vertical writing modes are not supported yet.
+        if writing_mode.is_vertical() {
+            LogicalVec2 {
+                inline: self.y,
+                block: self.x,
+            }
+        } else {
+            LogicalVec2 {
+                inline: if writing_mode.is_bidi_ltr() {
+                    self.x
+                } else {
+                    containing_block.inline_size - self.x
+                },
+                block: self.y,
+            }
+        }
+    }
+}
+
+impl ToLogicalWithContainingBlock<LogicalRect<Au>> for PhysicalRect<Au> {
+    fn to_logical(&self, containing_block: &ContainingBlock) -> LogicalRect<Au> {
+        let inline_start;
+        let block_start;
+        let inline;
+        let block;
+
+        let writing_mode = containing_block.style.writing_mode;
+        if writing_mode.is_vertical() {
+            // TODO: Bottom-to-top and right-to-left vertical writing modes are not supported yet.
+            inline = self.size.height;
+            block = self.size.width;
+            block_start = self.origin.x;
+            inline_start = self.origin.y;
+        } else {
+            inline = self.size.width;
+            block = self.size.height;
+            block_start = self.origin.y;
+            if writing_mode.is_bidi_ltr() {
+                inline_start = self.origin.x;
+            } else {
+                inline_start = containing_block.inline_size - (self.origin.x + self.size.width);
+            }
+        }
+        LogicalRect {
+            start_corner: LogicalVec2 {
+                inline: inline_start,
+                block: block_start,
+            },
+            size: LogicalVec2 { inline, block },
+        }
+    }
+}
+
+/// The possible values accepted by the sizing properties.
+/// <https://drafts.csswg.org/css-sizing/#sizing-properties>
+#[derive(Clone, PartialEq)]
+pub(crate) enum Size<T> {
+    /// Represents an `auto` value for the preferred and minimum size properties,
+    /// or `none` for the maximum size properties.
+    /// <https://drafts.csswg.org/css-sizing/#valdef-width-auto>
+    /// <https://drafts.csswg.org/css-sizing/#valdef-max-width-none>
+    Initial,
+    /// <https://drafts.csswg.org/css-sizing/#valdef-width-min-content>
+    MinContent,
+    /// <https://drafts.csswg.org/css-sizing/#valdef-width-max-content>
+    MaxContent,
+    /// <https://drafts.csswg.org/css-sizing-4/#valdef-width-fit-content>
+    FitContent,
+    /// <https://drafts.csswg.org/css-sizing-4/#valdef-width-stretch>
+    Stretch,
+    /// Represents a numeric `<length-percentage>`, but resolved as a `T`.
+    /// <https://drafts.csswg.org/css-sizing/#valdef-width-length-percentage-0>
+    Numeric(T),
+}
+
+impl<T: Copy> Copy for Size<T> {}
+
+impl<T> Default for Size<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::Initial
+    }
+}
+
+impl<T> Size<T> {
+    #[inline]
+    pub(crate) fn is_numeric(&self) -> bool {
+        matches!(self, Self::Numeric(_))
+    }
+
+    #[inline]
+    pub(crate) fn is_initial(&self) -> bool {
+        matches!(self, Self::Initial)
+    }
+}
+
+impl<T: Clone> Size<T> {
+    #[inline]
+    pub(crate) fn to_numeric(&self) -> Option<T> {
+        match self {
+            Self::Numeric(numeric) => Some(numeric).cloned(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn to_auto_or(&self) -> AutoOr<T> {
+        self.to_numeric()
+            .map_or(AutoOr::Auto, AutoOr::LengthPercentage)
+    }
+
+    #[inline]
+    pub fn map<U>(&self, f: impl FnOnce(T) -> U) -> Size<U> {
+        match self {
+            Size::Initial => Size::Initial,
+            Size::MinContent => Size::MinContent,
+            Size::MaxContent => Size::MaxContent,
+            Size::FitContent => Size::FitContent,
+            Size::Stretch => Size::Stretch,
+            Size::Numeric(numeric) => Size::Numeric(f(numeric.clone())),
+        }
+    }
+
+    #[inline]
+    pub fn maybe_map<U>(&self, f: impl FnOnce(T) -> Option<U>) -> Option<Size<U>> {
+        Some(match self {
+            Size::Numeric(numeric) => Size::Numeric(f(numeric.clone())?),
+            _ => self.map(|_| unreachable!("This shouldn't be called for keywords")),
+        })
+    }
+}
+
+impl From<StyleSize> for Size<LengthPercentage> {
+    fn from(size: StyleSize) -> Self {
+        match size {
+            StyleSize::LengthPercentage(length) => Size::Numeric(length.0),
+            StyleSize::Auto => Size::Initial,
+            StyleSize::MinContent => Size::MinContent,
+            StyleSize::MaxContent => Size::MaxContent,
+            StyleSize::FitContent => Size::FitContent,
+            StyleSize::Stretch => Size::Stretch,
+            StyleSize::AnchorSizeFunction(_) => unreachable!("anchor-size() should be disabled"),
+        }
+    }
+}
+
+impl From<StyleMaxSize> for Size<LengthPercentage> {
+    fn from(max_size: StyleMaxSize) -> Self {
+        match max_size {
+            StyleMaxSize::LengthPercentage(length) => Size::Numeric(length.0),
+            StyleMaxSize::None => Size::Initial,
+            StyleMaxSize::MinContent => Size::MinContent,
+            StyleMaxSize::MaxContent => Size::MaxContent,
+            StyleMaxSize::FitContent => Size::FitContent,
+            StyleMaxSize::Stretch => Size::Stretch,
+            StyleMaxSize::AnchorSizeFunction(_) => unreachable!("anchor-size() should be disabled"),
+        }
+    }
+}
+
+impl LogicalVec2<Size<LengthPercentage>> {
+    pub(crate) fn percentages_relative_to(
+        &self,
+        containing_block: &ContainingBlock,
+    ) -> LogicalVec2<Size<Au>> {
+        LogicalVec2 {
+            inline: self
+                .inline
+                .map(|lp| lp.to_used_value(containing_block.inline_size)),
+            block: self
+                .block
+                .maybe_map(|lp| lp.maybe_to_used_value(containing_block.block_size.non_auto()))
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn maybe_percentages_relative_to_basis(
+        &self,
+        basis: &LogicalVec2<Option<Au>>,
+    ) -> LogicalVec2<Size<Au>> {
+        LogicalVec2 {
+            inline: self
+                .inline
+                .maybe_map(|v| v.maybe_to_used_value(basis.inline))
+                .unwrap_or_default(),
+            block: self
+                .block
+                .maybe_map(|v| v.maybe_to_used_value(basis.block))
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn percentages_relative_to_basis(
+        &self,
+        basis: &LogicalVec2<Au>,
+    ) -> LogicalVec2<Size<Au>> {
+        LogicalVec2 {
+            inline: self.inline.map(|value| value.to_used_value(basis.inline)),
+            block: self.block.map(|value| value.to_used_value(basis.block)),
+        }
+    }
+}
+
+impl Size<Au> {
+    /// Resolves any size into a numerical value.
+    #[inline]
+    pub(crate) fn resolve(
+        &self,
+        initial_behavior: Self,
+        stretch_size: Au,
+        get_content_size: &mut impl FnMut() -> ContentSizes,
+    ) -> Au {
+        if self.is_initial() {
+            assert!(!initial_behavior.is_initial());
+            initial_behavior.resolve_non_initial(stretch_size, get_content_size)
+        } else {
+            self.resolve_non_initial(stretch_size, get_content_size)
+        }
+        .unwrap()
+    }
+
+    /// Resolves a non-initial size into a numerical value.
+    /// Returns `None` if the size is the initial one.
+    #[inline]
+    pub(crate) fn resolve_non_initial(
+        &self,
+        stretch_size: Au,
+        get_content_size: &mut impl FnMut() -> ContentSizes,
+    ) -> Option<Au> {
+        match self {
+            Self::Initial => None,
+            Self::MinContent => Some(get_content_size().min_content),
+            Self::MaxContent => Some(get_content_size().max_content),
+            Self::FitContent => Some(get_content_size().shrink_to_fit(stretch_size)),
+            Self::Stretch => Some(stretch_size),
+            Self::Numeric(numeric) => Some(*numeric),
+        }
+    }
+
+    /// Tries to resolve an extrinsic size into a numerical value.
+    /// Extrinsic sizes are those based on the context of an element, without regard for its contents.
+    /// <https://drafts.csswg.org/css-sizing-3/#extrinsic>
+    ///
+    /// Returns `None` if either:
+    /// - The size is intrinsic.
+    /// - The size is the initial one.
+    ///   TODO: should we allow it to behave as `stretch` instead of assuming it's intrinsic?
+    /// - The provided `stretch_size` is `None` but we need its value.
+    #[inline]
+    pub(crate) fn maybe_resolve_extrinsic(&self, stretch_size: Option<Au>) -> Option<Au> {
+        match self {
+            Self::Initial | Self::MinContent | Self::MaxContent | Self::FitContent => None,
+            Self::Stretch => stretch_size,
+            Self::Numeric(numeric) => Some(*numeric),
+        }
+    }
 }

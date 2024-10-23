@@ -226,7 +226,7 @@ impl StorageManager {
             .send(
                 data.get(&origin)
                     .and_then(|(_, entry)| entry.get(&name))
-                    .map(String::clone),
+                    .cloned(),
             )
             .unwrap();
     }
@@ -258,7 +258,7 @@ impl StorageManager {
         sender
             .send(
                 data.get_mut(&origin)
-                    .map_or(false, |&mut (ref mut total, ref mut entry)| {
+                    .is_some_and(|&mut (ref mut total, ref mut entry)| {
                         if !entry.is_empty() {
                             entry.clear();
                             *total = 0;

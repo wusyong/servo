@@ -7,9 +7,9 @@ use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::Builder;
 
+use base::id::PipelineId;
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
-use msg::constellation_msg::PipelineId;
 use servo_media::audio::context::OfflineAudioContextOptions as ServoMediaOfflineAudioContextOptions;
 
 use crate::dom::audiobuffer::{AudioBuffer, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
@@ -31,6 +31,7 @@ use crate::dom::offlineaudiocompletionevent::OfflineAudioCompletionEvent;
 use crate::dom::promise::Promise;
 use crate::dom::window::Window;
 use crate::realms::InRealm;
+use crate::script_runtime::CanGc;
 use crate::task_source::TaskSource;
 
 #[dom_struct]
@@ -43,7 +44,6 @@ pub struct OfflineAudioContext {
     pending_rendering_promise: DomRefCell<Option<Rc<Promise>>>,
 }
 
-#[allow(non_snake_case)]
 impl OfflineAudioContext {
     #[allow(crown::unrooted_must_root)]
     fn new_inherited(
@@ -51,7 +51,7 @@ impl OfflineAudioContext {
         length: u32,
         sample_rate: f32,
         pipeline_id: PipelineId,
-    ) -> OfflineAudioContext {
+    ) -> Fallible<OfflineAudioContext> {
         let options = ServoMediaOfflineAudioContextOptions {
             channels: channel_count as u8,
             length: length as usize,
@@ -60,14 +60,14 @@ impl OfflineAudioContext {
         let context = BaseAudioContext::new_inherited(
             BaseAudioContextOptions::OfflineAudioContext(options),
             pipeline_id,
-        );
-        OfflineAudioContext {
+        )?;
+        Ok(OfflineAudioContext {
             context,
             channel_count,
             length,
             rendering_started: Cell::new(false),
             pending_rendering_promise: Default::default(),
-        }
+        })
     }
 
     #[allow(crown::unrooted_must_root)]
@@ -77,28 +77,33 @@ impl OfflineAudioContext {
         channel_count: u32,
         length: u32,
         sample_rate: f32,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<OfflineAudioContext>> {
         if channel_count > MAX_CHANNEL_COUNT ||
             channel_count == 0 ||
             length == 0 ||
-            sample_rate < MIN_SAMPLE_RATE ||
-            sample_rate > MAX_SAMPLE_RATE
+            !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate)
         {
             return Err(Error::NotSupported);
         }
         let pipeline_id = window.pipeline_id();
         let context =
-            OfflineAudioContext::new_inherited(channel_count, length, sample_rate, pipeline_id);
+            OfflineAudioContext::new_inherited(channel_count, length, sample_rate, pipeline_id)?;
         Ok(reflect_dom_object_with_proto(
             Box::new(context),
             window,
             proto,
+            can_gc,
         ))
     }
+}
 
-    pub fn Constructor(
+impl OfflineAudioContextMethods for OfflineAudioContext {
+    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-offlineaudiocontext
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         options: &OfflineAudioContextOptions,
     ) -> Fallible<DomRoot<OfflineAudioContext>> {
         OfflineAudioContext::new(
@@ -107,21 +112,29 @@ impl OfflineAudioContext {
             options.numberOfChannels,
             options.length,
             *options.sampleRate,
+            can_gc,
         )
     }
 
-    pub fn Constructor_(
+    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-offlineaudiocontext-numberofchannels-length-samplerate
+    fn Constructor_(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         number_of_channels: u32,
         length: u32,
         sample_rate: Finite<f32>,
     ) -> Fallible<DomRoot<OfflineAudioContext>> {
-        OfflineAudioContext::new(window, proto, number_of_channels, length, *sample_rate)
+        OfflineAudioContext::new(
+            window,
+            proto,
+            number_of_channels,
+            length,
+            *sample_rate,
+            can_gc,
+        )
     }
-}
 
-impl OfflineAudioContextMethods for OfflineAudioContext {
     // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-oncomplete
     event_handler!(complete, GetOncomplete, SetOncomplete);
 
@@ -131,8 +144,8 @@ impl OfflineAudioContextMethods for OfflineAudioContext {
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-startrendering
-    fn StartRendering(&self, comp: InRealm) -> Rc<Promise> {
-        let promise = Promise::new_in_current_realm(comp);
+    fn StartRendering(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
+        let promise = Promise::new_in_current_realm(comp, can_gc);
         if self.rendering_started.get() {
             promise.reject_error(Error::InvalidState);
             return promise;
@@ -184,7 +197,8 @@ impl OfflineAudioContextMethods for OfflineAudioContext {
                             this.channel_count,
                             this.length,
                             *this.context.SampleRate(),
-                            Some(processed_audio.as_slice()));
+                            Some(processed_audio.as_slice()),
+                            CanGc::note());
                         (*this.pending_rendering_promise.borrow_mut()).take().unwrap().resolve_native(&buffer);
                         let global = &this.global();
                         let window = global.as_window();
@@ -192,7 +206,7 @@ impl OfflineAudioContextMethods for OfflineAudioContext {
                                                                      atom!("complete"),
                                                                      EventBubbles::DoesNotBubble,
                                                                      EventCancelable::NotCancelable,
-                                                                     &buffer);
+                                                                     &buffer, CanGc::note());
                         event.upcast::<Event>().fire(this.upcast());
                     }),
                     &canceller,

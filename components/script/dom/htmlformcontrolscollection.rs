@@ -50,16 +50,16 @@ impl HTMLFormControlsCollection {
             window,
         )
     }
-
-    // FIXME: This shouldn't need to be implemented here since HTMLCollection (the parent of
-    // HTMLFormControlsCollection) implements Length
-    #[allow(non_snake_case)]
-    pub fn Length(&self) -> u32 {
-        self.collection.Length()
-    }
 }
 
 impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
+    // FIXME: This shouldn't need to be implemented here since HTMLCollection (the parent of
+    // HTMLFormControlsCollection) implements Length
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-length
+    fn Length(&self) -> u32 {
+        self.collection.Length()
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-htmlformcontrolscollection-nameditem
     fn NamedItem(&self, name: DOMString) -> Option<RadioNodeListOrElement> {
         // Step 1
@@ -70,8 +70,8 @@ impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
         let name = Atom::from(name);
 
         let mut filter_map = self.collection.elements_iter().filter_map(|elem| {
-            if elem.get_name().map_or(false, |n| n == name) ||
-                elem.get_id().map_or(false, |i| i == name)
+            if elem.get_name().is_some_and(|n| n == name) ||
+                elem.get_id().is_some_and(|i| i == name)
             {
                 Some(elem)
             } else {

@@ -17,6 +17,7 @@ use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::weakref::MutableWeakRef;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::url::URL;
+use crate::script_runtime::CanGc;
 
 /// <https://url.spec.whatwg.org/#interface-urlsearchparams>
 #[dom_struct]
@@ -37,27 +38,39 @@ impl URLSearchParams {
         }
     }
 
-    pub fn new(global: &GlobalScope, url: Option<&URL>) -> DomRoot<URLSearchParams> {
-        Self::new_with_proto(global, None, url)
+    pub fn new(global: &GlobalScope, url: Option<&URL>, can_gc: CanGc) -> DomRoot<URLSearchParams> {
+        Self::new_with_proto(global, None, url, can_gc)
     }
 
     pub fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         url: Option<&URL>,
+        can_gc: CanGc,
     ) -> DomRoot<URLSearchParams> {
-        reflect_dom_object_with_proto(Box::new(URLSearchParams::new_inherited(url)), global, proto)
+        reflect_dom_object_with_proto(
+            Box::new(URLSearchParams::new_inherited(url)),
+            global,
+            proto,
+            can_gc,
+        )
     }
 
+    pub fn set_list(&self, list: Vec<(String, String)>) {
+        *self.list.borrow_mut() = list;
+    }
+}
+
+impl URLSearchParamsMethods for URLSearchParams {
     /// <https://url.spec.whatwg.org/#dom-urlsearchparams-urlsearchparams>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         init: USVStringSequenceSequenceOrUSVStringUSVStringRecordOrUSVString,
     ) -> Fallible<DomRoot<URLSearchParams>> {
         // Step 1.
-        let query = URLSearchParams::new_with_proto(global, proto, None);
+        let query = URLSearchParams::new_with_proto(global, proto, None, can_gc);
         match init {
             USVStringSequenceSequenceOrUSVStringUSVStringRecordOrUSVString::USVStringSequenceSequence(init) => {
                 // Step 2.
@@ -96,12 +109,6 @@ impl URLSearchParams {
         Ok(query)
     }
 
-    pub fn set_list(&self, list: Vec<(String, String)>) {
-        *self.list.borrow_mut() = list;
-    }
-}
-
-impl URLSearchParamsMethods for URLSearchParams {
     /// <https://url.spec.whatwg.org/#dom-urlsearchparams-size>
     fn Size(&self) -> u32 {
         self.list.borrow().len() as u32

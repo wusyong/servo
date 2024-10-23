@@ -9,15 +9,9 @@ mod mpsc;
 
 use std::fmt;
 
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use servo_config::opts;
 
 use crate::GLPlayerMsg;
-
-lazy_static! {
-    static ref IS_MULTIPROCESS: bool = opts::multiprocess();
-}
 
 #[derive(Deserialize, Serialize)]
 pub enum GLPlayerSender<T: Serialize> {
@@ -75,9 +69,9 @@ where
     }
 
     #[allow(clippy::wrong_self_convention)] // It is an alias to the underlying module
-    pub fn to_opaque(self) -> ipc_channel::ipc::OpaqueIpcReceiver {
+    pub fn to_ipc_receiver(self) -> ipc_channel::ipc::IpcReceiver<T> {
         match self {
-            GLPlayerReceiver::Ipc(receiver) => receiver.to_opaque(),
+            GLPlayerReceiver::Ipc(receiver) => receiver,
             _ => unreachable!(),
         }
     }

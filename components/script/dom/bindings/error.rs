@@ -29,7 +29,7 @@ use crate::dom::bindings::str::USVString;
 use crate::dom::domexception::{DOMErrorName, DOMException};
 use crate::dom::globalscope::GlobalScope;
 use crate::realms::InRealm;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[cfg(feature = "js_backtrace")]
 thread_local! {
@@ -85,6 +85,8 @@ pub enum Error {
     InvalidModification,
     /// NotReadableError DOMException
     NotReadable,
+    /// DataError DOMException
+    Data,
     /// OperationError DOMException
     Operation,
 
@@ -139,6 +141,7 @@ pub fn throw_dom_exception(cx: SafeJSContext, global: &GlobalScope, result: Erro
         Error::TypeMismatch => DOMErrorName::TypeMismatchError,
         Error::InvalidModification => DOMErrorName::InvalidModificationError,
         Error::NotReadable => DOMErrorName::NotReadableError,
+        Error::Data => DOMErrorName::DataError,
         Error::Operation => DOMErrorName::OperationError,
         Error::Type(message) => unsafe {
             assert!(!JS_IsExceptionPending(*cx));
@@ -166,6 +169,7 @@ pub fn throw_dom_exception(cx: SafeJSContext, global: &GlobalScope, result: Erro
 }
 
 /// A struct encapsulating information about a runtime script error.
+#[derive(Default)]
 pub struct ErrorInfo {
     /// The error message.
     pub message: String,
@@ -185,7 +189,7 @@ impl ErrorInfo {
         }
 
         let filename = {
-            let filename = (*report)._base.filename as *const u8;
+            let filename = (*report)._base.filename.data_ as *const u8;
             if !filename.is_null() {
                 let length = (0..).find(|idx| *filename.offset(*idx) == 0).unwrap();
                 let filename = from_raw_parts(filename, length as usize);
@@ -196,7 +200,7 @@ impl ErrorInfo {
         };
 
         let lineno = (*report)._base.lineno;
-        let column = (*report)._base.column;
+        let column = (*report)._base.column._base;
 
         let message = {
             let message = (*report)._base.message_.data_ as *const u8;
@@ -263,7 +267,12 @@ impl ErrorInfo {
 ///
 /// The `dispatch_event` argument is temporary and non-standard; passing false
 /// prevents dispatching the `error` event.
-pub unsafe fn report_pending_exception(cx: *mut JSContext, dispatch_event: bool, realm: InRealm) {
+pub unsafe fn report_pending_exception(
+    cx: *mut JSContext,
+    dispatch_event: bool,
+    realm: InRealm,
+    can_gc: CanGc,
+) {
     if !JS_IsExceptionPending(cx) {
         return;
     }
@@ -295,7 +304,7 @@ pub unsafe fn report_pending_exception(cx: *mut JSContext, dispatch_event: bool,
     }
 
     if dispatch_event {
-        GlobalScope::from_context(cx, realm).report_an_error(error_info, value.handle());
+        GlobalScope::from_context(cx, realm).report_an_error(error_info, value.handle(), can_gc);
     }
 }
 
@@ -318,6 +327,7 @@ pub unsafe fn throw_constructor_without_new(cx: *mut JSContext, name: &str) {
 
 impl Error {
     /// Convert this error value to a JS value, consuming it in the process.
+    #[allow(clippy::wrong_self_convention)]
     pub unsafe fn to_jsval(
         self,
         cx: *mut JSContext,

@@ -10,21 +10,19 @@ use std::{mem, thread};
 
 use embedder_traits::resources::{self, Resource};
 use imsz::imsz_from_reader;
-use ipc_channel::ipc::IpcSender;
+use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
 use log::{debug, warn};
-use net_traits::image::base::{load_from_memory, Image, ImageMetadata};
 use net_traits::image_cache::{
-    CorsStatus, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponder,
-    ImageResponse, PendingImageId, PendingImageResponse, UsePlaceholder,
+    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponder, ImageResponse,
+    PendingImageId, PendingImageResponse, UsePlaceholder,
 };
 use net_traits::request::CorsSettings;
-use net_traits::{
-    FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError, WebrenderIpcSender,
-};
-use pixels::PixelFormat;
+use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
+use pixels::{load_from_memory, CorsStatus, Image, ImageMetadata, PixelFormat};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use webrender_api::units::DeviceIntSize;
-use webrender_api::{ImageData, ImageDescriptor, ImageDescriptorFlags, ImageFormat};
+use webrender_api::{ImageDescriptor, ImageDescriptorFlags, ImageFormat};
+use webrender_traits::{CrossProcessCompositorApi, SerializableImageData};
 
 use crate::resource_thread::CoreResourceThreadPool;
 
@@ -47,13 +45,13 @@ fn decode_bytes_sync(key: LoadKey, bytes: &[u8], cors: CorsStatus) -> DecoderMsg
     DecoderMsg { key, image }
 }
 
-fn get_placeholder_image(webrender_api: &WebrenderIpcSender, data: &[u8]) -> Arc<Image> {
+fn get_placeholder_image(compositor_api: &CrossProcessCompositorApi, data: &[u8]) -> Arc<Image> {
     let mut image = load_from_memory(data, CorsStatus::Unsafe).unwrap();
-    set_webrender_image_key(webrender_api, &mut image);
+    set_webrender_image_key(compositor_api, &mut image);
     Arc::new(image)
 }
 
-fn set_webrender_image_key(webrender_api: &WebrenderIpcSender, image: &mut Image) {
+fn set_webrender_image_key(compositor_api: &CrossProcessCompositorApi, image: &mut Image) {
     if image.id.is_some() {
         return;
     }
@@ -84,10 +82,11 @@ fn set_webrender_image_key(webrender_api: &WebrenderIpcSender, image: &mut Image
         offset: 0,
         flags,
     };
-    let data = ImageData::new(bytes);
-    let image_key = webrender_api.generate_image_key();
-    webrender_api.add_image(image_key, descriptor, data);
-    image.id = Some(image_key);
+    if let Some(image_key) = compositor_api.generate_image_key() {
+        let data = SerializableImageData::Raw(IpcSharedMemory::from_bytes(&bytes));
+        compositor_api.add_image(image_key, descriptor, data);
+        image.id = Some(image_key);
+    }
 }
 
 // ======================================================================
@@ -330,8 +329,8 @@ struct ImageCacheStore {
     // The URL used for the placeholder image
     placeholder_url: ServoUrl,
 
-    // Webrender API instance.
-    webrender_api: WebrenderIpcSender,
+    // Cross-process compositor API instance.
+    compositor_api: CrossProcessCompositorApi,
 }
 
 impl ImageCacheStore {
@@ -345,7 +344,7 @@ impl ImageCacheStore {
 
         match load_result {
             LoadResult::Loaded(ref mut image) => {
-                set_webrender_image_key(&self.webrender_api, image)
+                set_webrender_image_key(&self.compositor_api, image)
             },
             LoadResult::PlaceholderLoaded(..) | LoadResult::None => {},
         }
@@ -418,7 +417,7 @@ pub struct ImageCacheImpl {
 }
 
 impl ImageCache for ImageCacheImpl {
-    fn new(webrender_api: WebrenderIpcSender) -> ImageCacheImpl {
+    fn new(compositor_api: CrossProcessCompositorApi) -> ImageCacheImpl {
         debug!("New image cache");
 
         let rippy_data = resources::read_bytes(Resource::RippyPNG);
@@ -433,9 +432,9 @@ impl ImageCache for ImageCacheImpl {
             store: Arc::new(Mutex::new(ImageCacheStore {
                 pending_loads: AllPendingLoads::new(),
                 completed_loads: HashMap::new(),
-                placeholder_image: get_placeholder_image(&webrender_api, &rippy_data),
+                placeholder_image: get_placeholder_image(&compositor_api, &rippy_data),
                 placeholder_url: ServoUrl::parse("chrome://resources/rippy.png").unwrap(),
-                webrender_api,
+                compositor_api,
             })),
             thread_pool: CoreResourceThreadPool::new(thread_count),
         }
@@ -582,9 +581,9 @@ impl ImageCache for ImageCacheImpl {
     /// Inform the image cache about a response for a pending request.
     fn notify_pending_response(&self, id: PendingImageId, action: FetchResponseMsg) {
         match (action, id) {
-            (FetchResponseMsg::ProcessRequestBody, _) |
-            (FetchResponseMsg::ProcessRequestEOF, _) => (),
-            (FetchResponseMsg::ProcessResponse(response), _) => {
+            (FetchResponseMsg::ProcessRequestBody(..), _) |
+            (FetchResponseMsg::ProcessRequestEOF(..), _) => (),
+            (FetchResponseMsg::ProcessResponse(_, response), _) => {
                 debug!("Received {:?} for {:?}", response.as_ref().map(|_| ()), id);
                 let mut store = self.store.lock().unwrap();
                 let pending_load = store.pending_loads.get_by_key_mut(&id).unwrap();
@@ -609,7 +608,7 @@ impl ImageCache for ImageCacheImpl {
                 pending_load.final_url = final_url;
                 pending_load.cors_status = cors_status;
             },
-            (FetchResponseMsg::ProcessResponseChunk(data), _) => {
+            (FetchResponseMsg::ProcessResponseChunk(_, data), _) => {
                 debug!("Got some data for {:?}", id);
                 let mut store = self.store.lock().unwrap();
                 let pending_load = store.pending_loads.get_by_key_mut(&id).unwrap();
@@ -628,7 +627,7 @@ impl ImageCache for ImageCacheImpl {
                     pending_load.metadata = Some(img_metadata);
                 }
             },
-            (FetchResponseMsg::ProcessResponseEOF(result), key) => {
+            (FetchResponseMsg::ProcessResponseEOF(_, result), key) => {
                 debug!("Received EOF for {:?}", key);
                 match result {
                     Ok(_) => {

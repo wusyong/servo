@@ -6,7 +6,6 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use ipc_channel::ipc::IpcSharedMemory;
-use webgpu::identity::WebGPUOpResult;
 use webgpu::{wgt, WebGPU, WebGPUQueue, WebGPURequest, WebGPUResponse};
 
 use super::bindings::codegen::Bindings::WebGPUBinding::{GPUImageCopyTexture, GPUImageDataLayout};
@@ -21,14 +20,11 @@ use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::gpubuffer::{GPUBuffer, GPUBufferState};
+use crate::dom::gpubuffer::GPUBuffer;
 use crate::dom::gpucommandbuffer::GPUCommandBuffer;
-use crate::dom::gpuconvert::{
-    convert_ic_texture, convert_image_data_layout, convert_texture_size_to_dict,
-    convert_texture_size_to_wgt,
-};
 use crate::dom::gpudevice::GPUDevice;
 use crate::dom::promise::Promise;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct GPUQueue {
@@ -62,6 +58,10 @@ impl GPUQueue {
     pub fn set_device(&self, device: &GPUDevice) {
         *self.device.borrow_mut() = Some(Dom::from_ref(device));
     }
+
+    pub fn id(&self) -> WebGPUQueue {
+        self.queue
+    }
 }
 
 impl GPUQueueMethods for GPUQueue {
@@ -77,31 +77,14 @@ impl GPUQueueMethods for GPUQueue {
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuqueue-submit>
     fn Submit(&self, command_buffers: Vec<DomRoot<GPUCommandBuffer>>) {
-        let valid = command_buffers.iter().all(|cb| {
-            cb.buffers()
-                .iter()
-                .all(|b| matches!(b.state(), GPUBufferState::Unmapped))
-        });
-        let scope_id = self.device.borrow().as_ref().unwrap().use_current_scope();
-        if !valid {
-            self.device.borrow().as_ref().unwrap().handle_server_msg(
-                scope_id,
-                WebGPUOpResult::ValidationError(String::from(
-                    "Referenced GPUBuffer(s) are not Unmapped",
-                )),
-            );
-            return;
-        }
         let command_buffers = command_buffers.iter().map(|cb| cb.id().0).collect();
         self.channel
             .0
-            .send((
-                scope_id,
-                WebGPURequest::Submit {
-                    queue_id: self.queue.0,
-                    command_buffers,
-                },
-            ))
+            .send(WebGPURequest::Submit {
+                device_id: self.device.borrow().as_ref().unwrap().id().0,
+                queue_id: self.queue.0,
+                command_buffers,
+            })
             .unwrap();
     }
 
@@ -115,36 +98,46 @@ impl GPUQueueMethods for GPUQueue {
         data_offset: GPUSize64,
         size: Option<GPUSize64>,
     ) -> Fallible<()> {
-        let bytes = match data {
+        // Step 1
+        let sizeof_element: usize = match data {
+            BufferSource::ArrayBufferView(ref d) => d.get_array_type().byte_size().unwrap_or(1),
+            BufferSource::ArrayBuffer(_) => 1,
+        };
+        let data = match data {
             BufferSource::ArrayBufferView(d) => d.to_vec(),
             BufferSource::ArrayBuffer(d) => d.to_vec(),
         };
+        // Step 2
+        let data_size: usize = data.len() / sizeof_element;
+        debug_assert_eq!(data.len() % sizeof_element, 0);
+        // Step 3
         let content_size = if let Some(s) = size {
             s
         } else {
-            bytes.len() as GPUSize64 - data_offset
+            (data_size as GPUSize64)
+                .checked_sub(data_offset)
+                .ok_or(Error::Operation)?
         };
-        let valid = data_offset + content_size <= bytes.len() as u64 &&
-            buffer.state() == GPUBufferState::Unmapped &&
-            content_size % wgt::COPY_BUFFER_ALIGNMENT == 0 &&
-            buffer_offset % wgt::COPY_BUFFER_ALIGNMENT == 0;
 
+        // Step 4
+        let valid = data_offset + content_size <= data_size as u64 &&
+            content_size * sizeof_element as u64 % wgt::COPY_BUFFER_ALIGNMENT == 0;
         if !valid {
             return Err(Error::Operation);
         }
 
-        let final_data = IpcSharedMemory::from_bytes(
-            &bytes[data_offset as usize..(data_offset + content_size) as usize],
+        // Step 5&6
+        let contents = IpcSharedMemory::from_bytes(
+            &data[(data_offset as usize) * sizeof_element..
+                ((data_offset + content_size) as usize) * sizeof_element],
         );
-        if let Err(e) = self.channel.0.send((
-            self.device.borrow().as_ref().unwrap().use_current_scope(),
-            WebGPURequest::WriteBuffer {
-                queue_id: self.queue.0,
-                buffer_id: buffer.id().0,
-                buffer_offset,
-                data: final_data,
-            },
-        )) {
+        if let Err(e) = self.channel.0.send(WebGPURequest::WriteBuffer {
+            device_id: self.device.borrow().as_ref().unwrap().id().0,
+            queue_id: self.queue.0,
+            buffer_id: buffer.id().0,
+            buffer_offset,
+            data: contents,
+        }) {
             warn!("Failed to send WriteBuffer({:?}) ({})", buffer.id(), e);
             return Err(Error::Operation);
         }
@@ -170,21 +163,19 @@ impl GPUQueueMethods for GPUQueue {
             return Err(Error::Operation);
         }
 
-        let texture_cv = convert_ic_texture(destination);
-        let texture_layout = convert_image_data_layout(data_layout);
-        let write_size = convert_texture_size_to_wgt(&convert_texture_size_to_dict(&size));
+        let texture_cv = destination.try_into()?;
+        let texture_layout = data_layout.into();
+        let write_size = (&size).try_into()?;
         let final_data = IpcSharedMemory::from_bytes(&bytes);
 
-        if let Err(e) = self.channel.0.send((
-            self.device.borrow().as_ref().unwrap().use_current_scope(),
-            WebGPURequest::WriteTexture {
-                queue_id: self.queue.0,
-                texture_cv,
-                data_layout: texture_layout,
-                size: write_size,
-                data: final_data,
-            },
-        )) {
+        if let Err(e) = self.channel.0.send(WebGPURequest::WriteTexture {
+            device_id: self.device.borrow().as_ref().unwrap().id().0,
+            queue_id: self.queue.0,
+            texture_cv,
+            data_layout: texture_layout,
+            size: write_size,
+            data: final_data,
+        }) {
             warn!(
                 "Failed to send WriteTexture({:?}) ({})",
                 destination.texture.id().0,
@@ -197,17 +188,18 @@ impl GPUQueueMethods for GPUQueue {
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuqueue-onsubmittedworkdone>
-    fn OnSubmittedWorkDone(&self) -> Rc<Promise> {
+    fn OnSubmittedWorkDone(&self, can_gc: CanGc) -> Rc<Promise> {
         let global = self.global();
-        let promise = Promise::new(&global);
+        let promise = Promise::new(&global, can_gc);
         let sender = response_async(&promise, self);
-        if let Err(e) = self.channel.0.send((
-            self.device.borrow().as_ref().unwrap().use_current_scope(),
-            WebGPURequest::QueueOnSubmittedWorkDone {
+        if let Err(e) = self
+            .channel
+            .0
+            .send(WebGPURequest::QueueOnSubmittedWorkDone {
                 sender,
                 queue_id: self.queue.0,
-            },
-        )) {
+            })
+        {
             warn!("QueueOnSubmittedWorkDone failed with {e}")
         }
         promise
@@ -217,11 +209,12 @@ impl GPUQueueMethods for GPUQueue {
 impl AsyncWGPUListener for GPUQueue {
     fn handle_response(
         &self,
-        response: Option<Result<webgpu::WebGPUResponse, String>>,
+        response: webgpu::WebGPUResponse,
         promise: &Rc<Promise>,
+        _can_gc: CanGc,
     ) {
         match response {
-            Some(Ok(WebGPUResponse::SubmittedWorkDone)) => {
+            WebGPUResponse::SubmittedWorkDone => {
                 promise.resolve_native(&());
             },
             _ => {

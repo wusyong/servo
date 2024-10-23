@@ -8,10 +8,12 @@ use std::sync::atomic::Ordering;
 
 use atomic_refcell::{AtomicRef, AtomicRefMut};
 use html5ever::{local_name, namespace_url, ns, LocalName, Namespace};
+use js::jsapi::JSObject;
 use script_layout_interface::wrapper_traits::{
     LayoutNode, PseudoElementType, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
 use script_layout_interface::{LayoutNodeType, StyleData};
+use script_traits::UntrustedNodeAddress;
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
 use selectors::bloom::{BloomFilter, BLOOM_HASH_MASK};
 use selectors::matching::{ElementSelectorFlags, MatchingContext, VisitedHandlingMode};
@@ -34,7 +36,7 @@ use style::shared_lock::Locked as StyleLocked;
 use style::values::computed::Display;
 use style::values::{AtomIdent, AtomString};
 use style::CaseSensitivityExt;
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
 use crate::dom::attr::AttrHelpersForLayout;
 use crate::dom::bindings::inheritance::{
@@ -44,7 +46,7 @@ use crate::dom::bindings::inheritance::{
 use crate::dom::bindings::root::LayoutDom;
 use crate::dom::characterdata::LayoutCharacterDataHelpers;
 use crate::dom::element::{Element, LayoutElementHelpers};
-use crate::dom::node::{LayoutNodeHelpers, NodeFlags};
+use crate::dom::node::{LayoutNodeHelpers, Node, NodeFlags};
 use crate::layout_dom::{ServoLayoutNode, ServoShadowRoot, ServoThreadSafeLayoutNode};
 
 /// A wrapper around elements that ensures layout can only ever access safe properties.
@@ -69,6 +71,10 @@ impl<'dom> ServoLayoutElement<'dom> {
         ServoLayoutElement { element: el }
     }
 
+    pub(super) fn is_html_element(&self) -> bool {
+        self.element.is_html_element()
+    }
+
     #[inline]
     fn get_attr_enum(&self, namespace: &Namespace, name: &LocalName) -> Option<&AttrValue> {
         self.element.get_attr_for_layout(namespace, name)
@@ -83,12 +89,24 @@ impl<'dom> ServoLayoutElement<'dom> {
         self.as_node().style_data()
     }
 
+    /// Unset the snapshot flags on the underlying DOM object for this element.
+    ///
+    /// # Safety
+    ///
+    /// This function accesses and modifies the underlying DOM object and should
+    /// not be used by more than a single thread at once.
     pub unsafe fn unset_snapshot_flags(&self) {
         self.as_node()
             .node
             .set_flag(NodeFlags::HAS_SNAPSHOT | NodeFlags::HANDLED_SNAPSHOT, false);
     }
 
+    /// Unset the snapshot flags on the underlying DOM object for this element.
+    ///
+    /// # Safety
+    ///
+    /// This function accesses and modifies the underlying DOM object and should
+    /// not be used by more than a single thread at once.
     pub unsafe fn set_has_snapshot(&self) {
         self.as_node().node.set_flag(NodeFlags::HAS_SNAPSHOT, true);
     }
@@ -139,7 +157,7 @@ impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
     }
 
     fn is_html_element(&self) -> bool {
-        self.element.is_html_element()
+        ServoLayoutElement::is_html_element(self)
     }
 
     fn is_mathml_element(&self) -> bool {
@@ -425,6 +443,18 @@ impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
         F: FnMut(&AtomIdent),
     {
     }
+
+    /// Convert an opaque element back into the element.
+    fn unopaque(opaque: ::selectors::OpaqueElement) -> Self {
+        unsafe {
+            let ptr = opaque.as_const_ptr::<JSObject>();
+            let untrusted_address = UntrustedNodeAddress::from_id(ptr as usize);
+            let node = Node::from_untrusted_node_address(untrusted_address);
+            let trusted_address = node.to_trusted_node_address();
+            let servo_layout_node = ServoLayoutNode::new(&trusted_address);
+            servo_layout_node.as_element().unwrap()
+        }
+    }
 }
 
 impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
@@ -489,7 +519,7 @@ impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
         match *ns {
             NamespaceConstraint::Specific(ns) => self
                 .get_attr_enum(ns, local_name)
-                .map_or(false, |value| value.eval_selector(operation)),
+                .is_some_and(|value| value.eval_selector(operation)),
             NamespaceConstraint::Any => self
                 .element
                 .get_attr_vals_for_layout(local_name)
@@ -563,22 +593,34 @@ impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
             NonTSPseudoClass::ReadOnly => !self
                 .element
                 .get_state_for_layout()
-                .contains(pseudo_class.state_flag()),
+                .contains(NonTSPseudoClass::ReadWrite.state_flag()),
 
             NonTSPseudoClass::Active |
+            NonTSPseudoClass::Autofill |
+            NonTSPseudoClass::Checked |
+            NonTSPseudoClass::Default |
+            NonTSPseudoClass::Defined |
+            NonTSPseudoClass::Disabled |
+            NonTSPseudoClass::Enabled |
             NonTSPseudoClass::Focus |
+            NonTSPseudoClass::FocusVisible |
+            NonTSPseudoClass::FocusWithin |
             NonTSPseudoClass::Fullscreen |
             NonTSPseudoClass::Hover |
-            NonTSPseudoClass::Defined |
-            NonTSPseudoClass::Enabled |
-            NonTSPseudoClass::Disabled |
-            NonTSPseudoClass::Checked |
-            NonTSPseudoClass::Valid |
-            NonTSPseudoClass::Invalid |
+            NonTSPseudoClass::InRange |
             NonTSPseudoClass::Indeterminate |
-            NonTSPseudoClass::ReadWrite |
+            NonTSPseudoClass::Invalid |
+            NonTSPseudoClass::Modal |
+            NonTSPseudoClass::Optional |
+            NonTSPseudoClass::OutOfRange |
             NonTSPseudoClass::PlaceholderShown |
-            NonTSPseudoClass::Target => self
+            NonTSPseudoClass::PopoverOpen |
+            NonTSPseudoClass::ReadWrite |
+            NonTSPseudoClass::Required |
+            NonTSPseudoClass::Target |
+            NonTSPseudoClass::UserInvalid |
+            NonTSPseudoClass::UserValid |
+            NonTSPseudoClass::Valid => self
                 .element
                 .get_state_for_layout()
                 .contains(pseudo_class.state_flag()),
@@ -607,7 +649,7 @@ impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
         unsafe {
             (*self.element.id_attribute())
                 .as_ref()
-                .map_or(false, |atom| case_sensitivity.eq_atom(atom, id))
+                .is_some_and(|atom| case_sensitivity.eq_atom(atom, id))
         }
     }
 
@@ -821,7 +863,7 @@ impl<'dom> ::selectors::Element for ServoThreadSafeLayoutElement<'dom> {
         match *ns {
             NamespaceConstraint::Specific(ns) => self
                 .get_attr_enum(ns, local_name)
-                .map_or(false, |value| value.eval_selector(operation)),
+                .is_some_and(|value| value.eval_selector(operation)),
             NamespaceConstraint::Any => self
                 .element
                 .element

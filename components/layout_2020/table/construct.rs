@@ -9,15 +9,17 @@ use std::iter::repeat;
 use log::warn;
 use script_layout_interface::wrapper_traits::ThreadSafeLayoutNode;
 use servo_arc::Arc;
+use style::properties::style_structs::Font;
 use style::properties::ComputedValues;
 use style::selector_parser::PseudoElement;
 use style::str::char_is_whitespace;
 use style::values::specified::TextDecorationLine;
 
 use super::{
-    Table, TableSlot, TableSlotCell, TableSlotCoordinates, TableSlotOffset, TableTrack,
-    TableTrackGroup, TableTrackGroupType,
+    Table, TableCaption, TableSlot, TableSlotCell, TableSlotCoordinates, TableSlotOffset,
+    TableTrack, TableTrackGroup, TableTrackGroupType,
 };
+use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom::{BoxSlot, NodeExt};
 use crate::dom_traversal::{Contents, NodeAndStyleInfo, NonReplacedContents, TraversalHandler};
@@ -73,12 +75,14 @@ impl Table {
     pub(crate) fn construct<'dom>(
         context: &LayoutContext,
         info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
+        grid_style: Arc<ComputedValues>,
         contents: NonReplacedContents,
         propagated_text_decoration_line: TextDecorationLine,
     ) -> Self {
         let text_decoration_line =
             propagated_text_decoration_line | info.style.clone_text_decoration_line();
-        let mut traversal = TableBuilderTraversal::new(context, info, text_decoration_line);
+        let mut traversal =
+            TableBuilderTraversal::new(context, info, grid_style, text_decoration_line);
         contents.traverse(context, info, &mut traversal);
         traversal.finish()
     }
@@ -92,7 +96,7 @@ impl Table {
     where
         Node: crate::dom::NodeExt<'dom>,
     {
-        let anonymous_style = context
+        let grid_and_wrapper_style = context
             .shared_context()
             .stylist
             .style_for_anonymous::<Node::ConcreteElement>(
@@ -100,10 +104,14 @@ impl Table {
                 &PseudoElement::ServoAnonymousTable,
                 &parent_info.style,
             );
-        let anonymous_info = parent_info.new_anonymous(anonymous_style.clone());
+        let anonymous_info = parent_info.new_anonymous(grid_and_wrapper_style.clone());
 
-        let mut table_builder =
-            TableBuilderTraversal::new(context, &anonymous_info, propagated_text_decoration_line);
+        let mut table_builder = TableBuilderTraversal::new(
+            context,
+            &anonymous_info,
+            grid_and_wrapper_style.clone(),
+            propagated_text_decoration_line,
+        );
 
         for content in contents {
             match content {
@@ -128,8 +136,8 @@ impl Table {
 
         IndependentFormattingContext::NonReplaced(NonReplacedFormattingContext {
             base_fragment_info: (&anonymous_info).into(),
-            style: anonymous_style,
-            content_sizes: None,
+            style: grid_and_wrapper_style,
+            content_sizes_result: None,
             contents: NonReplacedFormattingContextContents::Table(table),
         })
     }
@@ -229,15 +237,25 @@ pub struct TableBuilder {
 }
 
 impl TableBuilder {
-    pub(super) fn new(style: Arc<ComputedValues>) -> Self {
+    pub(super) fn new(
+        style: Arc<ComputedValues>,
+        grid_style: Arc<ComputedValues>,
+        base_fragment_info: BaseFragmentInfo,
+    ) -> Self {
         Self {
-            table: Table::new(style),
+            table: Table::new(style, grid_style, base_fragment_info),
             incoming_rowspans: Vec::new(),
         }
     }
 
     pub fn new_for_tests() -> Self {
-        Self::new(ComputedValues::initial_values().to_arc())
+        let testing_style =
+            ComputedValues::initial_values_with_font_override(Font::initial_values());
+        Self::new(
+            testing_style.clone(),
+            testing_style.clone(),
+            BaseFragmentInfo::anonymous(),
+        )
     }
 
     pub fn last_row_index_in_row_group_at_row_n(&self, n: usize) -> usize {
@@ -253,8 +271,8 @@ impl TableBuilder {
     }
 
     pub fn finish(mut self) -> Table {
+        self.adjust_table_geometry_for_columns_and_colgroups();
         self.do_missing_cells_fixup();
-        self.remove_extra_columns_and_column_groups();
         self.reorder_first_thead_and_tfoot();
         self.do_final_rowspan_calculation();
         self.table
@@ -269,26 +287,16 @@ impl TableBuilder {
     }
 
     /// It's possible to define more table columns via `<colgroup>` and `<col>` elements
-    /// than actually exist in the table. In that case, remove these bogus columns
-    /// to prevent using them later in layout.
-    fn remove_extra_columns_and_column_groups(&mut self) {
-        let number_of_actual_table_columns = self.table.size.width;
-        self.table.columns.truncate(number_of_actual_table_columns);
-
-        let mut remove_from = None;
-        for (group_index, column_group) in self.table.column_groups.iter_mut().enumerate() {
-            if column_group.track_range.start >= number_of_actual_table_columns {
-                remove_from = Some(group_index);
-                break;
-            }
-            column_group.track_range.end = column_group
-                .track_range
-                .end
-                .min(number_of_actual_table_columns);
-        }
-
-        if let Some(remove_from) = remove_from {
-            self.table.column_groups.truncate(remove_from);
+    /// than actually exist in the table. In that case, increase the size of the table.
+    ///
+    /// However, if the table has no row nor row group, remove the extra columns instead.
+    /// This matches WebKit, and some tests require it, but Gecko and Blink don't do it.
+    fn adjust_table_geometry_for_columns_and_colgroups(&mut self) {
+        if self.table.rows.is_empty() && self.table.row_groups.is_empty() {
+            self.table.columns.truncate(0);
+            self.table.column_groups.truncate(0);
+        } else {
+            self.table.size.width = self.table.size.width.max(self.table.columns.len());
         }
     }
 
@@ -352,82 +360,85 @@ impl TableBuilder {
     }
 
     fn move_row_group_to_front(&mut self, index_to_move: usize) {
-        if index_to_move == 0 {
-            return;
-        }
-
-        // Move the slots associated with this group.
-        let row_range = self.table.row_groups[index_to_move].track_range.clone();
-        let removed_slots: Vec<Vec<TableSlot>> = self
-            .table
-            .slots
-            .splice(row_range.clone(), std::iter::empty())
-            .collect();
-        self.table.slots.splice(0..0, removed_slots);
-
-        // Move the rows associated with this group.
-        let removed_rows: Vec<TableTrack> = self
-            .table
-            .rows
-            .splice(row_range, std::iter::empty())
-            .collect();
-        self.table.rows.splice(0..0, removed_rows);
-
         // Move the group itself.
-        let removed_row_group = self.table.row_groups.remove(index_to_move);
-        self.table.row_groups.insert(0, removed_row_group);
+        if index_to_move > 0 {
+            let removed_row_group = self.table.row_groups.remove(index_to_move);
+            self.table.row_groups.insert(0, removed_row_group);
 
-        for row in self.table.rows.iter_mut() {
-            match row.group_index.as_mut() {
-                Some(group_index) if *group_index < index_to_move => *group_index += 1,
-                Some(group_index) if *group_index == index_to_move => *group_index = 0,
-                _ => {},
+            for row in self.table.rows.iter_mut() {
+                match row.group_index.as_mut() {
+                    Some(group_index) if *group_index < index_to_move => *group_index += 1,
+                    Some(group_index) if *group_index == index_to_move => *group_index = 0,
+                    _ => {},
+                }
             }
         }
 
-        // Do this now, rather than after possibly moving a `<tfoot>` row group to the end,
-        // because moving row groups depends on an accurate `track_range` in every group.
-        self.regenerate_track_ranges();
+        let row_range = self.table.row_groups[0].track_range.clone();
+        if row_range.start > 0 {
+            // Move the slots associated with the moved group.
+            let removed_slots: Vec<Vec<TableSlot>> = self
+                .table
+                .slots
+                .splice(row_range.clone(), std::iter::empty())
+                .collect();
+            self.table.slots.splice(0..0, removed_slots);
+
+            // Move the rows associated with the moved group.
+            let removed_rows: Vec<TableTrack> = self
+                .table
+                .rows
+                .splice(row_range, std::iter::empty())
+                .collect();
+            self.table.rows.splice(0..0, removed_rows);
+
+            // Do this now, rather than after possibly moving a `<tfoot>` row group to the end,
+            // because moving row groups depends on an accurate `track_range` in every group.
+            self.regenerate_track_ranges();
+        }
     }
 
     fn move_row_group_to_end(&mut self, index_to_move: usize) {
         let last_row_group_index = self.table.row_groups.len() - 1;
-        if index_to_move == last_row_group_index {
-            return;
-        }
-
-        // Move the slots associated with this group.
-        let row_range = self.table.row_groups[index_to_move].track_range.clone();
-        let removed_slots: Vec<Vec<TableSlot>> = self
-            .table
-            .slots
-            .splice(row_range.clone(), std::iter::empty())
-            .collect();
-        self.table.slots.extend(removed_slots);
-
-        // Move the rows associated with this group.
-        let removed_rows: Vec<TableTrack> = self
-            .table
-            .rows
-            .splice(row_range, std::iter::empty())
-            .collect();
-        self.table.rows.extend(removed_rows);
 
         // Move the group itself.
-        let removed_row_group = self.table.row_groups.remove(index_to_move);
-        self.table.row_groups.push(removed_row_group);
+        if index_to_move < last_row_group_index {
+            let removed_row_group = self.table.row_groups.remove(index_to_move);
+            self.table.row_groups.push(removed_row_group);
 
-        for row in self.table.rows.iter_mut() {
-            match row.group_index.as_mut() {
-                Some(group_index) if *group_index > index_to_move => *group_index -= 1,
-                Some(group_index) if *group_index == index_to_move => {
-                    *group_index = last_row_group_index
-                },
-                _ => {},
+            for row in self.table.rows.iter_mut() {
+                match row.group_index.as_mut() {
+                    Some(group_index) if *group_index > index_to_move => *group_index -= 1,
+                    Some(group_index) if *group_index == index_to_move => {
+                        *group_index = last_row_group_index
+                    },
+                    _ => {},
+                }
             }
         }
 
-        self.regenerate_track_ranges();
+        let row_range = self.table.row_groups[last_row_group_index]
+            .track_range
+            .clone();
+        if row_range.end < self.table.rows.len() {
+            // Move the slots associated with the moved group.
+            let removed_slots: Vec<Vec<TableSlot>> = self
+                .table
+                .slots
+                .splice(row_range.clone(), std::iter::empty())
+                .collect();
+            self.table.slots.extend(removed_slots);
+
+            // Move the rows associated with the moved group.
+            let removed_rows: Vec<TableTrack> = self
+                .table
+                .rows
+                .splice(row_range, std::iter::empty())
+                .collect();
+            self.table.rows.extend(removed_rows);
+
+            self.regenerate_track_ranges();
+        }
     }
 
     /// Turn all rowspan=0 rows into the real value to avoid having to make the calculation
@@ -622,13 +633,14 @@ where
     pub(crate) fn new(
         context: &'style LayoutContext<'style>,
         info: &'style NodeAndStyleInfo<Node>,
+        grid_style: Arc<ComputedValues>,
         text_decoration_line: TextDecorationLine,
     ) -> Self {
         TableBuilderTraversal {
             context,
             info,
             current_text_decoration_line: text_decoration_line,
-            builder: TableBuilder::new(info.style.clone()),
+            builder: TableBuilder::new(info.style.clone(), grid_style, info.into()),
             current_anonymous_row_content: Vec::new(),
             current_row_group_index: None,
         }
@@ -777,20 +789,12 @@ where
                     ::std::mem::forget(box_slot)
                 },
                 DisplayLayoutInternal::TableColumn => {
-                    let span = info
-                        .node
-                        .and_then(|node| node.to_threadsafe().get_span())
-                        .unwrap_or(1)
-                        .min(1000);
-
-                    for _ in 0..span + 1 {
-                        self.builder.table.columns.push(TableTrack {
-                            base_fragment_info: info.into(),
-                            style: info.style.clone(),
-                            group_index: None,
-                            is_anonymous: false,
-                        })
-                    }
+                    add_column(
+                        &mut self.builder.table.columns,
+                        info,
+                        None,  /* group_index */
+                        false, /* is_anonymous */
+                    );
 
                     // We are doing this until we have actually set a Box for this `BoxSlot`.
                     ::std::mem::forget(box_slot)
@@ -810,20 +814,11 @@ where
 
                     let first_column = self.builder.table.columns.len();
                     if column_group_builder.columns.is_empty() {
-                        let span = info
-                            .node
-                            .and_then(|node| node.to_threadsafe().get_span())
-                            .unwrap_or(1)
-                            .min(1000) as usize;
-
-                        self.builder.table.columns.extend(
-                            repeat(TableTrack {
-                                base_fragment_info: info.into(),
-                                style: info.style.clone(),
-                                group_index: Some(column_group_index),
-                                is_anonymous: true,
-                            })
-                            .take(span),
+                        add_column(
+                            &mut self.builder.table.columns,
+                            info,
+                            Some(column_group_index),
+                            true, /* is_anonymous */
                         );
                     } else {
                         self.builder
@@ -842,9 +837,36 @@ where
                     ::std::mem::forget(box_slot);
                 },
                 DisplayLayoutInternal::TableCaption => {
-                    // TODO: Handle table captions.
+                    let contents = match contents.try_into() {
+                        Ok(non_replaced_contents) => {
+                            NonReplacedFormattingContextContents::Flow(
+                                BlockFormattingContext::construct(
+                                    self.context,
+                                    info,
+                                    non_replaced_contents,
+                                    self.current_text_decoration_line,
+                                    false, /* is_list_item */
+                                ),
+                            )
+                        },
+                        Err(_replaced) => {
+                            unreachable!("Replaced should not have a LayoutInternal display type.");
+                        },
+                    };
+
+                    let caption = TableCaption {
+                        context: ArcRefCell::new(NonReplacedFormattingContext {
+                            style: info.style.clone(),
+                            base_fragment_info: info.into(),
+                            content_sizes_result: None,
+                            contents,
+                        }),
+                    };
+
+                    self.builder.table.captions.push(caption);
+
                     // We are doing this until we have actually set a Box for this `BoxSlot`.
-                    ::std::mem::forget(box_slot);
+                    ::std::mem::forget(box_slot)
                 },
                 DisplayLayoutInternal::TableCell => {
                     self.current_anonymous_row_content
@@ -1068,12 +1090,12 @@ where
         ) {
             return;
         }
-        self.columns.push(TableTrack {
-            base_fragment_info: info.into(),
-            style: info.style.clone(),
-            group_index: Some(self.column_group_index),
-            is_anonymous: false,
-        });
+        add_column(
+            &mut self.columns,
+            info,
+            Some(self.column_group_index),
+            false, /* is_anonymous */
+        );
     }
 }
 
@@ -1087,4 +1109,28 @@ impl From<DisplayLayoutInternal> for TableTrackGroupType {
             _ => unreachable!(),
         }
     }
+}
+
+fn add_column<'dom, Node>(
+    collection: &mut Vec<TableTrack>,
+    column_info: &NodeAndStyleInfo<Node>,
+    group_index: Option<usize>,
+    is_anonymous: bool,
+) where
+    Node: NodeExt<'dom>,
+{
+    let span = column_info
+        .node
+        .and_then(|node| node.to_threadsafe().get_span())
+        .map_or(1, |span| span.min(1000) as usize);
+
+    collection.extend(
+        repeat(TableTrack {
+            base_fragment_info: column_info.into(),
+            style: column_info.style.clone(),
+            group_index,
+            is_anonymous,
+        })
+        .take(span),
+    );
 }

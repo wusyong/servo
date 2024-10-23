@@ -5,14 +5,12 @@
 use std::sync::Arc;
 
 use app_units::Au;
-use gfx::font::FontMetrics;
-use gfx::text::glyph::GlyphStore;
-use gfx_traits::print_tree::PrintTree;
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
+use base::id::{BrowsingContextId, PipelineId};
+use base::print_tree::PrintTree;
+use fonts::{FontMetrics, GlyphStore};
 use serde::Serialize;
 use servo_arc::Arc as ServoArc;
 use style::properties::ComputedValues;
-use style::values::computed::Length;
 use style::values::specified::text::TextDecorationLine;
 use style::Zero;
 use webrender_api::{FontInstanceKey, ImageKey};
@@ -22,7 +20,7 @@ use super::{
     Tag,
 };
 use crate::cell::ArcRefCell;
-use crate::geom::{LogicalRect, LogicalSides, PhysicalRect};
+use crate::geom::{LogicalSides, PhysicalRect};
 use crate::style_ext::ComputedValuesExt;
 
 #[derive(Serialize)]
@@ -66,7 +64,7 @@ pub(crate) struct TextFragment {
     pub base: BaseFragment,
     #[serde(skip_serializing)]
     pub parent_style: ServoArc<ComputedValues>,
-    pub rect: LogicalRect<Length>,
+    pub rect: PhysicalRect<Au>,
     pub font_metrics: FontMetrics,
     #[serde(skip_serializing)]
     pub font_key: FontInstanceKey,
@@ -76,7 +74,7 @@ pub(crate) struct TextFragment {
     pub text_decoration_line: TextDecorationLine,
 
     /// Extra space to add for each justification opportunity.
-    pub justification_adjustment: Length,
+    pub justification_adjustment: Au,
 }
 
 #[derive(Serialize)]
@@ -84,7 +82,8 @@ pub(crate) struct ImageFragment {
     pub base: BaseFragment,
     #[serde(skip_serializing)]
     pub style: ServoArc<ComputedValues>,
-    pub rect: LogicalRect<Length>,
+    pub rect: PhysicalRect<Au>,
+    pub clip: PhysicalRect<Au>,
     #[serde(skip_serializing)]
     pub image_key: ImageKey,
 }
@@ -94,7 +93,7 @@ pub(crate) struct IFrameFragment {
     pub base: BaseFragment,
     pub pipeline_id: PipelineId,
     pub browsing_context_id: BrowsingContextId,
-    pub rect: LogicalRect<Length>,
+    pub rect: PhysicalRect<Au>,
     #[serde(skip_serializing)]
     pub style: ServoArc<ComputedValues>,
 }
@@ -110,6 +109,17 @@ impl Fragment {
             Fragment::IFrame(fragment) => &fragment.base,
             Fragment::Float(fragment) => &fragment.base,
         })
+    }
+    pub(crate) fn content_rect_mut(&mut self) -> Option<&mut PhysicalRect<Au>> {
+        match self {
+            Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+                Some(&mut box_fragment.content_rect)
+            },
+            Fragment::Positioning(_) | Fragment::AbsoluteOrFixedPositioned(_) => None,
+            Fragment::Text(text_fragment) => Some(&mut text_fragment.rect),
+            Fragment::Image(image_fragment) => Some(&mut image_fragment.rect),
+            Fragment::IFrame(iframe_fragment) => Some(&mut iframe_fragment.rect),
+        }
     }
 
     pub fn tag(&self) -> Option<Tag> {
@@ -134,42 +144,33 @@ impl Fragment {
         }
     }
 
-    pub fn scrolling_area(&self, containing_block: &PhysicalRect<Length>) -> PhysicalRect<Length> {
+    pub fn scrolling_area(&self, containing_block: &PhysicalRect<Au>) -> PhysicalRect<Au> {
         match self {
             Fragment::Box(fragment) | Fragment::Float(fragment) => fragment
-                .scrollable_overflow(containing_block)
+                .scrollable_overflow()
                 .translate(containing_block.origin.to_vector()),
-            _ => self.scrollable_overflow(containing_block),
+            _ => self.scrollable_overflow(),
         }
     }
 
-    pub fn scrollable_overflow(
-        &self,
-        containing_block: &PhysicalRect<Length>,
-    ) -> PhysicalRect<Length> {
+    pub fn scrollable_overflow(&self) -> PhysicalRect<Au> {
         match self {
             Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                fragment.scrollable_overflow_for_parent(containing_block)
+                fragment.scrollable_overflow_for_parent()
             },
             Fragment::AbsoluteOrFixedPositioned(_) => PhysicalRect::zero(),
             Fragment::Positioning(fragment) => fragment.scrollable_overflow,
-            Fragment::Text(fragment) => fragment
-                .rect
-                .to_physical(fragment.parent_style.writing_mode, containing_block),
-            Fragment::Image(fragment) => fragment
-                .rect
-                .to_physical(fragment.style.writing_mode, containing_block),
-            Fragment::IFrame(fragment) => fragment
-                .rect
-                .to_physical(fragment.style.writing_mode, containing_block),
+            Fragment::Text(fragment) => fragment.rect,
+            Fragment::Image(fragment) => fragment.rect,
+            Fragment::IFrame(fragment) => fragment.rect,
         }
     }
 
     pub(crate) fn find<T>(
         &self,
-        manager: &ContainingBlockManager<PhysicalRect<Length>>,
+        manager: &ContainingBlockManager<PhysicalRect<Au>>,
         level: usize,
-        process_func: &mut impl FnMut(&Fragment, usize, &PhysicalRect<Length>) -> Option<T>,
+        process_func: &mut impl FnMut(&Fragment, usize, &PhysicalRect<Au>) -> Option<T>,
     ) -> Option<T> {
         let containing_block = manager.get_containing_block_for_fragment(self);
         if let Some(result) = process_func(self, level, containing_block) {
@@ -180,11 +181,9 @@ impl Fragment {
             Fragment::Box(fragment) | Fragment::Float(fragment) => {
                 let content_rect = fragment
                     .content_rect
-                    .to_physical(fragment.style.writing_mode, containing_block)
                     .translate(containing_block.origin.to_vector());
                 let padding_rect = fragment
                     .padding_rect()
-                    .to_physical(fragment.style.writing_mode, containing_block)
                     .translate(containing_block.origin.to_vector());
                 let new_manager = if fragment
                     .style
@@ -206,10 +205,7 @@ impl Fragment {
                     .find_map(|child| child.borrow().find(&new_manager, level + 1, process_func))
             },
             Fragment::Positioning(fragment) => {
-                let content_rect = fragment
-                    .rect
-                    .to_physical(fragment.writing_mode, containing_block)
-                    .translate(containing_block.origin.to_vector());
+                let content_rect = fragment.rect.translate(containing_block.origin.to_vector());
                 let new_manager = manager.new_for_non_absolute_descendants(&content_rect);
                 fragment
                     .children

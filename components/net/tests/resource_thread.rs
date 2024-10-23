@@ -6,6 +6,7 @@ use std::net::IpAddr;
 
 use ipc_channel::ipc;
 use net::connector::CACertificates;
+use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_core_resource_thread;
 use net::test::parse_hostsfile;
 use net_traits::CoreResourceMsg;
@@ -32,9 +33,13 @@ fn test_exit() {
         None,
         CACertificates::Default,
         false, /* ignore_certificate_errors */
+        std::sync::Arc::new(ProtocolRegistry::default()),
     );
     resource_thread.send(CoreResourceMsg::Exit(sender)).unwrap();
     receiver.recv().unwrap();
+    // Workaround for https://github.com/servo/servo/issues/32912
+    #[cfg(windows)]
+    std::thread::sleep(std::time::Duration::from_millis(100));
 }
 
 #[test]

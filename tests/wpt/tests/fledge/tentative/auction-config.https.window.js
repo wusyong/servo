@@ -1,4 +1,5 @@
 // META: script=/resources/testdriver.js
+// META: script=/resources/testdriver-vendor.js
 // META: script=/common/utils.js
 // META: script=resources/fledge-util.sub.js
 // META: script=/common/subset-tests.js
@@ -12,8 +13,12 @@
 // META: variant=?31-35
 // META: variant=?36-40
 // META: variant=?40-45
-// META: variant=?45-50
-// META: variant=?50-last
+// META: variant=?46-50
+// META: variant=?51-55
+// META: variant=?56-60
+// META: variant=?61-65
+// META: variant=?66-70
+// META: variant=?71-last
 
 "use strict;"
 
@@ -167,6 +172,60 @@ makeTest({
 });
 
 makeTest({
+  name: 'sellerRealTimeReportingConfig has default local reporting type',
+  expect:  EXPECT_WINNER,
+  auctionConfigOverrides: {sellerRealTimeReportingConfig:
+                            {type: 'default-local-reporting'}}
+});
+
+makeTest({
+  name: 'sellerRealTimeReportingConfig has no type',
+  expect: EXPECT_EXCEPTION(TypeError),
+  auctionConfigOverrides: {sellerRealTimeReportingConfig:
+                            {notType: 'default-local-reporting'}}
+});
+
+makeTest({
+  name: 'sellerRealTimeReportingConfig has unknown type',
+  expect:  EXPECT_WINNER,
+  auctionConfigOverrides: {sellerRealTimeReportingConfig: {type: 'unknown type'}}
+});
+
+makeTest({
+  name: 'perBuyerRealTimeReportingConfig',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerRealTimeReportingConfig:
+                            {'https://example.com': {type: 'default-local-reporting'}}}
+});
+
+makeTest({
+  name: 'perBuyerRealTimeReportingConfig has invalid buyer',
+  expect: EXPECT_EXCEPTION(TypeError),
+  auctionConfigOverrides: {perBuyerRealTimeReportingConfig:
+                            {'http://example.com': {type: 'default-local-reporting'}}}
+});
+
+makeTest({
+  name: 'perBuyerRealTimeReportingConfig has no type',
+  expect: EXPECT_EXCEPTION(TypeError),
+  auctionConfigOverrides: {perBuyerRealTimeReportingConfig:
+                            {'https://example.com': {notType: 'default-local-reporting'}}}
+});
+
+makeTest({
+  name: 'perBuyerRealTimeReportingConfig has unknown type',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerRealTimeReportingConfig:
+                            {'https://example.com': {type: 'unknown type'}}}
+});
+
+makeTest({
+  name: 'perBuyerRealTimeReportingConfig has no entry',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerRealTimeReportingConfig: {}}
+});
+
+makeTest({
   name: 'no buyers => no winners',
   expect: EXPECT_NO_WINNER,
   auctionConfigOverrides: {interestGroupBuyers: []},
@@ -240,9 +299,12 @@ makeTest({
   }
 });
 
+// Cross-origin trustedScoringSignalsURL is fine, but it needs extra
+// headers to actually make it work. The auction here doesn't actually
+// care if the signals don't load.
 makeTest({
   name: 'trustedScoringSignalsURL is cross-origin with seller',
-  expect: EXPECT_EXCEPTION(TypeError),
+  expect: EXPECT_WINNER,
   auctionConfigOverrides: { trustedScoringSignalsURL: "https://example.com" },
 });
 
@@ -578,3 +640,65 @@ subsetTest(promise_test, async test => {
     uuid,
     [bidderReportURL2, sellerReportURL2, bidderReportURL1, sellerReportURL1]);
 }, `forDebuggingOnly lockout and cooldowns updating in one auction, read in another's.`);
+
+makeTest({
+  name: 'deprecatedRenderURLReplacements nullability',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {deprecatedRenderURLReplacements: null}
+});
+
+makeTest({
+  name: 'deprecatedRenderURLReplacements nullability 2',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides:
+      {deprecatedRenderURLReplacements: Promise.resolve(undefined)}
+});
+
+makeTest({
+  name: 'perBuyerSignals nullability',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerSignals: null},
+});
+
+makeTest({
+  name: 'perBuyerSignals nullability 2',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerSignals: Promise.resolve(undefined)},
+});
+
+makeTest({
+  name: 'perBuyerTimeouts nullability',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerTimeouts: null},
+});
+
+makeTest({
+  name: 'perBuyerTimeouts nullability 2',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerTimeouts: Promise.resolve(undefined)},
+});
+
+makeTest({
+  name: 'perBuyerCumulativeTimeouts nullability',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerCumulativeTimeouts: null},
+});
+
+makeTest({
+  name: 'perBuyerCumulativeTimeouts nullability 2',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides:
+      {perBuyerCumulativeTimeouts: Promise.resolve(undefined)},
+});
+
+makeTest({
+  name: 'perBuyerCurrencies nullability',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerCurrencies: null},
+});
+
+makeTest({
+  name: 'perBuyerCurrencies nullability 2',
+  expect: EXPECT_WINNER,
+  auctionConfigOverrides: {perBuyerCurrencies: Promise.resolve(undefined)},
+});

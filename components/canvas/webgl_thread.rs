@@ -24,7 +24,7 @@ use euclid::default::Size2D;
 use fnv::FnvHashMap;
 use half::f16;
 use log::{debug, error, trace, warn};
-use pixels::{self, PixelFormat};
+use pixels::{self, unmultiply_inplace, PixelFormat};
 use sparkle::gl;
 use sparkle::gl::{GLint, GLuint, Gl};
 use surfman::chains::{PreserveBuffer, SwapChains, SwapChainsAPI};
@@ -51,14 +51,10 @@ use webxr_api::{
 
 use crate::webgl_limits::GLLimitsDetect;
 
-#[cfg(feature = "xr-profile")]
-fn to_ms(ns: u64) -> f64 {
-    ns as f64 / 1_000_000.
-}
-
 struct GLContextData {
     ctx: Context,
     gl: Rc<Gl>,
+    glow: glow::Context,
     state: GLState,
     attributes: GLContextAttributes,
 }
@@ -215,7 +211,7 @@ pub(crate) struct WebGLThread {
     /// The swap chains used by webrender
     webrender_swap_chains: SwapChains<WebGLContextId, Device>,
     /// Whether this context is a GL or GLES context.
-    api_type: gl::GlType,
+    api_type: GlType,
     /// The bridge to WebXR
     pub webxr_bridge: WebXRBridge,
 }
@@ -230,7 +226,7 @@ pub(crate) struct WebGLThreadInit {
     pub webrender_swap_chains: SwapChains<WebGLContextId, Device>,
     pub connection: Connection,
     pub adapter: Adapter,
-    pub api_type: gl::GlType,
+    pub api_type: GlType,
     pub webxr_init: WebXRBridgeInit,
 }
 
@@ -373,7 +369,10 @@ impl WebGLThread {
             WebGLMsg::SwapBuffers(swap_ids, sender, sent_time) => {
                 self.handle_swap_buffers(swap_ids, sender, sent_time);
             },
-            WebGLMsg::Exit => {
+            WebGLMsg::Exit(sender) => {
+                if let Err(e) = sender.send(()) {
+                    warn!("Failed to send response to WebGLMsg::Exit ({e})");
+                }
                 return true;
             },
         }
@@ -554,12 +553,23 @@ impl WebGLThread {
         );
 
         let gl = match self.api_type {
-            gl::GlType::Gl => Gl::gl_fns(gl::ffi_gl::Gl::load_with(|symbol_name| {
+            GlType::Gl => Gl::gl_fns(gl::ffi_gl::Gl::load_with(|symbol_name| {
                 self.device.get_proc_address(&ctx, symbol_name)
             })),
-            gl::GlType::Gles => Gl::gles_fns(gl::ffi_gles::Gles2::load_with(|symbol_name| {
+            GlType::Gles => Gl::gles_fns(gl::ffi_gles::Gles2::load_with(|symbol_name| {
                 self.device.get_proc_address(&ctx, symbol_name)
             })),
+        };
+
+        let glow = unsafe {
+            match self.api_type {
+                GlType::Gl => glow::Context::from_loader_function(|symbol_name| {
+                    self.device.get_proc_address(&ctx, symbol_name)
+                }),
+                GlType::Gles => glow::Context::from_loader_function(|symbol_name| {
+                    self.device.get_proc_address(&ctx, symbol_name)
+                }),
+            }
         };
 
         let limits = GLLimits::detect(&gl, webgl_version);
@@ -624,6 +634,7 @@ impl WebGLThread {
             GLContextData {
                 ctx,
                 gl,
+                glow,
                 state,
                 attributes,
             },
@@ -676,7 +687,7 @@ impl WebGLThread {
                 .resize(&mut self.device, &mut data.ctx, size.to_i32())
                 .map_err(|err| format!("Failed to resize swap chain: {:?}", err))?;
             swap_chain
-                .clear_surface(&mut self.device, &mut data.ctx, &data.gl, clear_color)
+                .clear_surface(&mut self.device, &mut data.ctx, &data.glow, clear_color)
                 .map_err(|err| format!("Failed to clear resized swap chain: {:?}", err))?;
         } else {
             error!("Failed to find swap chain");
@@ -779,7 +790,7 @@ impl WebGLThread {
                     &mut self.device,
                     &mut data.ctx,
                     if data.attributes.preserve_drawing_buffer {
-                        PreserveBuffer::Yes(&data.gl)
+                        PreserveBuffer::Yes(&data.glow)
                     } else {
                         PreserveBuffer::No
                     },
@@ -795,7 +806,7 @@ impl WebGLThread {
                     .contains(ContextAttributeFlags::ALPHA);
                 let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
                 swap_chain
-                    .clear_surface(&mut self.device, &mut data.ctx, &data.gl, clear_color)
+                    .clear_surface(&mut self.device, &mut data.ctx, &data.glow, clear_color)
                     .unwrap();
                 debug_assert_eq!(data.gl.get_error(), gl::NO_ERROR);
             }
@@ -829,14 +840,6 @@ impl WebGLThread {
 
         #[allow(unused)]
         let mut end_swap = 0;
-        #[cfg(feature = "xr-profile")]
-        {
-            end_swap = time::precise_time_ns();
-            println!(
-                "WEBXR PROFILING [swap buffer]:\t{}ms",
-                to_ms(end_swap - start_swap)
-            );
-        }
         completed_sender.send(end_swap).unwrap();
     }
 
@@ -1054,7 +1057,7 @@ impl WebGLImpl {
                 gl.clear_color(r, g, b, a);
             },
             WebGLCommand::ClearDepth(depth) => {
-                let value = depth.max(0.).min(1.) as f64;
+                let value = depth.clamp(0., 1.) as f64;
                 state.depth_clear_value = value;
                 gl.clear_depth(value)
             },
@@ -1093,7 +1096,7 @@ impl WebGLImpl {
                 state.restore_depth_invariant(gl);
             },
             WebGLCommand::DepthRange(near, far) => {
-                gl.depth_range(near.max(0.).min(1.) as f64, far.max(0.).min(1.) as f64)
+                gl.depth_range(near.clamp(0., 1.) as f64, far.clamp(0., 1.) as f64)
             },
             WebGLCommand::Disable(cap) => match cap {
                 gl::SCISSOR_TEST => {
@@ -2848,15 +2851,6 @@ fn premultiply_inplace(format: TexFormat, data_type: TexDataType, pixels: &mut [
     }
 }
 
-fn unmultiply_inplace(pixels: &mut [u8]) {
-    for rgba in pixels.chunks_mut(4) {
-        let a = (rgba[3] as f32) / 255.0;
-        rgba[0] = (rgba[0] as f32 / a) as u8;
-        rgba[1] = (rgba[1] as f32 / a) as u8;
-        rgba[2] = (rgba[2] as f32 / a) as u8;
-    }
-}
-
 /// Flips the pixels in the Vec on the Y axis.
 fn flip_pixels_y(
     internal_format: TexFormat,
@@ -2886,8 +2880,8 @@ fn flip_pixels_y(
 
 // Clamp a size to the current GL context's max viewport
 fn clamp_viewport(gl: &Gl, size: Size2D<u32>) -> Size2D<u32> {
-    let mut max_viewport = [i32::max_value(), i32::max_value()];
-    let mut max_renderbuffer = [i32::max_value()];
+    let mut max_viewport = [i32::MAX, i32::MAX];
+    let mut max_renderbuffer = [i32::MAX];
     #[allow(unsafe_code)]
     unsafe {
         gl.get_integer_v(gl::MAX_VIEWPORT_DIMS, &mut max_viewport);
@@ -2907,12 +2901,12 @@ fn clamp_viewport(gl: &Gl, size: Size2D<u32>) -> Size2D<u32> {
 }
 
 trait ToSurfmanVersion {
-    fn to_surfman_version(self, api_type: gl::GlType) -> GLVersion;
+    fn to_surfman_version(self, api_type: GlType) -> GLVersion;
 }
 
 impl ToSurfmanVersion for WebGLVersion {
-    fn to_surfman_version(self, api_type: gl::GlType) -> GLVersion {
-        if api_type == gl::GlType::Gles {
+    fn to_surfman_version(self, api_type: GlType) -> GLVersion {
+        if api_type == GlType::Gles {
             return GLVersion::new(3, 0);
         }
         match self {
@@ -2929,7 +2923,7 @@ trait SurfmanContextAttributeFlagsConvert {
     fn to_surfman_context_attribute_flags(
         &self,
         webgl_version: WebGLVersion,
-        api_type: gl::GlType,
+        api_type: GlType,
     ) -> ContextAttributeFlags;
 }
 
@@ -2937,13 +2931,13 @@ impl SurfmanContextAttributeFlagsConvert for GLContextAttributes {
     fn to_surfman_context_attribute_flags(
         &self,
         webgl_version: WebGLVersion,
-        api_type: gl::GlType,
+        api_type: GlType,
     ) -> ContextAttributeFlags {
         let mut flags = ContextAttributeFlags::empty();
         flags.set(ContextAttributeFlags::ALPHA, self.alpha);
         flags.set(ContextAttributeFlags::DEPTH, self.depth);
         flags.set(ContextAttributeFlags::STENCIL, self.stencil);
-        if (webgl_version == WebGLVersion::WebGL1) && (api_type == gl::GlType::Gl) {
+        if (webgl_version == WebGLVersion::WebGL1) && (api_type == GlType::Gl) {
             flags.set(ContextAttributeFlags::COMPATIBILITY_PROFILE, true);
         }
         flags
@@ -3322,13 +3316,13 @@ impl<'a> WebXRContexts<WebXRSurfman> for WebXRBridgeContexts<'a> {
         )?;
         Some(&mut data.ctx)
     }
-    fn bindings(&mut self, device: &Device, context_id: WebXRContextId) -> Option<&Gl> {
+    fn bindings(&mut self, device: &Device, context_id: WebXRContextId) -> Option<&glow::Context> {
         let data = WebGLThread::make_current_if_needed(
             device,
             WebGLContextId::from(context_id),
             self.contexts,
             self.bound_context_id,
         )?;
-        Some(&data.gl)
+        Some(&data.glow)
     }
 }

@@ -7,8 +7,14 @@ use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::Deref;
 
+/// Receiver type used in WebGLCommands.
+pub use base::generic_channel::GenericReceiver as WebGLReceiver;
+/// Sender type used in WebGLCommands.
+pub use base::generic_channel::GenericSender as WebGLSender;
+/// Result type for send()/recv() calls in in WebGLCommands.
+pub use base::generic_channel::SendResult as WebGLSendResult;
 use euclid::default::{Rect, Size2D};
-use ipc_channel::ipc::{IpcBytesReceiver, IpcBytesSender, IpcSharedMemory};
+use ipc_channel::ipc::{IpcBytesReceiver, IpcBytesSender, IpcSender, IpcSharedMemory};
 use malloc_size_of_derive::MallocSizeOf;
 use pixels::PixelFormat;
 use serde::{Deserialize, Serialize};
@@ -20,17 +26,33 @@ use webxr_api::{
 };
 
 /// Helper function that creates a WebGL channel (WebGLSender, WebGLReceiver) to be used in WebGLCommands.
-pub use crate::webgl_channel::webgl_channel;
+pub fn webgl_channel<T>() -> Option<(WebGLSender<T>, WebGLReceiver<T>)>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    base::generic_channel::channel(servo_config::opts::multiprocess())
+}
+
 /// Entry point channel type used for sending WebGLMsg messages to the WebGL renderer.
-pub use crate::webgl_channel::WebGLChan;
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WebGLChan(pub WebGLSender<WebGLMsg>);
+
+impl WebGLChan {
+    #[inline]
+    pub fn send(&self, msg: WebGLMsg) -> WebGLSendResult {
+        self.0.send(msg)
+    }
+}
+
 /// Entry point type used in a Script Pipeline to get the WebGLChan to be used in that thread.
-pub use crate::webgl_channel::WebGLPipeline;
-/// Receiver type used in WebGLCommands.
-pub use crate::webgl_channel::WebGLReceiver;
-/// Result type for send()/recv() calls in in WebGLCommands.
-pub use crate::webgl_channel::WebGLSendResult;
-/// Sender type used in WebGLCommands.
-pub use crate::webgl_channel::WebGLSender;
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WebGLPipeline(pub WebGLChan);
+
+impl WebGLPipeline {
+    pub fn channel(&self) -> WebGLChan {
+        self.0.clone()
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WebGLCommandBacktrace {
@@ -51,9 +73,9 @@ impl WebGLThreads {
     }
 
     /// Sends a exit message to close the WebGLThreads and release all WebGLContexts.
-    pub fn exit(&self) -> Result<(), &'static str> {
+    pub fn exit(&self, sender: IpcSender<()>) -> Result<(), &'static str> {
         self.0
-            .send(WebGLMsg::Exit)
+            .send(WebGLMsg::Exit(sender))
             .map_err(|_| "Failed to send Exit message")
     }
 }
@@ -84,7 +106,7 @@ pub enum WebGLMsg {
     /// request is fulfilled
     SwapBuffers(Vec<WebGLContextId>, WebGLSender<u64>, u64),
     /// Frees all resources and closes the thread.
-    Exit,
+    Exit(IpcSender<()>),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]

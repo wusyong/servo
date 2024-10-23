@@ -3,31 +3,27 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::{self, BufReader, Seek, SeekFrom};
-use std::ops::Bound;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::{mem, str};
+use std::{io, mem, str};
 
 use base64::engine::general_purpose;
 use base64::Engine as _;
 use content_security_policy as csp;
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
-use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt, Range};
+use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt};
 use http::header::{self, HeaderMap, HeaderName};
 use http::{Method, StatusCode};
 use ipc_channel::ipc::{self, IpcReceiver};
-use lazy_static::lazy_static;
-use log::{debug, warn};
+use log::warn;
 use mime::{self, Mime};
-use net_traits::blob_url_store::{parse_blob_url, BlobURLStoreError};
 use net_traits::filemanager_thread::{FileTokenCheck, RelativePos};
+use net_traits::http_status::HttpStatus;
 use net_traits::request::{
     is_cors_safelisted_method, is_cors_safelisted_request_header, BodyChunkRequest,
-    BodyChunkResponse, CredentialsMode, Destination, Origin, Referrer, Request, RequestMode,
-    ResponseTainting, Window,
+    BodyChunkResponse, CredentialsMode, Destination, Origin, RedirectMode, Referrer, Request,
+    RequestMode, ResponseTainting, Window,
 };
 use net_traits::response::{Response, ResponseBody, ResponseType};
 use net_traits::{
@@ -38,24 +34,17 @@ use rustls::Certificate;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_url::ServoUrl;
-use tokio::sync::mpsc::{
-    unbounded_channel, UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender,
-};
+use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
 
-use crate::data_loader::decode;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::headers::determine_nosniff;
-use crate::filemanager_thread::{FileManager, FILE_CHUNK_SIZE};
+use crate::filemanager_thread::FileManager;
 use crate::http_loader::{
     determine_requests_referrer, http_fetch, set_default_accept, set_default_accept_language,
     HttpState,
 };
+use crate::protocols::ProtocolRegistry;
 use crate::subresource_integrity::is_response_integrity_valid;
-
-lazy_static! {
-    static ref X_CONTENT_TYPE_OPTIONS: HeaderName =
-        HeaderName::from_static("x-content-type-options");
-}
 
 pub type Target<'a> = &'a mut (dyn FetchTaskTarget + Send);
 
@@ -74,6 +63,7 @@ pub struct FetchContext {
     pub file_token: FileTokenCheck,
     pub cancellation_listener: Arc<Mutex<CancellationListener>>,
     pub timing: ServoArc<Mutex<ResourceFetchTiming>>,
+    pub protocols: Arc<ProtocolRegistry>,
 }
 
 pub struct CancellationListener {
@@ -144,7 +134,7 @@ pub async fn fetch_with_cors_cache(
     }
 
     // Step 3.
-    set_default_accept(request.destination, &mut request.headers);
+    set_default_accept(request);
 
     // Step 4.
     set_default_accept_language(&mut request.headers);
@@ -285,10 +275,12 @@ pub async fn main_fetch(
 
     // Step 12.
 
+    let current_url = request.current_url();
+    let current_scheme = current_url.scheme();
+
     let mut response = match response {
         Some(res) => res,
         None => {
-            let current_url = request.current_url();
             let same_origin = if let Origin::Origin(ref origin) = request.origin {
                 *origin == current_url.origin()
             } else {
@@ -296,8 +288,12 @@ pub async fn main_fetch(
             };
 
             if (same_origin && !cors_flag) ||
-                current_url.scheme() == "data" ||
-                current_url.scheme() == "chrome"
+                current_scheme == "chrome" ||
+                context.protocols.is_fetchable(current_scheme) ||
+                matches!(
+                    request.mode,
+                    RequestMode::Navigate | RequestMode::WebSocket { .. }
+                )
             {
                 // Substep 1.
                 request.response_tainting = ResponseTainting::Basic;
@@ -307,12 +303,19 @@ pub async fn main_fetch(
             } else if request.mode == RequestMode::SameOrigin {
                 Response::network_error(NetworkError::Internal("Cross-origin response".into()))
             } else if request.mode == RequestMode::NoCors {
-                // Substep 1.
-                request.response_tainting = ResponseTainting::Opaque;
+                // Substep 1. If request’s redirect mode is not "follow", then return a network error.
+                if request.redirect_mode != RedirectMode::Follow {
+                    Response::network_error(NetworkError::Internal(
+                        "NoCors requests must follow redirects".into(),
+                    ))
+                } else {
+                    // Substep 2. Set request’s response tainting to "opaque".
+                    request.response_tainting = ResponseTainting::Opaque;
 
-                // Substep 2.
-                scheme_fetch(request, cache, target, done_chan, context).await
-            } else if !matches!(current_url.scheme(), "http" | "https") {
+                    // Substep 3. Return the result of running scheme fetch given fetchParams.
+                    scheme_fetch(request, cache, target, done_chan, context).await
+                }
+            } else if !matches!(current_scheme, "http" | "https") {
                 Response::network_error(NetworkError::Internal("Non-http scheme".into()))
             } else if request.use_cors_preflight ||
                 (request.unsafe_request &&
@@ -413,7 +416,7 @@ pub async fn main_fetch(
 
         // Step 16.
         if internal_response.url_list.is_empty() {
-            internal_response.url_list = request.url_list.clone();
+            internal_response.url_list.clone_from(&request.url_list)
         }
 
         // Step 17.
@@ -462,7 +465,7 @@ pub async fn main_fetch(
     let mut response_loaded = false;
     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
         // Step 19.1.
-        wait_for_response(&mut response, target, done_chan).await;
+        wait_for_response(request, &mut response, target, done_chan).await;
         response_loaded = true;
 
         // Step 19.2.
@@ -484,17 +487,17 @@ pub async fn main_fetch(
     if request.synchronous {
         // process_response is not supposed to be used
         // by sync fetch, but we overload it here for simplicity
-        target.process_response(&response);
+        target.process_response(request, &response);
         if !response_loaded {
-            wait_for_response(&mut response, target, done_chan).await;
+            wait_for_response(request, &mut response, target, done_chan).await;
         }
         // overloaded similarly to process_response
-        target.process_response_eof(&response);
+        target.process_response_eof(request, &response);
         return response;
     }
 
     // Step 21.
-    if request.body.is_some() && matches!(request.current_url().scheme(), "http" | "https") {
+    if request.body.is_some() && matches!(current_scheme, "http" | "https") {
         // XXXManishearth: We actually should be calling process_request
         // in http_network_fetch. However, we can't yet follow the request
         // upload progress, so I'm keeping it here for now and pretending
@@ -504,15 +507,15 @@ pub async fn main_fetch(
     }
 
     // Step 22.
-    target.process_response(&response);
+    target.process_response(request, &response);
 
     // Step 23.
     if !response_loaded {
-        wait_for_response(&mut response, target, done_chan).await;
+        wait_for_response(request, &mut response, target, done_chan).await;
     }
 
     // Step 24.
-    target.process_response_eof(&response);
+    target.process_response_eof(request, &response);
 
     if let Ok(http_cache) = context.state.http_cache.write() {
         http_cache.update_awaiting_consumers(request, &response);
@@ -524,6 +527,7 @@ pub async fn main_fetch(
 }
 
 async fn wait_for_response(
+    request: &Request,
     response: &mut Response,
     target: Target<'_>,
     done_chan: &mut DoneChannel,
@@ -532,7 +536,7 @@ async fn wait_for_response(
         loop {
             match ch.1.recv().await {
                 Some(Data::Payload(vec)) => {
-                    target.process_response_chunk(vec);
+                    target.process_response_chunk(request, vec);
                 },
                 Some(Data::Done) => {
                     break;
@@ -552,7 +556,7 @@ async fn wait_for_response(
             // in case there was no channel to wait for, the body was
             // obtained synchronously via scheme_fetch for data/file/about/etc
             // We should still send the body across as a chunk
-            target.process_response_chunk(vec.clone());
+            target.process_response_chunk(request, vec.clone());
         } else {
             assert_eq!(*body, ResponseBody::Empty)
         }
@@ -591,50 +595,13 @@ impl RangeRequestBounds {
     }
 }
 
-/// Get the range bounds if the `Range` header is present.
-fn get_range_request_bounds(range: Option<Range>) -> RangeRequestBounds {
-    if let Some(ref range) = range {
-        let (start, end) = match range
-            .iter()
-            .collect::<Vec<(Bound<u64>, Bound<u64>)>>()
-            .first()
-        {
-            Some(&(Bound::Included(start), Bound::Unbounded)) => (start, None),
-            Some(&(Bound::Included(start), Bound::Included(end))) => {
-                // `end` should be less or equal to `start`.
-                (start, Some(i64::max(start as i64, end as i64)))
-            },
-            Some(&(Bound::Unbounded, Bound::Included(offset))) => {
-                return RangeRequestBounds::Pending(offset);
-            },
-            _ => (0, None),
-        };
-        RangeRequestBounds::Final(RelativePos::from_opts(Some(start as i64), end))
-    } else {
-        RangeRequestBounds::Final(RelativePos::from_opts(Some(0), None))
-    }
-}
-
-fn partial_content(response: &mut Response) {
-    let reason = "Partial Content".to_owned();
-    response.status = Some((StatusCode::PARTIAL_CONTENT, reason.clone()));
-    response.raw_status = Some((StatusCode::PARTIAL_CONTENT.as_u16(), reason.into()));
-}
-
-fn range_not_satisfiable_error(response: &mut Response) {
-    let reason = "Range Not Satisfiable".to_owned();
-    response.status = Some((StatusCode::RANGE_NOT_SATISFIABLE, reason.clone()));
-    response.raw_status = Some((StatusCode::RANGE_NOT_SATISFIABLE.as_u16(), reason.into()));
-}
-
 fn create_blank_reply(url: ServoUrl, timing_type: ResourceTimingType) -> Response {
     let mut response = Response::new(url, ResourceFetchTiming::new(timing_type));
     response
         .headers
         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
     *response.body.lock().unwrap() = ResponseBody::Done(vec![]);
-    response.status = Some((StatusCode::OK, "OK".to_string()));
-    response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
+    response.status = HttpStatus::default();
     response
 }
 
@@ -690,7 +657,8 @@ async fn scheme_fetch(
 ) -> Response {
     let url = request.current_url();
 
-    match url.scheme() {
+    let scheme = url.scheme();
+    match scheme {
         "about" if url.path() == "blank" => create_blank_reply(url, request.timing_type()),
 
         "chrome" if url.path() == "allowcert" => {
@@ -707,172 +675,20 @@ async fn scheme_fetch(
             .await
         },
 
-        "data" => match decode(&url) {
-            Ok((mime, bytes)) => {
-                let mut response =
-                    Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-                *response.body.lock().unwrap() = ResponseBody::Done(bytes);
-                response.headers.typed_insert(ContentType::from(mime));
-                response.status = Some((StatusCode::OK, "OK".to_string()));
-                response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
-                response
-            },
-            Err(_) => {
-                Response::network_error(NetworkError::Internal("Decoding data URL failed".into()))
-            },
+        _ => match context.protocols.get(scheme) {
+            Some(handler) => handler.load(request, done_chan, context).await,
+            None => Response::network_error(NetworkError::Internal("Unexpected scheme".into())),
         },
-
-        "file" => {
-            if request.method != Method::GET {
-                return Response::network_error(NetworkError::Internal(
-                    "Unexpected method for file".into(),
-                ));
-            }
-            if let Ok(file_path) = url.to_file_path() {
-                if let Ok(file) = File::open(file_path.clone()) {
-                    if let Ok(metadata) = file.metadata() {
-                        if metadata.is_dir() {
-                            return Response::network_error(NetworkError::Internal(
-                                "Opening a directory is not supported".into(),
-                            ));
-                        }
-                    }
-
-                    // Get range bounds (if any) and try to seek to the requested offset.
-                    // If seeking fails, bail out with a NetworkError.
-                    let file_size = match file.metadata() {
-                        Ok(metadata) => Some(metadata.len()),
-                        Err(_) => None,
-                    };
-
-                    let mut response =
-                        Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-
-                    let range_header = request.headers.typed_get::<Range>();
-                    let is_range_request = range_header.is_some();
-                    let Ok(range) = get_range_request_bounds(range_header).get_final(file_size)
-                    else {
-                        range_not_satisfiable_error(&mut response);
-                        return response;
-                    };
-                    let mut reader = BufReader::with_capacity(FILE_CHUNK_SIZE, file);
-                    if reader.seek(SeekFrom::Start(range.start as u64)).is_err() {
-                        return Response::network_error(NetworkError::Internal(
-                            "Unexpected method for file".into(),
-                        ));
-                    }
-
-                    // Set response status to 206 if Range header is present.
-                    // At this point we should have already validated the header.
-                    if is_range_request {
-                        partial_content(&mut response);
-                    }
-
-                    // Set Content-Type header.
-                    let mime = mime_guess::from_path(file_path).first_or_octet_stream();
-                    response.headers.typed_insert(ContentType::from(mime));
-
-                    // Setup channel to receive cross-thread messages about the file fetch
-                    // operation.
-                    let (mut done_sender, done_receiver) = unbounded_channel();
-                    *done_chan = Some((done_sender.clone(), done_receiver));
-
-                    *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
-
-                    context.filemanager.lock().unwrap().fetch_file_in_chunks(
-                        &mut done_sender,
-                        reader,
-                        response.body.clone(),
-                        context.cancellation_listener.clone(),
-                        range,
-                    );
-
-                    response
-                } else {
-                    Response::network_error(NetworkError::Internal("Opening file failed".into()))
-                }
-            } else {
-                Response::network_error(NetworkError::Internal(
-                    "Constructing file path failed".into(),
-                ))
-            }
-        },
-
-        "blob" => {
-            debug!("Loading blob {}", url.as_str());
-            // Step 2.
-            if request.method != Method::GET {
-                return Response::network_error(NetworkError::Internal(
-                    "Unexpected method for blob".into(),
-                ));
-            }
-
-            let range_header = request.headers.typed_get::<Range>();
-            let is_range_request = range_header.is_some();
-            // We will get a final version of this range once we have
-            // the length of the data backing the blob.
-            let range = get_range_request_bounds(range_header);
-
-            let (id, origin) = match parse_blob_url(&url) {
-                Ok((id, origin)) => (id, origin),
-                Err(error) => {
-                    return Response::network_error(NetworkError::Internal(format!(
-                        "Invalid blob URL ({error})"
-                    )));
-                },
-            };
-
-            let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-            response.status = Some((StatusCode::OK, "OK".to_string()));
-            response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
-
-            if is_range_request {
-                partial_content(&mut response);
-            }
-
-            let (mut done_sender, done_receiver) = unbounded_channel();
-            *done_chan = Some((done_sender.clone(), done_receiver));
-            *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
-
-            if let Err(err) = context.filemanager.lock().unwrap().fetch_file(
-                &mut done_sender,
-                context.cancellation_listener.clone(),
-                id,
-                &context.file_token,
-                origin,
-                &mut response,
-                range,
-            ) {
-                let _ = done_sender.send(Data::Done);
-                let err = match err {
-                    BlobURLStoreError::InvalidRange => {
-                        range_not_satisfiable_error(&mut response);
-                        return response;
-                    },
-                    _ => format!("{:?}", err),
-                };
-                return Response::network_error(NetworkError::Internal(err));
-            };
-
-            response
-        },
-
-        "ftp" => {
-            debug!("ftp is not implemented");
-            Response::network_error(NetworkError::Internal("Unexpected scheme".into()))
-        },
-
-        _ => Response::network_error(NetworkError::Internal("Unexpected scheme".into())),
     }
 }
 
-fn is_null_body_status(status: &Option<(StatusCode, String)>) -> bool {
+fn is_null_body_status(status: &HttpStatus) -> bool {
     matches!(
-        status,
-        Some((StatusCode::SWITCHING_PROTOCOLS, ..)) |
-            Some((StatusCode::NO_CONTENT, ..)) |
-            Some((StatusCode::RESET_CONTENT, ..)) |
-            Some((StatusCode::NOT_MODIFIED, ..))
+        status.try_code(),
+        Some(StatusCode::SWITCHING_PROTOCOLS) |
+            Some(StatusCode::NO_CONTENT) |
+            Some(StatusCode::RESET_CONTENT) |
+            Some(StatusCode::NOT_MODIFIED)
     )
 }
 

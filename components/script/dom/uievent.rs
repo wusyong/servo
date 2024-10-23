@@ -19,6 +19,7 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // https://w3c.github.io/uievents/#interface-uievent
 #[dom_struct]
@@ -37,15 +38,16 @@ impl UIEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<UIEvent> {
-        Self::new_uninitialized_with_proto(window, None)
+    pub fn new_uninitialized(window: &Window, can_gc: CanGc) -> DomRoot<UIEvent> {
+        Self::new_uninitialized_with_proto(window, None, can_gc)
     }
 
     fn new_uninitialized_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<UIEvent> {
-        reflect_dom_object_with_proto(Box::new(UIEvent::new_inherited()), window, proto)
+        reflect_dom_object_with_proto(Box::new(UIEvent::new_inherited()), window, proto, can_gc)
     }
 
     pub fn new(
@@ -55,10 +57,14 @@ impl UIEvent {
         cancelable: EventCancelable,
         view: Option<&Window>,
         detail: i32,
+        can_gc: CanGc,
     ) -> DomRoot<UIEvent> {
-        Self::new_with_proto(window, None, type_, can_bubble, cancelable, view, detail)
+        Self::new_with_proto(
+            window, None, type_, can_bubble, cancelable, view, detail, can_gc,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
@@ -67,8 +73,9 @@ impl UIEvent {
         cancelable: EventCancelable,
         view: Option<&Window>,
         detail: i32,
+        can_gc: CanGc,
     ) -> DomRoot<UIEvent> {
-        let ev = UIEvent::new_uninitialized_with_proto(window, proto);
+        let ev = UIEvent::new_uninitialized_with_proto(window, proto, can_gc);
         ev.InitUIEvent(
             type_,
             bool::from(can_bubble),
@@ -78,11 +85,14 @@ impl UIEvent {
         );
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl UIEventMethods for UIEvent {
+    /// <https://w3c.github.io/uievents/#dom-uievent-uievent>
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &UIEventBinding::UIEventInit,
     ) -> Fallible<DomRoot<UIEvent>> {
@@ -96,12 +106,11 @@ impl UIEvent {
             cancelable,
             init.view.as_deref(),
             init.detail,
+            can_gc,
         );
         Ok(event)
     }
-}
 
-impl UIEventMethods for UIEvent {
     // https://w3c.github.io/uievents/#widl-UIEvent-view
     fn GetView(&self) -> Option<DomRoot<Window>> {
         self.view.get()

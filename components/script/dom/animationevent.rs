@@ -17,6 +17,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct AnimationEvent {
@@ -37,8 +38,13 @@ impl AnimationEvent {
         }
     }
 
-    pub fn new(window: &Window, type_: Atom, init: &AnimationEventInit) -> DomRoot<AnimationEvent> {
-        Self::new_with_proto(window, None, type_, init)
+    pub fn new(
+        window: &Window,
+        type_: Atom,
+        init: &AnimationEventInit,
+        can_gc: CanGc,
+    ) -> DomRoot<AnimationEvent> {
+        Self::new_with_proto(window, None, type_, init, can_gc)
     }
 
     fn new_with_proto(
@@ -46,11 +52,13 @@ impl AnimationEvent {
         proto: Option<HandleObject>,
         type_: Atom,
         init: &AnimationEventInit,
+        can_gc: CanGc,
     ) -> DomRoot<AnimationEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(AnimationEvent::new_inherited(init)),
             window,
             proto,
+            can_gc,
         );
         {
             let event = ev.upcast::<Event>();
@@ -58,19 +66,20 @@ impl AnimationEvent {
         }
         ev
     }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        type_: DOMString,
-        init: &AnimationEventInit,
-    ) -> DomRoot<AnimationEvent> {
-        AnimationEvent::new_with_proto(window, proto, Atom::from(type_), init)
-    }
 }
 
 impl AnimationEventMethods for AnimationEvent {
+    // https://drafts.csswg.org/css-animations/#dom-animationevent-animationevent
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        type_: DOMString,
+        init: &AnimationEventInit,
+    ) -> DomRoot<AnimationEvent> {
+        AnimationEvent::new_with_proto(window, proto, Atom::from(type_), init, can_gc)
+    }
+
     // https://drafts.csswg.org/css-animations/#interface-animationevent-attributes
     fn AnimationName(&self) -> DOMString {
         DOMString::from(&*self.animation_name)

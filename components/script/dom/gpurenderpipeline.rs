@@ -2,20 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::string::String;
-
 use dom_struct::dom_struct;
-use webgpu::{WebGPU, WebGPUBindGroupLayout, WebGPURenderPipeline, WebGPURequest};
+use ipc_channel::ipc::IpcSender;
+use webgpu::wgc::pipeline::RenderPipelineDescriptor;
+use webgpu::{WebGPU, WebGPUBindGroupLayout, WebGPURenderPipeline, WebGPURequest, WebGPUResponse};
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::GPURenderPipelineMethods;
-use crate::dom::bindings::error::{Error, Fallible};
+use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::gpubindgrouplayout::GPUBindGroupLayout;
-use crate::dom::gpudevice::GPUDevice;
+use crate::dom::gpudevice::{GPUDevice, PipelineLayout};
 
 #[dom_struct]
 pub struct GPURenderPipeline {
@@ -26,8 +26,6 @@ pub struct GPURenderPipeline {
     label: DomRefCell<USVString>,
     #[no_trace]
     render_pipeline: WebGPURenderPipeline,
-    #[no_trace]
-    bind_group_layouts: Vec<WebGPUBindGroupLayout>,
     device: Dom<GPUDevice>,
 }
 
@@ -35,7 +33,6 @@ impl GPURenderPipeline {
     fn new_inherited(
         render_pipeline: WebGPURenderPipeline,
         label: USVString,
-        bgls: Vec<WebGPUBindGroupLayout>,
         device: &GPUDevice,
     ) -> Self {
         Self {
@@ -43,7 +40,6 @@ impl GPURenderPipeline {
             channel: device.channel(),
             label: DomRefCell::new(label),
             render_pipeline,
-            bind_group_layouts: bgls,
             device: Dom::from_ref(device),
         }
     }
@@ -52,14 +48,12 @@ impl GPURenderPipeline {
         global: &GlobalScope,
         render_pipeline: WebGPURenderPipeline,
         label: USVString,
-        bgls: Vec<WebGPUBindGroupLayout>,
         device: &GPUDevice,
     ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(GPURenderPipeline::new_inherited(
                 render_pipeline,
                 label,
-                bgls,
                 device,
             )),
             global,
@@ -70,6 +64,30 @@ impl GPURenderPipeline {
 impl GPURenderPipeline {
     pub fn id(&self) -> WebGPURenderPipeline {
         self.render_pipeline
+    }
+
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createrenderpipeline>
+    pub fn create(
+        device: &GPUDevice,
+        pipeline_layout: PipelineLayout,
+        descriptor: RenderPipelineDescriptor<'static>,
+        async_sender: Option<IpcSender<WebGPUResponse>>,
+    ) -> Fallible<WebGPURenderPipeline> {
+        let render_pipeline_id = device.global().wgpu_id_hub().create_render_pipeline_id();
+
+        device
+            .channel()
+            .0
+            .send(WebGPURequest::CreateRenderPipeline {
+                device_id: device.id().0,
+                render_pipeline_id,
+                descriptor,
+                implicit_ids: pipeline_layout.implicit(),
+                async_sender,
+            })
+            .expect("Failed to create WebGPU render pipeline");
+
+        Ok(WebGPURenderPipeline(render_pipeline_id))
     }
 }
 
@@ -86,13 +104,25 @@ impl GPURenderPipelineMethods for GPURenderPipeline {
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpupipelinebase-getbindgrouplayout>
     fn GetBindGroupLayout(&self, index: u32) -> Fallible<DomRoot<GPUBindGroupLayout>> {
-        if index > self.bind_group_layouts.len() as u32 {
-            return Err(Error::Range(String::from("Index out of bounds")));
+        let id = self.global().wgpu_id_hub().create_bind_group_layout_id();
+
+        if let Err(e) = self
+            .channel
+            .0
+            .send(WebGPURequest::RenderGetBindGroupLayout {
+                device_id: self.device.id().0,
+                pipeline_id: self.render_pipeline.0,
+                index,
+                id,
+            })
+        {
+            warn!("Failed to send WebGPURequest::RenderGetBindGroupLayout {e:?}");
         }
+
         Ok(GPUBindGroupLayout::new(
             &self.global(),
             self.channel.clone(),
-            self.bind_group_layouts[index as usize],
+            WebGPUBindGroupLayout(id),
             USVString::default(),
         ))
     }
@@ -100,10 +130,11 @@ impl GPURenderPipelineMethods for GPURenderPipeline {
 
 impl Drop for GPURenderPipeline {
     fn drop(&mut self) {
-        if let Err(e) = self.channel.0.send((
-            None,
-            WebGPURequest::DropRenderPipeline(self.render_pipeline.0),
-        )) {
+        if let Err(e) = self
+            .channel
+            .0
+            .send(WebGPURequest::DropRenderPipeline(self.render_pipeline.0))
+        {
             warn!(
                 "Failed to send WebGPURequest::DropRenderPipeline({:?}) ({})",
                 self.render_pipeline.0, e

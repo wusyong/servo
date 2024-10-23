@@ -16,8 +16,8 @@ use std::fmt;
 use std::ops::Add;
 
 use app_units::Au;
+use base::print_tree::PrintTree;
 use euclid::default::Point2D;
-use gfx_traits::print_tree::PrintTree;
 use log::{debug, trace};
 use serde::Serialize;
 use style::computed_values::{position, table_layout};
@@ -360,7 +360,8 @@ impl Flow for TableWrapperFlow {
             debug_assert!(kid.is_table_caption() || kid.is_table());
             if kid.is_table() {
                 let table = kid.as_table();
-                self.column_intrinsic_inline_sizes = table.column_intrinsic_inline_sizes.clone();
+                self.column_intrinsic_inline_sizes
+                    .clone_from(&table.column_intrinsic_inline_sizes)
             }
         }
 
@@ -847,25 +848,30 @@ fn initial_computed_inline_size(
     preferred_width_of_all_columns: Au,
     table_border_padding: Au,
 ) -> MaybeAuto {
-    match block.fragment.style.content_inline_size() {
-        Size::Auto => {
-            if preferred_width_of_all_columns + table_border_padding <= containing_block_inline_size
-            {
-                MaybeAuto::Specified(preferred_width_of_all_columns + table_border_padding)
-            } else if minimum_width_of_all_columns > containing_block_inline_size {
-                MaybeAuto::Specified(minimum_width_of_all_columns)
-            } else {
-                MaybeAuto::Auto
-            }
-        },
-        Size::LengthPercentage(ref lp) => {
-            let used = lp.to_used_value(containing_block_inline_size);
-            MaybeAuto::Specified(max(
-                used - table_border_padding,
-                minimum_width_of_all_columns,
-            ))
-        },
-    }
+    block
+        .fragment
+        .style
+        .content_inline_size()
+        .to_used_value(containing_block_inline_size)
+        .map_or_else(
+            || {
+                if preferred_width_of_all_columns + table_border_padding <=
+                    containing_block_inline_size
+                {
+                    MaybeAuto::Specified(preferred_width_of_all_columns + table_border_padding)
+                } else if minimum_width_of_all_columns > containing_block_inline_size {
+                    MaybeAuto::Specified(minimum_width_of_all_columns)
+                } else {
+                    MaybeAuto::Auto
+                }
+            },
+            |used| {
+                MaybeAuto::Specified(max(
+                    used - table_border_padding,
+                    minimum_width_of_all_columns,
+                ))
+            },
+        )
 }
 
 struct Table {

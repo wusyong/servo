@@ -18,6 +18,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::maplike;
+use crate::script_runtime::CanGc;
 
 /// maplike<DOMString, long>
 #[dom_struct]
@@ -28,7 +29,11 @@ pub struct TestBindingMaplike {
 }
 
 impl TestBindingMaplike {
-    fn new(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<TestBindingMaplike> {
+    fn new(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<TestBindingMaplike> {
         reflect_dom_object_with_proto(
             Box::new(TestBindingMaplike {
                 reflector: Reflector::new(),
@@ -36,19 +41,20 @@ impl TestBindingMaplike {
             }),
             global,
             proto,
+            can_gc,
         )
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<TestBindingMaplike>> {
-        Ok(TestBindingMaplike::new(global, proto))
     }
 }
 
 impl TestBindingMaplikeMethods for TestBindingMaplike {
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<TestBindingMaplike>> {
+        Ok(TestBindingMaplike::new(global, proto, can_gc))
+    }
+
     fn SetInternal(&self, key: DOMString, value: i32) {
         self.internal.set(key, value)
     }

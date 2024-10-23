@@ -198,7 +198,10 @@ def bootstrap_command_only(topdir):
     import servo.util
 
     try:
-        servo.platform.get().bootstrap('-f' in sys.argv or '--force' in sys.argv)
+        force = '-f' in sys.argv or '--force' in sys.argv
+        skip_platform = '--skip-platform' in sys.argv
+        skip_lints = '--skip-lints' in sys.argv
+        servo.platform.get().bootstrap(force, skip_platform, skip_lints)
     except NotImplementedError as exception:
         print(exception)
         return 1
@@ -212,8 +215,8 @@ def bootstrap(topdir):
     topdir = os.path.abspath(topdir)
 
     # We don't support paths with spaces for now
-    # https://github.com/servo/servo/issues/9442
-    if ' ' in topdir:
+    # https://github.com/servo/servo/issues/9616
+    if ' ' in topdir and (not _is_windows()):
         print('Cannot run mach in a path with spaces.')
         print('Current path:', topdir)
         sys.exit(1)

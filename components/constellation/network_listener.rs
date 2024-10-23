@@ -6,14 +6,14 @@
 //! Any redirects that are encountered are followed. Whenever a non-redirect
 //! response is received, it is forwarded to the appropriate script thread.
 
+use base::id::PipelineId;
 use crossbeam_channel::Sender;
-use http::HeaderMap;
+use http::{header, HeaderMap};
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
 use log::warn;
-use msg::constellation_msg::PipelineId;
-use net::http_loader::{set_default_accept, set_default_accept_language};
-use net_traits::request::{Destination, Referrer, RequestBuilder};
+use net::http_loader::{set_default_accept_language, DOCUMENT_ACCEPT_HEADER_VALUE};
+use net_traits::request::{Referrer, RequestBuilder, RequestId};
 use net_traits::response::ResponseInit;
 use net_traits::{
     CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseMsg, IpcSend, NetworkError,
@@ -66,7 +66,17 @@ impl NetworkListener {
                 None,
             ),
             None => {
-                set_default_accept(Destination::Document, &mut listener.request_builder.headers);
+                if !listener
+                    .request_builder
+                    .headers
+                    .contains_key(header::ACCEPT)
+                {
+                    listener
+                        .request_builder
+                        .headers
+                        .insert(header::ACCEPT, DOCUMENT_ACCEPT_HEADER_VALUE);
+                }
+
                 set_default_accept_language(&mut listener.request_builder.headers);
 
                 CoreResourceMsg::Fetch(
@@ -76,12 +86,13 @@ impl NetworkListener {
             },
         };
 
-        ROUTER.add_route(
-            ipc_receiver.to_opaque(),
+        ROUTER.add_typed_route(
+            ipc_receiver,
             Box::new(move |message| {
-                let msg = message.to();
-                match msg {
-                    Ok(FetchResponseMsg::ProcessResponse(res)) => listener.check_redirect(res),
+                match message {
+                    Ok(FetchResponseMsg::ProcessResponse(request_id, res)) => {
+                        listener.check_redirect(request_id, res)
+                    },
                     Ok(msg_) => listener.send(msg_),
                     Err(e) => warn!("Error while receiving network listener message: {}", e),
                 };
@@ -93,7 +104,11 @@ impl NetworkListener {
         }
     }
 
-    fn check_redirect(&mut self, message: Result<FetchMetadata, NetworkError>) {
+    fn check_redirect(
+        &mut self,
+        request_id: RequestId,
+        message: Result<FetchMetadata, NetworkError>,
+    ) {
         match message {
             Ok(res_metadata) => {
                 let metadata = match res_metadata {
@@ -136,8 +151,8 @@ impl NetworkListener {
                             referrer: metadata.referrer.clone(),
                             status_code: metadata
                                 .status
-                                .as_ref()
-                                .map(|&(code, _)| code)
+                                .try_code()
+                                .map(|code| code.as_u16())
                                 .unwrap_or(200),
                         });
 
@@ -150,13 +165,16 @@ impl NetworkListener {
                     _ => {
                         // Response should be processed by script thread.
                         self.should_send = true;
-                        self.send(FetchResponseMsg::ProcessResponse(Ok(res_metadata)));
+                        self.send(FetchResponseMsg::ProcessResponse(
+                            request_id,
+                            Ok(res_metadata),
+                        ));
                     },
                 };
             },
             Err(e) => {
                 self.should_send = true;
-                self.send(FetchResponseMsg::ProcessResponse(Err(e)))
+                self.send(FetchResponseMsg::ProcessResponse(request_id, Err(e)))
             },
         };
     }

@@ -19,30 +19,29 @@
 
 use std::borrow::{BorrowMut, Cow};
 use std::cmp::max;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::vec::Drain;
 
+pub use base::id::TopLevelBrowsingContextId;
+use base::id::{PipelineNamespace, PipelineNamespaceId};
 use bluetooth::BluetoothThreadFactory;
 use bluetooth_traits::BluetoothRequest;
-use canvas::canvas_paint_thread::{self, CanvasPaintThread};
+use canvas::canvas_paint_thread::CanvasPaintThread;
 use canvas::WebGLComm;
-use canvas_traits::webgl::WebGLThreads;
+use canvas_traits::webgl::{GlType, WebGLThreads};
 use compositing::webview::UnknownWebView;
 use compositing::windowing::{EmbedderEvent, EmbedderMethods, WindowMethods};
 use compositing::{CompositeTarget, IOCompositor, InitialCompositorState, ShutdownState};
-use compositing_traits::{
-    CanvasToCompositorMsg, CompositorMsg, CompositorProxy, CompositorReceiver, ConstellationMsg,
-    FontToCompositorMsg, ForwardedToCompositorMsg,
-};
+use compositing_traits::{CompositorMsg, CompositorProxy, CompositorReceiver, ConstellationMsg};
 #[cfg(all(
     not(target_os = "windows"),
     not(target_os = "ios"),
     not(target_os = "android"),
     not(target_arch = "arm"),
-    not(target_arch = "aarch64")
+    not(target_arch = "aarch64"),
+    not(target_env = "ohos"),
 ))]
 use constellation::content_process_sandbox_profile;
 use constellation::{
@@ -53,25 +52,26 @@ use crossbeam_channel::{unbounded, Sender};
 use embedder_traits::{EmbedderMsg, EmbedderProxy, EmbedderReceiver, EventLoopWaker};
 use env_logger::Builder as EnvLoggerBuilder;
 use euclid::Scale;
+use fonts::SystemFontService;
 #[cfg(all(
     not(target_os = "windows"),
     not(target_os = "ios"),
     not(target_os = "android"),
     not(target_arch = "arm"),
-    not(target_arch = "aarch64")
+    not(target_arch = "aarch64"),
+    not(target_env = "ohos"),
 ))]
 use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
-use gfx::font_cache_thread::FontCacheThread;
-pub use gfx::rendering_context;
-use gfx::rendering_context::RenderingContext;
 pub use gleam::gl;
+use gleam::gl::RENDERER;
 use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::router::ROUTER;
+#[cfg(feature = "layout_2013")]
+pub use layout_thread_2013;
 use log::{error, trace, warn, Log, Metadata, Record};
 use media::{GLPlayerThreads, GlApi, NativeDisplay, WindowGLContext};
-pub use msg::constellation_msg::TopLevelBrowsingContextId;
-use msg::constellation_msg::{PipelineNamespace, PipelineNamespaceId};
+use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_resource_threads;
-use net_traits::IpcSend;
 use profile::{mem as profile_mem, time as profile_time};
 use profile_traits::{mem, time};
 use script::serviceworker_manager::ServiceWorkerManager;
@@ -81,27 +81,26 @@ use script_traits::{ScriptToConstellationChan, WindowSizeData};
 use servo_config::{opts, pref, prefs};
 use servo_media::player::context::GlContext;
 use servo_media::ServoMedia;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use surfman::platform::generic::multi::connection::NativeConnection as LinuxNativeConnection;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use surfman::platform::generic::multi::context::NativeContext as LinuxNativeContext;
 use surfman::{GLApi, GLVersion};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use surfman::{NativeConnection, NativeContext};
-use webrender::{RenderApiSender, ShaderPrecacheFlags};
-use webrender_api::{
-    ColorF, DocumentId, FontInstanceKey, FontKey, FramePublishId, ImageKey, NativeFontHandle,
-};
+use webgpu::swapchain::WGPUImageMap;
+use webrender::{RenderApiSender, ShaderPrecacheFlags, UploadMethod, ONE_TIME_USAGE_HINT};
+use webrender_api::{ColorF, DocumentId, FramePublishId};
 use webrender_traits::{
-    WebrenderExternalImageHandlers, WebrenderExternalImageRegistry, WebrenderImageHandlerType,
+    CrossProcessCompositorApi, RenderingContext, WebrenderExternalImageHandlers,
+    WebrenderExternalImageRegistry, WebrenderImageHandlerType,
 };
 pub use {
-    background_hang_monitor, bluetooth, bluetooth_traits, canvas, canvas_traits, compositing,
-    constellation, devtools, devtools_traits, embedder_traits, euclid, gfx, ipc_channel,
-    keyboard_types, layout_thread_2013, layout_thread_2020, media, msg, net, net_traits, profile,
-    profile_traits, script, script_layout_interface, script_traits, servo_config as config,
-    servo_config, servo_geometry, servo_url as url, servo_url, style, style_traits, webgpu,
-    webrender_api, webrender_traits,
+    background_hang_monitor, base, bluetooth, bluetooth_traits, canvas, canvas_traits, compositing,
+    constellation, devtools, devtools_traits, embedder_traits, euclid, fonts, ipc_channel,
+    keyboard_types, layout_thread_2020, media, net, net_traits, profile, profile_traits, script,
+    script_layout_interface, script_traits, servo_config as config, servo_config, servo_geometry,
+    servo_url as url, servo_url, style, style_traits, webgpu, webrender_api, webrender_traits,
 };
 
 #[cfg(feature = "webdriver")]
@@ -135,7 +134,7 @@ mod media_platform {
 
             match GStreamerBackend::init_with_plugins(
                 plugin_dir,
-                &gstreamer_plugins::GSTREAMER_PLUGINS,
+                gstreamer_plugins::GSTREAMER_PLUGINS,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -203,13 +202,16 @@ impl webrender_api::RenderNotifier for RenderNotifier {
 
     fn new_frame_ready(
         &self,
-        _document_id: DocumentId,
+        document_id: DocumentId,
         _scrolled: bool,
         composite_needed: bool,
         _frame_publish_id: FramePublishId,
     ) {
         self.compositor_proxy
-            .send(CompositorMsg::NewWebRenderFrameReady(composite_needed));
+            .send(CompositorMsg::NewWebRenderFrameReady(
+                document_id,
+                composite_needed,
+            ));
     }
 }
 
@@ -222,6 +224,11 @@ impl<Window> Servo<Window>
 where
     Window: WindowMethods + 'static + ?Sized,
 {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(embedder, window), fields(servo_profiling = true))
+    )]
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         mut embedder: Box<dyn EmbedderMethods>,
         window: Rc<Window>,
@@ -251,6 +258,9 @@ where
             },
             Some(ref ua) if ua == "desktop" => {
                 default_user_agent_string_for(UserAgent::Desktop).into()
+            },
+            Some(ref ua) if ua == "ohos" => {
+                default_user_agent_string_for(UserAgent::OpenHarmony).into()
             },
             Some(ua) => ua.into(),
             None => embedder
@@ -328,6 +338,13 @@ where
                 clear_color[2] as f32,
                 clear_color[3] as f32,
             );
+            // Use same texture upload method as Gecko with ANGLE:
+            // https://searchfox.org/mozilla-central/source/gfx/webrender_bindings/src/bindings.rs#1215-1219
+            let upload_method = if webrender_gl.get_string(RENDERER).starts_with("ANGLE") {
+                UploadMethod::Immediate
+            } else {
+                UploadMethod::PixelBuffer(ONE_TIME_USAGE_HINT)
+            };
             webrender::create_webrender_instance(
                 webrender_gl.clone(),
                 render_notifier,
@@ -349,6 +366,7 @@ where
                         !opts.debug.disable_subpixel_text_antialiasing,
                     allow_texture_swizzling: pref!(gfx.texture_swizzling.enabled),
                     clear_color,
+                    upload_method,
                     ..Default::default()
                 },
                 None,
@@ -369,8 +387,8 @@ where
 
         // Create the webgl thread
         let gl_type = match webrender_gl.get_type() {
-            gleam::gl::GlType::Gl => sparkle::gl::GlType::Gl,
-            gleam::gl::GlType::Gles => sparkle::gl::GlType::Gles,
+            gleam::gl::GlType::Gl => GlType::Gl,
+            gleam::gl::GlType::Gles => GlType::Gles,
         };
 
         let (external_image_handlers, external_images) = WebrenderExternalImageHandlers::new();
@@ -423,6 +441,9 @@ where
 
         // Create the constellation, which maintains the engine pipelines, including script and
         // layout, as well as the navigation context.
+        let mut protocols = ProtocolRegistry::with_internal_protocols();
+        protocols.merge(embedder.get_protocol_handlers());
+
         let constellation_chan = create_constellation(
             user_agent,
             opts.config_dir.clone(),
@@ -440,6 +461,7 @@ where
             window_size,
             external_images,
             wgpu_image_map,
+            protocols,
         );
 
         if cfg!(feature = "webdriver") {
@@ -456,7 +478,7 @@ where
 
         // The compositor coordinates with the client window to create the final
         // rendered page and display it somewhere.
-        let compositor = IOCompositor::create(
+        let compositor = IOCompositor::new(
             window,
             InitialCompositorState {
                 sender: compositor_proxy,
@@ -475,6 +497,7 @@ where
             opts.exit_after_load,
             opts.debug.convert_mouse_to_touch,
             top_level_browsing_context_id,
+            embedder.get_version_string().unwrap_or_default(),
         );
 
         let servo = Servo {
@@ -491,7 +514,7 @@ where
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn get_native_media_display_and_gl_context(
         rendering_context: &RenderingContext,
     ) -> Option<(NativeDisplay, GlContext)> {
@@ -522,13 +545,22 @@ where
     fn get_native_media_display_and_gl_context(
         rendering_context: &RenderingContext,
     ) -> Option<(NativeDisplay, GlContext)> {
-        let gl_context = GlContext::Egl(rendering_context.native_context().egl_context as usize);
-        let native_display =
-            NativeDisplay::Egl(rendering_context.native_device().egl_display as usize);
-        Some((native_display, gl_context))
+        #[cfg(feature = "no-wgl")]
+        {
+            let gl_context =
+                GlContext::Egl(rendering_context.native_context().egl_context as usize);
+            let native_display =
+                NativeDisplay::Egl(rendering_context.native_device().egl_display as usize);
+            Some((native_display, gl_context))
+        }
+        #[cfg(not(feature = "no-wgl"))]
+        None
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )))]
     fn get_native_media_display_and_gl_context(
         _rendering_context: &RenderingContext,
     ) -> Option<(NativeDisplay, GlContext)> {
@@ -677,6 +709,10 @@ where
                 if let Err(e) = self.constellation_chan.send(msg) {
                     warn!("Sending navigation to constellation failed ({:?}).", e);
                 }
+                self.messages_for_embedder.push((
+                    Some(top_level_browsing_context_id),
+                    EmbedderMsg::Status(None),
+                ));
             },
 
             EmbedderEvent::Keyboard(key_event) => {
@@ -943,15 +979,47 @@ fn create_compositor_channel(
     event_loop_waker: Box<dyn EventLoopWaker>,
 ) -> (CompositorProxy, CompositorReceiver) {
     let (sender, receiver) = unbounded();
-    (
-        CompositorProxy {
-            sender,
-            event_loop_waker,
-        },
-        CompositorReceiver { receiver },
-    )
+
+    let (compositor_ipc_sender, compositor_ipc_receiver) =
+        ipc::channel().expect("ipc channel failure");
+
+    let cross_process_compositor_api = CrossProcessCompositorApi(compositor_ipc_sender);
+    let compositor_proxy = CompositorProxy {
+        sender,
+        cross_process_compositor_api,
+        event_loop_waker,
+    };
+
+    let compositor_proxy_clone = compositor_proxy.clone();
+    ROUTER.add_typed_route(
+        compositor_ipc_receiver,
+        Box::new(move |message| {
+            compositor_proxy_clone.send(CompositorMsg::CrossProcess(
+                message.expect("Could not convert Compositor message"),
+            ));
+        }),
+    );
+
+    (compositor_proxy, CompositorReceiver { receiver })
 }
 
+fn get_layout_factory(legacy_layout: bool) -> Arc<dyn LayoutFactory> {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "layout_2013")] {
+            if legacy_layout {
+                return Arc::new(layout_thread_2013::LayoutFactoryImpl());
+            }
+        } else {
+            if legacy_layout {
+                warn!("Runtime option `legacy_layout` was enabled, but the `layout_2013` \
+                feature was not enabled at compile time. Falling back to layout 2020! ");
+           }
+        }
+    }
+    Arc::new(layout_thread_2020::LayoutFactoryImpl())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn create_constellation(
     user_agent: Cow<'static, str>,
     config_dir: Option<PathBuf>,
@@ -968,7 +1036,8 @@ fn create_constellation(
     glplayer_threads: Option<GLPlayerThreads>,
     initial_window_size: WindowSizeData,
     external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
-    wgpu_image_map: Arc<Mutex<HashMap<u64, webgpu::PresentationData>>>,
+    wgpu_image_map: WGPUImageMap,
+    protocols: ProtocolRegistry,
 ) -> Sender<ConstellationMsg> {
     // Global configuration options, parsed from the command line.
     let opts = opts::get();
@@ -985,16 +1054,17 @@ fn create_constellation(
         config_dir,
         opts.certificate_path.clone(),
         opts.ignore_certificate_errors,
+        Arc::new(protocols),
     );
 
-    let font_cache_thread = FontCacheThread::new(
-        public_resource_threads.sender(),
-        Box::new(FontCacheWR(compositor_proxy.clone())),
+    let system_font_service = Arc::new(
+        SystemFontService::spawn(compositor_proxy.cross_process_compositor_api.clone()).to_proxy(),
     );
 
     let (canvas_create_sender, canvas_ipc_sender) = CanvasPaintThread::start(
-        Box::new(CanvasWebrenderApi(compositor_proxy.clone())),
-        font_cache_thread.clone(),
+        compositor_proxy.cross_process_compositor_api.clone(),
+        system_font_service.clone(),
+        public_resource_threads.clone(),
     );
 
     let initial_state = InitialConstellationState {
@@ -1002,7 +1072,7 @@ fn create_constellation(
         embedder_proxy,
         devtools_sender,
         bluetooth_thread,
-        font_cache_thread,
+        system_font_service,
         public_resource_threads,
         private_resource_threads,
         time_profiler_chan,
@@ -1018,11 +1088,7 @@ fn create_constellation(
         wgpu_image_map,
     };
 
-    let layout_factory: Arc<dyn LayoutFactory> = if opts::get().legacy_layout {
-        Arc::new(layout_thread_2013::LayoutFactoryImpl())
-    } else {
-        Arc::new(layout_thread_2020::LayoutFactoryImpl())
-    };
+    let layout_factory: Arc<dyn LayoutFactory> = get_layout_factory(opts::get().legacy_layout);
 
     Constellation::<
         script::script_thread::ScriptThread,
@@ -1038,67 +1104,6 @@ fn create_constellation(
         canvas_create_sender,
         canvas_ipc_sender,
     )
-}
-
-struct FontCacheWR(CompositorProxy);
-
-impl gfx_traits::WebrenderApi for FontCacheWR {
-    fn add_font_instance(&self, font_key: FontKey, size: f32) -> FontInstanceKey {
-        let (sender, receiver) = unbounded();
-        let _ = self
-            .0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddFontInstance(font_key, size, sender),
-            )));
-        receiver.recv().unwrap()
-    }
-    fn add_font(&self, data: Arc<Vec<u8>>, index: u32) -> FontKey {
-        let (sender, receiver) = unbounded();
-        let (bytes_sender, bytes_receiver) =
-            ipc::bytes_channel().expect("failed to create IPC channel");
-        let _ = self
-            .0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddFont(sender, index, bytes_receiver),
-            )));
-        let _ = bytes_sender.send(&data);
-        receiver.recv().unwrap()
-    }
-
-    fn add_system_font(&self, handle: NativeFontHandle) -> FontKey {
-        let (sender, receiver) = unbounded();
-        let _ = self
-            .0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddSystemFont(sender, handle),
-            )));
-        receiver.recv().unwrap()
-    }
-}
-
-#[derive(Clone)]
-struct CanvasWebrenderApi(CompositorProxy);
-
-impl canvas_paint_thread::WebrenderApi for CanvasWebrenderApi {
-    fn generate_key(&self) -> Option<ImageKey> {
-        let (sender, receiver) = unbounded();
-        let _ = self
-            .0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Canvas(
-                CanvasToCompositorMsg::GenerateKey(sender),
-            )));
-        receiver.recv().ok()
-    }
-    fn update_images(&self, updates: Vec<canvas_paint_thread::ImageUpdate>) {
-        let _ = self
-            .0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Canvas(
-                CanvasToCompositorMsg::UpdateImages(updates),
-            )));
-    }
-    fn clone(&self) -> Box<dyn canvas_paint_thread::WebrenderApi> {
-        Box::new(<Self as Clone>::clone(self))
-    }
 }
 
 // A logger that logs to two downstream loggers.
@@ -1167,11 +1172,8 @@ pub fn run_content_process(token: String) {
             set_logger(content.script_to_constellation_chan().clone());
 
             let background_hang_monitor_register = content.register_with_background_hang_monitor();
-            let layout_factory: Arc<dyn LayoutFactory> = if opts::get().legacy_layout {
-                Arc::new(layout_thread_2013::LayoutFactoryImpl())
-            } else {
-                Arc::new(layout_thread_2020::LayoutFactoryImpl())
-            };
+            let layout_factory: Arc<dyn LayoutFactory> =
+                get_layout_factory(opts::get().legacy_layout);
 
             content.start_all::<script::script_thread::ScriptThread>(
                 true,
@@ -1190,7 +1192,8 @@ pub fn run_content_process(token: String) {
     not(target_os = "ios"),
     not(target_os = "android"),
     not(target_arch = "arm"),
-    not(target_arch = "aarch64")
+    not(target_arch = "aarch64"),
+    not(target_env = "ohos"),
 ))]
 fn create_sandbox() {
     ChildSandbox::new(content_process_sandbox_profile())
@@ -1203,7 +1206,8 @@ fn create_sandbox() {
     target_os = "ios",
     target_os = "android",
     target_arch = "arm",
-    target_arch = "aarch64"
+    target_arch = "aarch64",
+    target_env = "ohos",
 ))]
 fn create_sandbox() {
     panic!("Sandboxing is not supported on Windows, iOS, ARM targets and android.");
@@ -1212,46 +1216,67 @@ fn create_sandbox() {
 enum UserAgent {
     Desktop,
     Android,
+    OpenHarmony,
     #[allow(non_camel_case_types)]
     iOS,
 }
 
-fn default_user_agent_string_for(agent: UserAgent) -> &'static str {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    const DESKTOP_UA_STRING: &'static str =
-        "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Servo/1.0 Firefox/111.0";
-    #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
-    const DESKTOP_UA_STRING: &'static str =
-        "Mozilla/5.0 (X11; Linux i686; rv:109.0) Servo/1.0 Firefox/111.0";
+fn get_servo_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn default_user_agent_string_for(agent: UserAgent) -> String {
+    let servo_version = get_servo_version();
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(target_env = "ohos")))]
+    let desktop_ua_string =
+        format!("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Servo/{servo_version} Firefox/128.0");
+    #[cfg(all(
+        target_os = "linux",
+        not(target_arch = "x86_64"),
+        not(target_env = "ohos")
+    ))]
+    let desktop_ua_string =
+        format!("Mozilla/5.0 (X11; Linux i686; rv:128.0) Servo/{servo_version} Firefox/128.0");
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    const DESKTOP_UA_STRING: &'static str =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Servo/1.0 Firefox/111.0";
+    let desktop_ua_string = format!(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Servo/{servo_version} Firefox/128.0"
+    );
     #[cfg(all(target_os = "windows", not(target_arch = "x86_64")))]
-    const DESKTOP_UA_STRING: &'static str =
-        "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Servo/1.0 Firefox/111.0";
+    let desktop_ua_string =
+        format!("Mozilla/5.0 (Windows NT 10.0; rv:128.0) Servo/{servo_version} Firefox/128.0");
 
     #[cfg(target_os = "macos")]
-    const DESKTOP_UA_STRING: &'static str =
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Servo/1.0 Firefox/111.0";
+    let desktop_ua_string = format!(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Servo/{servo_version} Firefox/128.0"
+    );
 
-    #[cfg(target_os = "android")]
-    const DESKTOP_UA_STRING: &'static str = "";
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    let desktop_ua_string = "".to_string();
 
     match agent {
-        UserAgent::Desktop => DESKTOP_UA_STRING,
-        UserAgent::Android => "Mozilla/5.0 (Android; Mobile; rv:109.0) Servo/1.0 Firefox/111.0",
-        UserAgent::iOS => {
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X; rv:109.0) Servo/1.0 Firefox/111.0"
-        },
+        UserAgent::Desktop => desktop_ua_string,
+        UserAgent::Android => format!(
+            "Mozilla/5.0 (Android; Mobile; rv:128.0) Servo/{servo_version} Firefox/128.0"
+        ),
+        UserAgent::OpenHarmony => format!(
+            "Mozilla/5.0 (OpenHarmony; Mobile; rv:128.0) Servo/{servo_version} Firefox/128.0"
+        ),
+        UserAgent::iOS => format!(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X; rv:128.0) Servo/{servo_version} Firefox/128.0"
+        ),
     }
 }
 
 #[cfg(target_os = "android")]
 const DEFAULT_USER_AGENT: UserAgent = UserAgent::Android;
 
+#[cfg(target_env = "ohos")]
+const DEFAULT_USER_AGENT: UserAgent = UserAgent::OpenHarmony;
+
 #[cfg(target_os = "ios")]
 const DEFAULT_USER_AGENT: UserAgent = UserAgent::iOS;
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 const DEFAULT_USER_AGENT: UserAgent = UserAgent::Desktop;

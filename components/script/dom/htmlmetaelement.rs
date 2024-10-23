@@ -3,12 +3,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::str::FromStr;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use js::rust::HandleObject;
 use regex::bytes::Regex;
-use script_traits::{HistoryEntryReplacement, MsDuration};
+use script_traits::HistoryEntryReplacement;
 use servo_url::ServoUrl;
 use style::str::HTML_SPACE_CHARACTERS;
 
@@ -28,6 +30,7 @@ use crate::dom::location::NavigationType;
 use crate::dom::node::{document_from_node, window_from_node, BindContext, Node, UnbindContext};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 use crate::timers::OneshotTimerCallback;
 
 #[dom_struct]
@@ -43,11 +46,12 @@ pub struct RefreshRedirectDue {
     pub window: DomRoot<Window>,
 }
 impl RefreshRedirectDue {
-    pub fn invoke(self) {
+    pub fn invoke(self, can_gc: CanGc) {
         self.window.Location().navigate(
             self.url.clone(),
             HistoryEntryReplacement::Enabled,
             NavigationType::DeclarativeRefresh,
+            can_gc,
         );
     }
 }
@@ -85,8 +89,14 @@ impl HTMLMetaElement {
             if name == "referrer" {
                 self.apply_referrer();
             }
+        // https://html.spec.whatwg.org/multipage/#attr-meta-http-equiv
         } else if !self.HttpEquiv().is_empty() {
-            self.declarative_refresh();
+            // TODO: Implement additional http-equiv candidates
+            match self.HttpEquiv().to_ascii_lowercase().as_str() {
+                "refresh" => self.declarative_refresh(),
+                "content-security-policy" => self.apply_csp_list(),
+                _ => {},
+            }
         }
     }
 
@@ -111,6 +121,15 @@ impl HTMLMetaElement {
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#attr-meta-http-equiv-content-security-policy>
+    fn apply_csp_list(&self) {
+        if let Some(parent) = self.upcast::<Node>().GetParentElement() {
+            if let Some(head) = parent.downcast::<HTMLHeadElement>() {
+                head.set_content_security_policy();
+            }
+        }
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#shared-declarative-refresh-steps>
     fn declarative_refresh(&self) {
         // 2
@@ -131,8 +150,8 @@ impl HTMLMetaElement {
         }
 
         // 2-11
-        lazy_static::lazy_static! {
-            static ref REFRESH_REGEX: Regex = Regex::new(
+        static REFRESH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
                 r#"(?x)
                 ^
                 \s* # 3
@@ -154,8 +173,9 @@ impl HTMLMetaElement {
                 $
             "#,
             )
-            .unwrap();
-        }
+            .unwrap()
+        });
+
         let mut url_record = document.url();
         let captures = if let Some(captures) = REFRESH_REGEX.captures(content.as_bytes()) {
             captures
@@ -190,7 +210,7 @@ impl HTMLMetaElement {
                     window: window.clone(),
                     url: url_record,
                 }),
-                MsDuration::new(time.saturating_mul(1000)),
+                Duration::from_secs(time),
             );
             document.set_declarative_refresh(DeclarativeRefresh::CreatedAfterLoad);
         } else {

@@ -16,7 +16,9 @@ import os.path as path
 import shutil
 import subprocess
 import textwrap
+import json
 
+from python.servo.post_build_commands import PostBuildCommands
 import wpt
 import wpt.manifestupdate
 import wpt.run
@@ -147,22 +149,23 @@ class MachCommands(CommandBase):
                 test_patterns.append(test)
 
         self_contained_tests = [
-            "servoshell",
             "background_hang_monitor",
-            "gfx",
+            "base",
+            "compositing",
+            "constellation",
+            "crown",
+            "fonts",
             "hyper_serde",
             "layout_2013",
             "layout_2020",
-            "msg",
             "net",
             "net_traits",
-            "selectors",
+            "pixels",
             "script_traits",
+            "selectors",
             "servo_config",
-            "crown",
-            "constellation",
+            "servoshell",
             "style_config",
-            "compositing",
         ]
         if not packages:
             packages = set(os.listdir(path.join(self.context.topdir, "tests", "unit"))) - set(['.DS_Store'])
@@ -227,7 +230,7 @@ class MachCommands(CommandBase):
     def test_tidy(self, all_files, no_progress):
         tidy_failed = tidy.scan(not all_files, not no_progress)
 
-        print("\r ➤  Checking formatting of rust files...")
+        print("\r ➤  Checking formatting of Rust files...")
         rustfmt_failed = call(["cargo", "fmt", "--", *UNSTABLE_RUSTFMT_ARGUMENTS, "--check"])
         if rustfmt_failed:
             print("Run `./mach fmt` to fix the formatting")
@@ -302,9 +305,9 @@ class MachCommands(CommandBase):
              description='Run the regular web platform test suite',
              category='testing',
              parser=wpt.create_parser)
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def test_wpt(self, build_type: BuildType, **kwargs):
-        return self._test_wpt(build_type=build_type, **kwargs)
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def test_wpt(self, servo_binary: str, **kwargs):
+        return self._test_wpt(servo_binary, **kwargs)
 
     @Command('test-wpt-android',
              description='Run the web platform test suite in an Android emulator',
@@ -318,15 +321,12 @@ class MachCommands(CommandBase):
             binary_args=self.in_android_emulator(build_type) + (binary_args or []),
             binary=sys.executable,
         )
-        return self._test_wpt(build_type=build_type, android=True, **kwargs)
+        return self._test_wpt(sys.executable, android=True, **kwargs)
 
-    def _test_wpt(self, build_type: BuildType, android=False, **kwargs):
-        if not android:
-            os.environ.update(self.build_env())
-
+    @CommandBase.allow_target_configuration
+    def _test_wpt(self, servo_binary: str, **kwargs):
         # TODO(mrobinson): Why do we pass the wrong binary path in when running WPT on Android?
-        binary_path = self.get_binary_path(build_type=build_type)
-        return_value = wpt.run.run_tests(binary_path, **kwargs)
+        return_value = wpt.run.run_tests(servo_binary, **kwargs)
         return return_value if not kwargs["always_succeed"] else 0
 
     @Command('update-manifest',
@@ -387,7 +387,6 @@ class MachCommands(CommandBase):
         avd = "servo-x86"
         target = "i686-linux-android"
         print("Assuming --target " + target)
-        self.cross_compile_target = target
 
         env = self.build_env()
         os.environ["PATH"] = env["PATH"]
@@ -404,16 +403,23 @@ class MachCommands(CommandBase):
 
     @Command('test-dromaeo', description='Run the Dromaeo test suite', category='testing')
     @CommandArgument('tests', default=["recommended"], nargs="...", help="Specific tests to run")
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def test_dromaeo(self, tests, build_type: BuildType):
-        return self.dromaeo_test_runner(tests, build_type)
+    @CommandArgument('--bmf-output', default=None, help="Specify BMF JSON output file")
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def test_dromaeo(self, tests, servo_binary: str, bmf_output: str | None = None):
+        return self.dromaeo_test_runner(tests, servo_binary, bmf_output)
+
+    @Command('test-speedometer', description="Run servo's speedometer", category='testing')
+    @CommandArgument('--bmf-output', default=None, help="Specify BMF JSON output file")
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def test_speedometer(self, servo_binary: str, bmf_output: str | None = None):
+        return self.speedometer_runner(servo_binary, bmf_output)
 
     @Command('update-jquery',
              description='Update the jQuery test suite expected results',
              category='testing')
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def update_jquery(self, build_type: BuildType):
-        return self.jquery_test_runner("update", build_type)
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def update_jquery(self, servo_binary: str):
+        return self.jquery_test_runner("update", servo_binary)
 
     @Command('compare_dromaeo',
              description='Compare outputs of two runs of ./mach test-dromaeo command',
@@ -471,7 +477,7 @@ class MachCommands(CommandBase):
                     print("{}|{}|{}|{}".format(a1.ljust(width_col1), str(b1).ljust(width_col2),
                           str(c1).ljust(width_col3), str(d1).ljust(width_col4)))
 
-    def jquery_test_runner(self, cmd, build_type: BuildType):
+    def jquery_test_runner(self, cmd, binary: str):
         base_dir = path.abspath(path.join("tests", "jquery"))
         jquery_dir = path.join(base_dir, "jquery")
         run_file = path.join(base_dir, "run_jquery.py")
@@ -486,14 +492,18 @@ class MachCommands(CommandBase):
             ["git", "-C", jquery_dir, "pull"])
 
         # Check that a release servo build exists
-        bin_path = path.abspath(self.get_binary_path(build_type))
+        bin_path = path.abspath(binary)
 
         return call([run_file, cmd, bin_path, base_dir])
 
-    def dromaeo_test_runner(self, tests, build_type: BuildType):
+    def dromaeo_test_runner(self, tests, binary: str, bmf_output: str | None):
         base_dir = path.abspath(path.join("tests", "dromaeo"))
         dromaeo_dir = path.join(base_dir, "dromaeo")
         run_file = path.join(base_dir, "run_dromaeo.py")
+        if bmf_output:
+            bmf_output = path.abspath(bmf_output)
+        else:
+            bmf_output = ""
 
         # Clone the Dromaeo repository if it doesn't exist
         if not os.path.isdir(dromaeo_dir):
@@ -509,10 +519,39 @@ class MachCommands(CommandBase):
             ["make", "-C", dromaeo_dir, "web"])
 
         # Check that a release servo build exists
-        bin_path = path.abspath(self.get_binary_path(build_type))
+        bin_path = path.abspath(binary)
 
         return check_call(
-            [run_file, "|".join(tests), bin_path, base_dir])
+            [run_file, "|".join(tests), bin_path, base_dir, bmf_output])
+
+    def speedometer_runner(self, binary: str, bmf_output: str | None):
+        speedometer = json.loads(subprocess.check_output([
+            binary,
+            "https://servospeedometer.netlify.app?headless=1",
+            "--pref", "dom.allow_scripts_to_close_windows",
+            "--resolution=1100x900",
+            "--headless"], timeout=60).decode())
+
+        print(f"Score: {speedometer['Score']['mean']} ± {speedometer['Score']['delta']}")
+
+        if bmf_output:
+            output = dict()
+
+            def parse_speedometer_result(result):
+                output[f"Speedometer/{result['name']}"] = {
+                    'latency': {  # speedometer has ms we need to convert to ns
+                        'value': float(result['mean']) * 1000.0,
+                        'lower_value': float(result['min']) * 1000.0,
+                        'upper_value': float(result['max']) * 1000.0,
+                    }
+                }
+                for child in result['children']:
+                    parse_speedometer_result(child)
+
+            for v in speedometer.values():
+                parse_speedometer_result(v)
+            with open(bmf_output, 'w', encoding='utf-8') as f:
+                json.dump(output, f, indent=4)
 
 
 def create_parser_create():
@@ -766,13 +805,13 @@ tests/wpt/mozilla/tests for Servo-only tests""" % reference_path)
              category='testing')
     @CommandArgument('params', nargs='...',
                      help="Command-line arguments to be passed through to Servo")
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def smoketest(self, build_type: BuildType, params):
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def smoketest(self, servo_binary: str, params, **kwargs):
         # We pass `-f` here so that any thread panic will cause Servo to exit,
         # preventing a panic from hanging execution. This means that these kind
         # of panics won't cause timeouts on CI.
-        return self.context.commands.dispatch('run', self.context, build_type=build_type,
-                                              params=params + ['-f', 'tests/html/close-on-load.html'])
+        return PostBuildCommands(self.context)._run(servo_binary,
+                                                    params + ['-f', 'tests/html/close-on-load.html'])
 
     @Command('try', description='Runs try jobs by force pushing to try branch', category='testing')
     @CommandArgument('--remote', '-r', default="origin", help='A git remote to run the try job on')

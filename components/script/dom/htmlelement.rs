@@ -11,10 +11,11 @@ use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use js::rust::HandleObject;
 use script_layout_interface::QueryMsg;
 use style::attr::AttrValue;
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
 use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
+use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterData_Binding::CharacterDataMethods;
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::{
     EventHandlerNonNull, OnErrorEventHandlerNonNull,
 };
@@ -26,6 +27,7 @@ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::characterdata::CharacterData;
 use crate::dom::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner};
 use crate::dom::customelementregistry::CallbackReaction;
 use crate::dom::document::{Document, FocusType};
@@ -49,6 +51,7 @@ use crate::dom::node::{
 };
 use crate::dom::text::Text;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
 #[dom_struct]
@@ -103,6 +106,30 @@ impl HTMLElement {
     fn is_body_or_frameset(&self) -> bool {
         let eventtarget = self.upcast::<EventTarget>();
         eventtarget.is::<HTMLBodyElement>() || eventtarget.is::<HTMLFrameSetElement>()
+    }
+
+    /// Calls into the layout engine to generate a plain text representation
+    /// of a [`HTMLElement`] as specified when getting the `.innerText` or
+    /// `.outerText` in JavaScript.`
+    ///
+    /// <https://html.spec.whatwg.org/multipage/#get-the-text-steps>
+    fn get_inner_outer_text(&self, can_gc: CanGc) -> DOMString {
+        let node = self.upcast::<Node>();
+        let window = window_from_node(node);
+        let element = self.as_element();
+
+        // Step 1.
+        let element_not_rendered = !node.is_connected() || !element.has_css_layout_box(can_gc);
+        if element_not_rendered {
+            return node.GetTextContent().unwrap();
+        }
+
+        window.layout_reflow(QueryMsg::ElementInnerOuterTextQuery, can_gc);
+        let text = window
+            .layout()
+            .query_element_inner_outer_text(node.to_trusted_node_address());
+
+        DOMString::from(text)
     }
 }
 
@@ -162,7 +189,7 @@ impl HTMLElementMethods for HTMLElement {
             }
         } else {
             self.upcast::<EventTarget>()
-                .get_event_handler_common("error")
+                .get_event_handler_common("error", CanGc::note())
         }
     }
 
@@ -191,7 +218,7 @@ impl HTMLElementMethods for HTMLElement {
             }
         } else {
             self.upcast::<EventTarget>()
-                .get_event_handler_common("load")
+                .get_event_handler_common("load", CanGc::note())
         }
     }
 
@@ -219,7 +246,7 @@ impl HTMLElementMethods for HTMLElement {
             }
         } else {
             self.upcast::<EventTarget>()
-                .get_event_handler_common("blur")
+                .get_event_handler_common("blur", CanGc::note())
         }
     }
 
@@ -247,7 +274,7 @@ impl HTMLElementMethods for HTMLElement {
             }
         } else {
             self.upcast::<EventTarget>()
-                .get_event_handler_common("focus")
+                .get_event_handler_common("focus", CanGc::note())
         }
     }
 
@@ -275,7 +302,7 @@ impl HTMLElementMethods for HTMLElement {
             }
         } else {
             self.upcast::<EventTarget>()
-                .get_event_handler_common("resize")
+                .get_event_handler_common("resize", CanGc::note())
         }
     }
 
@@ -303,7 +330,7 @@ impl HTMLElementMethods for HTMLElement {
             }
         } else {
             self.upcast::<EventTarget>()
-                .get_event_handler_common("scroll")
+                .get_event_handler_common("scroll", CanGc::note())
         }
     }
 
@@ -357,7 +384,7 @@ impl HTMLElementMethods for HTMLElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-click
-    fn Click(&self) {
+    fn Click(&self, can_gc: CanGc) {
         let element = self.as_element();
         if element.disabled_state() {
             return;
@@ -368,151 +395,151 @@ impl HTMLElementMethods for HTMLElement {
         element.set_click_in_progress(true);
 
         self.upcast::<Node>()
-            .fire_synthetic_mouse_event_not_trusted(DOMString::from("click"));
+            .fire_synthetic_mouse_event_not_trusted(DOMString::from("click"), can_gc);
         element.set_click_in_progress(false);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-focus
-    fn Focus(&self) {
+    fn Focus(&self, can_gc: CanGc) {
         // TODO: Mark the element as locked for focus and run the focusing steps.
         // https://html.spec.whatwg.org/multipage/#focusing-steps
         let document = document_from_node(self);
-        document.request_focus(Some(self.upcast()), FocusType::Element);
+        document.request_focus(Some(self.upcast()), FocusType::Element, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-blur
-    fn Blur(&self) {
+    fn Blur(&self, can_gc: CanGc) {
         // TODO: Run the unfocusing steps.
         if !self.as_element().focus_state() {
             return;
         }
         // https://html.spec.whatwg.org/multipage/#unfocusing-steps
         let document = document_from_node(self);
-        document.request_focus(None, FocusType::Element);
+        document.request_focus(None, FocusType::Element, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetparent
-    fn GetOffsetParent(&self) -> Option<DomRoot<Element>> {
+    fn GetOffsetParent(&self, can_gc: CanGc) -> Option<DomRoot<Element>> {
         if self.is::<HTMLBodyElement>() || self.is::<HTMLHtmlElement>() {
             return None;
         }
 
         let node = self.upcast::<Node>();
         let window = window_from_node(self);
-        let (element, _) = window.offset_parent_query(node);
+        let (element, _) = window.offset_parent_query(node, can_gc);
 
         element
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsettop
-    fn OffsetTop(&self) -> i32 {
+    fn OffsetTop(&self, can_gc: CanGc) -> i32 {
         if self.is::<HTMLBodyElement>() {
             return 0;
         }
 
         let node = self.upcast::<Node>();
         let window = window_from_node(self);
-        let (_, rect) = window.offset_parent_query(node);
+        let (_, rect) = window.offset_parent_query(node, can_gc);
 
         rect.origin.y.to_nearest_px()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetleft
-    fn OffsetLeft(&self) -> i32 {
+    fn OffsetLeft(&self, can_gc: CanGc) -> i32 {
         if self.is::<HTMLBodyElement>() {
             return 0;
         }
 
         let node = self.upcast::<Node>();
         let window = window_from_node(self);
-        let (_, rect) = window.offset_parent_query(node);
+        let (_, rect) = window.offset_parent_query(node, can_gc);
 
         rect.origin.x.to_nearest_px()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetwidth
-    fn OffsetWidth(&self) -> i32 {
+    fn OffsetWidth(&self, can_gc: CanGc) -> i32 {
         let node = self.upcast::<Node>();
         let window = window_from_node(self);
-        let (_, rect) = window.offset_parent_query(node);
+        let (_, rect) = window.offset_parent_query(node, can_gc);
 
         rect.size.width.to_nearest_px()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetheight
-    fn OffsetHeight(&self) -> i32 {
+    fn OffsetHeight(&self, can_gc: CanGc) -> i32 {
         let node = self.upcast::<Node>();
         let window = window_from_node(self);
-        let (_, rect) = window.offset_parent_query(node);
+        let (_, rect) = window.offset_parent_query(node, can_gc);
 
         rect.size.height.to_nearest_px()
     }
 
-    // https://html.spec.whatwg.org/multipage/#the-innertext-idl-attribute
-    fn InnerText(&self) -> DOMString {
-        let node = self.upcast::<Node>();
-        let window = window_from_node(node);
-        let element = self.as_element();
-
-        // Step 1.
-        let element_not_rendered = !node.is_connected() || !element.has_css_layout_box();
-        if element_not_rendered {
-            return node.GetTextContent().unwrap();
-        }
-
-        window.layout_reflow(QueryMsg::ElementInnerTextQuery);
-        let text = window
-            .with_layout(|layout| layout.query_element_inner_text(node.to_trusted_node_address()))
-            .unwrap_or_default();
-        DOMString::from(text)
+    /// <https://html.spec.whatwg.org/multipage/#the-innertext-idl-attribute>
+    fn InnerText(&self, can_gc: CanGc) -> DOMString {
+        self.get_inner_outer_text(can_gc)
     }
 
-    // https://html.spec.whatwg.org/multipage/#the-innertext-idl-attribute
+    /// <https://html.spec.whatwg.org/multipage/#set-the-inner-text-steps>
     fn SetInnerText(&self, input: DOMString) {
-        // Step 1.
+        // Step 1: Let fragment be the rendered text fragment for value given element's node
+        // document.
+        let fragment = self.rendered_text_fragment(input);
+
+        // Step 2: Replace all with fragment within element.
+        Node::replace_all(Some(fragment.upcast()), self.upcast::<Node>());
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-outertext>
+    fn GetOuterText(&self, can_gc: CanGc) -> Fallible<DOMString> {
+        Ok(self.get_inner_outer_text(can_gc))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#the-innertext-idl-attribute:dom-outertext-2>
+    fn SetOuterText(&self, input: DOMString) -> Fallible<()> {
+        // Step 1: If this's parent is null, then throw a "NoModificationAllowedError" DOMException.
+        let Some(parent) = self.upcast::<Node>().GetParentNode() else {
+            return Err(Error::NoModificationAllowed);
+        };
+
+        let node = self.upcast::<Node>();
         let document = document_from_node(self);
 
-        // Step 2.
-        let fragment = DocumentFragment::new(&document);
+        // Step 2: Let next be this's next sibling.
+        let next = node.GetNextSibling();
 
-        // Step 3. The given value is already named 'input'.
+        // Step 3: Let previous be this's previous sibling.
+        let previous = node.GetPreviousSibling();
 
-        // Step 4.
-        let mut position = input.chars().peekable();
+        // Step 4: Let fragment be the rendered text fragment for the given value given this's node
+        // document.
+        let fragment = self.rendered_text_fragment(input);
 
-        // Step 5.
-        let mut text = String::new();
+        // Step 5: If fragment has no children, then append a new Text node whose data is the empty
+        // string and node document is this's node document to fragment.
+        if fragment.upcast::<Node>().children_count() == 0 {
+            let text_node = Text::new(DOMString::from("".to_owned()), &document);
 
-        // Step 6.
-        while let Some(ch) = position.next() {
-            match ch {
-                '\u{000A}' | '\u{000D}' => {
-                    if ch == '\u{000D}' && position.peek() == Some(&'\u{000A}') {
-                        // a \r\n pair should only generate one <br>,
-                        // so just skip the \r.
-                        position.next();
-                    }
+            fragment.upcast::<Node>().AppendChild(text_node.upcast())?;
+        }
 
-                    if !text.is_empty() {
-                        append_text_node_to_fragment(&document, &fragment, text);
-                        text = String::new();
-                    }
+        // Step 6: Replace this with fragment within this's parent.
+        parent.ReplaceChild(fragment.upcast(), node)?;
 
-                    let br = HTMLBRElement::new(local_name!("br"), None, &document, None);
-                    fragment.upcast::<Node>().AppendChild(br.upcast()).unwrap();
-                },
-                _ => {
-                    text.push(ch);
-                },
+        // Step 7: If next is non-null and next's previous sibling is a Text node, then merge with
+        // the next text node given next's previous sibling.
+        if let Some(next_sibling) = next {
+            if let Some(node) = next_sibling.GetPreviousSibling() {
+                Self::merge_with_the_next_text_node(node);
             }
         }
 
-        if !text.is_empty() {
-            append_text_node_to_fragment(&document, &fragment, text);
+        // Step 8: If previous is a Text node, then merge with the next text node given previous.
+        if let Some(previous) = previous {
+            Self::merge_with_the_next_text_node(previous)
         }
 
-        // Step 7.
-        Node::replace_all(Some(fragment.upcast()), self.upcast::<Node>());
+        Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-translate
@@ -591,6 +618,17 @@ impl HTMLElementMethods for HTMLElement {
         internals.set_attached();
         Ok(internals)
     }
+
+    // https://html.spec.whatwg.org/multipage/#dom-fe-autofocus
+    fn Autofocus(&self) -> bool {
+        self.element.has_attribute(&local_name!("autofocus"))
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-fe-autofocus
+    fn SetAutofocus(&self, autofocus: bool) {
+        self.element
+            .set_bool_attribute(&local_name!("autofocus"), autofocus);
+    }
 }
 
 fn append_text_node_to_fragment(document: &Document, fragment: &DocumentFragment, text: String) {
@@ -662,7 +700,7 @@ impl HTMLElement {
             .chars()
             .skip_while(|&ch| ch != '\u{2d}')
             .nth(1)
-            .map_or(false, |ch| ch.is_ascii_lowercase())
+            .is_some_and(|ch| ch.is_ascii_lowercase())
         {
             return Err(Error::Syntax);
         }
@@ -886,6 +924,88 @@ impl HTMLElement {
             None => false,
         }
     }
+
+    /// <https://html.spec.whatwg.org/multipage/#rendered-text-fragment>
+    fn rendered_text_fragment(&self, input: DOMString) -> DomRoot<DocumentFragment> {
+        // Step 1: Let fragment be a new DocumentFragment whose node document is document.
+        let document = document_from_node(self);
+        let fragment = DocumentFragment::new(&document);
+
+        // Step 2: Let position be a position variable for input, initially pointing at the start
+        // of input.
+        let mut position = input.chars().peekable();
+
+        // Step 3: Let text be the empty string.
+        let mut text = String::new();
+
+        // Step 4
+        while let Some(ch) = position.next() {
+            match ch {
+                // While position is not past the end of input, and the code point at position is
+                // either U+000A LF or U+000D CR:
+                '\u{000A}' | '\u{000D}' => {
+                    if ch == '\u{000D}' && position.peek() == Some(&'\u{000A}') {
+                        // a \r\n pair should only generate one <br>,
+                        // so just skip the \r.
+                        position.next();
+                    }
+
+                    if !text.is_empty() {
+                        append_text_node_to_fragment(&document, &fragment, text);
+                        text = String::new();
+                    }
+
+                    let br = HTMLBRElement::new(local_name!("br"), None, &document, None);
+                    fragment.upcast::<Node>().AppendChild(br.upcast()).unwrap();
+                },
+                _ => {
+                    // Collect a sequence of code points that are not U+000A LF or U+000D CR from
+                    // input given position, and set text to the result.
+                    text.push(ch);
+                },
+            }
+        }
+
+        // If text is not the empty string, then append a new Text node whose data is text and node
+        // document is document to fragment.
+        if !text.is_empty() {
+            append_text_node_to_fragment(&document, &fragment, text);
+        }
+
+        fragment
+    }
+
+    /// Checks whether a given [`DomRoot<Node>`] and its next sibling are
+    /// of type [`Text`], and if so merges them into a single [`Text`]
+    /// node.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/#merge-with-the-next-text-node>
+    fn merge_with_the_next_text_node(node: DomRoot<Node>) {
+        // Make sure node is a Text node
+        if !node.is::<Text>() {
+            return;
+        }
+
+        // Step 1: Let next be node's next sibling.
+        let next = match node.GetNextSibling() {
+            Some(next) => next,
+            None => return,
+        };
+
+        // Step 2: If next is not a Text node, then return.
+        if !next.is::<Text>() {
+            return;
+        }
+        // Step 3: Replace data with node, node's data's length, 0, and next's data.
+        let node_chars = node.downcast::<CharacterData>().expect("Node is Text");
+        let next_chars = next.downcast::<CharacterData>().expect("Next node is Text");
+        node_chars
+            .ReplaceData(node_chars.Length(), 0, next_chars.Data())
+            .expect("Got chars from Text");
+
+        // Step 4:Remove next.
+        next.remove_self();
+    }
 }
 
 impl VirtualMethods for HTMLElement {
@@ -958,7 +1078,7 @@ impl VirtualMethods for HTMLElement {
             super_type.bind_to_tree(context);
         }
         let element = self.as_element();
-        element.update_sequentially_focusable_status();
+        element.update_sequentially_focusable_status(CanGc::note());
 
         // Binding to a tree can disable a form control if one of the new
         // ancestors is a fieldset.
@@ -1019,7 +1139,7 @@ impl Activatable for HTMLElement {
     }
 
     // Basically used to make the HTMLSummaryElement activatable (which has no IDL definition)
-    fn activation_behavior(&self, _event: &Event, _target: &EventTarget) {
+    fn activation_behavior(&self, _event: &Event, _target: &EventTarget, _can_gc: CanGc) {
         self.summary_activation_behavior();
     }
 }

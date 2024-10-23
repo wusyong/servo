@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
+use cookie::Cookie;
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
 use embedder_traits::EmbedderProxy;
@@ -43,6 +44,7 @@ use crate::async_runtime::HANDLE;
 use crate::connector::{
     create_http_client, create_tls_config, CACertificates, CertificateErrorOverrideManager,
 };
+use crate::cookie::ServoCookie;
 use crate::cookie_storage::CookieStorage;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::methods::{fetch, CancellationListener, FetchContext};
@@ -50,8 +52,9 @@ use crate::filemanager_thread::FileManager;
 use crate::hsts::HstsList;
 use crate::http_cache::HttpCache;
 use crate::http_loader::{http_redirect_fetch, HttpState};
+use crate::protocols::ProtocolRegistry;
 use crate::storage_thread::StorageThreadFactory;
-use crate::{cookie, websocket_loader};
+use crate::websocket_loader;
 
 /// Load a file with CA certificate and produce a RootCertStore with the results.
 fn load_root_cert_store_from_file(file_path: String) -> io::Result<RootCertStore> {
@@ -74,6 +77,7 @@ pub fn new_resource_threads(
     config_dir: Option<PathBuf>,
     certificate_path: Option<String>,
     ignore_certificate_errors: bool,
+    protocols: Arc<ProtocolRegistry>,
 ) -> (ResourceThreads, ResourceThreads) {
     let ca_certificates = match certificate_path {
         Some(path) => match load_root_cert_store_from_file(path) {
@@ -95,6 +99,7 @@ pub fn new_resource_threads(
         config_dir.clone(),
         ca_certificates,
         ignore_certificate_errors,
+        protocols,
     );
     let storage: IpcSender<StorageThreadMsg> = StorageThreadFactory::new(config_dir);
     (
@@ -114,6 +119,7 @@ pub fn new_core_resource_thread(
     config_dir: Option<PathBuf>,
     ca_certificates: CACertificates,
     ignore_certificate_errors: bool,
+    protocols: Arc<ProtocolRegistry>,
 ) -> (CoreResourceThread, CoreResourceThread) {
     let (public_setup_chan, public_setup_port) = ipc::channel().unwrap();
     let (private_setup_chan, private_setup_port) = ipc::channel().unwrap();
@@ -139,7 +145,14 @@ pub fn new_core_resource_thread(
             };
 
             mem_profiler_chan.run_with_memory_reporting(
-                || (channel_manager.start(public_setup_port, private_setup_port, report_port)),
+                || {
+                    channel_manager.start(
+                        public_setup_port,
+                        private_setup_port,
+                        report_port,
+                        protocols,
+                    )
+                },
                 String::from("network-cache-reporter"),
                 report_chan,
                 |report_chan| report_chan,
@@ -213,6 +226,7 @@ impl ResourceChannelManager {
         public_receiver: IpcReceiver<CoreResourceMsg>,
         private_receiver: IpcReceiver<CoreResourceMsg>,
         memory_reporter: IpcReceiver<ReportsChan>,
+        protocols: Arc<ProtocolRegistry>,
     ) {
         let (public_http_state, private_http_state) = create_http_states(
             self.config_dir.as_deref(),
@@ -246,7 +260,7 @@ impl ResourceChannelManager {
                         &public_http_state
                     };
                     if let Ok(msg) = data.to() {
-                        if !self.process_msg(msg, group) {
+                        if !self.process_msg(msg, group, Arc::clone(&protocols)) {
                             return;
                         }
                     }
@@ -281,13 +295,22 @@ impl ResourceChannelManager {
     }
 
     /// Returns false if the thread should exit.
-    fn process_msg(&mut self, msg: CoreResourceMsg, http_state: &Arc<HttpState>) -> bool {
+    fn process_msg(
+        &mut self,
+        msg: CoreResourceMsg,
+        http_state: &Arc<HttpState>,
+        protocols: Arc<ProtocolRegistry>,
+    ) -> bool {
         match msg {
             CoreResourceMsg::Fetch(req_init, channels) => match channels {
-                FetchChannels::ResponseMsg(sender, cancel_chan) => {
-                    self.resource_manager
-                        .fetch(req_init, None, sender, http_state, cancel_chan)
-                },
+                FetchChannels::ResponseMsg(sender, cancel_chan) => self.resource_manager.fetch(
+                    req_init,
+                    None,
+                    sender,
+                    http_state,
+                    cancel_chan,
+                    protocols,
+                ),
                 FetchChannels::WebSocket {
                     event_sender,
                     action_receiver,
@@ -297,10 +320,14 @@ impl ResourceChannelManager {
                     action_receiver,
                     http_state,
                 ),
-                FetchChannels::Prefetch => {
-                    self.resource_manager
-                        .fetch(req_init, None, DiscardFetch, http_state, None)
-                },
+                FetchChannels::Prefetch => self.resource_manager.fetch(
+                    req_init,
+                    None,
+                    DiscardFetch,
+                    http_state,
+                    None,
+                    protocols,
+                ),
             },
             CoreResourceMsg::DeleteCookies(request) => {
                 http_state
@@ -310,12 +337,19 @@ impl ResourceChannelManager {
                     .clear_storage(&request);
                 return true;
             },
-            CoreResourceMsg::FetchRedirect(req_init, res_init, sender, cancel_chan) => self
-                .resource_manager
-                .fetch(req_init, Some(res_init), sender, http_state, cancel_chan),
+            CoreResourceMsg::FetchRedirect(req_init, res_init, sender, cancel_chan) => {
+                self.resource_manager.fetch(
+                    req_init,
+                    Some(res_init),
+                    sender,
+                    http_state,
+                    cancel_chan,
+                    protocols,
+                )
+            },
             CoreResourceMsg::SetCookieForUrl(request, cookie, source) => self
                 .resource_manager
-                .set_cookie_for_url(&request, cookie.into_inner(), source, http_state),
+                .set_cookie_for_url(&request, cookie.into_inner().to_owned(), source, http_state),
             CoreResourceMsg::SetCookiesForUrl(request, cookies, source) => {
                 for cookie in cookies {
                     self.resource_manager.set_cookie_for_url(
@@ -637,11 +671,11 @@ impl CoreResourceManager {
     fn set_cookie_for_url(
         &mut self,
         request: &ServoUrl,
-        cookie: cookie_rs::Cookie<'static>,
+        cookie: Cookie<'static>,
         source: CookieSource,
         http_state: &Arc<HttpState>,
     ) {
-        if let Some(cookie) = cookie::Cookie::new_wrapped(cookie, request, source) {
+        if let Some(cookie) = ServoCookie::new_wrapped(cookie, request, source) {
             let mut cookie_jar = http_state.cookie_jar.write().unwrap();
             cookie_jar.push(cookie, request, source)
         }
@@ -654,6 +688,7 @@ impl CoreResourceManager {
         mut sender: Target,
         http_state: &Arc<HttpState>,
         cancel_chan: Option<IpcReceiver<()>>,
+        protocols: Arc<ProtocolRegistry>,
     ) {
         let http_state = http_state.clone();
         let ua = self.user_agent.clone();
@@ -702,6 +737,7 @@ impl CoreResourceManager {
                 file_token,
                 cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(cancel_chan))),
                 timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(request.timing_type()))),
+                protocols,
             };
 
             match res_init_ {

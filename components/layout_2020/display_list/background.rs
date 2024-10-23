@@ -9,7 +9,7 @@ use style::computed_values::background_clip::single_value::T as Clip;
 use style::computed_values::background_origin::single_value::T as Origin;
 use style::properties::ComputedValues;
 use style::values::computed::background::BackgroundSize as Size;
-use style::values::computed::{Length, LengthPercentage};
+use style::values::computed::LengthPercentage;
 use style::values::specified::background::{
     BackgroundRepeat as RepeatXY, BackgroundRepeatKeyword as Repeat,
 };
@@ -17,7 +17,7 @@ use webrender_api::{self as wr, units};
 use wr::units::LayoutSize;
 use wr::ClipChainId;
 
-use crate::replaced::IntrinsicSizes;
+use crate::replaced::NaturalSizes;
 
 pub(super) struct BackgroundLayer {
     pub common: wr::CommonItemProperties,
@@ -167,7 +167,7 @@ pub(super) fn layout_layer(
     painter: &BackgroundPainter,
     builder: &mut super::DisplayListBuilder,
     layer_index: usize,
-    intrinsic: IntrinsicSizes,
+    natural_sizes: NaturalSizes,
 ) -> Option<BackgroundLayer> {
     let painting_area = painter.painting_area(fragment_builder, builder, layer_index);
     let positioning_area = painter.positioning_area(fragment_builder, layer_index);
@@ -180,19 +180,19 @@ pub(super) fn layout_layer(
     }
     let size_contain_or_cover = |background_size| {
         let mut tile_size = positioning_area.size();
-        if let Some(intrinsic_ratio) = intrinsic.ratio {
+        if let Some(natural_ratio) = natural_sizes.ratio {
             let positioning_ratio = positioning_area.size().width / positioning_area.size().height;
             // Whether the tile width (as opposed to height)
             // is scaled to that of the positioning area
             let fit_width = match background_size {
-                ContainOrCover::Contain => positioning_ratio <= intrinsic_ratio,
-                ContainOrCover::Cover => positioning_ratio > intrinsic_ratio,
+                ContainOrCover::Contain => positioning_ratio <= natural_ratio,
+                ContainOrCover::Cover => positioning_ratio > natural_ratio,
             };
             // The other dimension needs to be adjusted
             if fit_width {
-                tile_size.height = tile_size.width / intrinsic_ratio
+                tile_size.height = tile_size.width / natural_ratio
             } else {
-                tile_size.width = tile_size.height * intrinsic_ratio
+                tile_size.width = tile_size.height * natural_ratio
             }
         }
         tile_size
@@ -204,44 +204,44 @@ pub(super) fn layout_layer(
         Size::Cover => size_contain_or_cover(ContainOrCover::Cover),
         Size::ExplicitSize { width, height } => {
             let mut width = width.non_auto().map(|lp| {
-                lp.0.percentage_relative_to(Length::new(positioning_area.size().width))
+                lp.0.to_used_value(Au::from_f32_px(positioning_area.size().width))
             });
             let mut height = height.non_auto().map(|lp| {
-                lp.0.percentage_relative_to(Length::new(positioning_area.size().height))
+                lp.0.to_used_value(Au::from_f32_px(positioning_area.size().height))
             });
 
             if width.is_none() && height.is_none() {
                 // Both computed values are 'auto':
-                // use intrinsic sizes, treating missing width or height as 'auto'
-                width = intrinsic.width.map(|v| v.into());
-                height = intrinsic.height.map(|v| v.into());
+                // use natural sizes, treating missing width or height as 'auto'
+                width = natural_sizes.width;
+                height = natural_sizes.height;
             }
 
             match (width, height) {
-                (Some(w), Some(h)) => units::LayoutSize::new(w.px(), h.px()),
+                (Some(w), Some(h)) => units::LayoutSize::new(w.to_f32_px(), h.to_f32_px()),
                 (Some(w), None) => {
-                    let h = if let Some(intrinsic_ratio) = intrinsic.ratio {
-                        w / intrinsic_ratio
-                    } else if let Some(intrinsic_height) = intrinsic.height {
-                        intrinsic_height.into()
+                    let h = if let Some(natural_ratio) = natural_sizes.ratio {
+                        w.scale_by(1.0 / natural_ratio)
+                    } else if let Some(natural_height) = natural_sizes.height {
+                        natural_height
                     } else {
                         // Treated as 100%
-                        Au::from_f32_px(positioning_area.size().height).into()
+                        Au::from_f32_px(positioning_area.size().height)
                     };
-                    units::LayoutSize::new(w.px(), h.px())
+                    units::LayoutSize::new(w.to_f32_px(), h.to_f32_px())
                 },
                 (None, Some(h)) => {
-                    let w = if let Some(intrinsic_ratio) = intrinsic.ratio {
-                        h * intrinsic_ratio
-                    } else if let Some(intrinsic_width) = intrinsic.width {
-                        intrinsic_width.into()
+                    let w = if let Some(natural_ratio) = natural_sizes.ratio {
+                        h.scale_by(natural_ratio)
+                    } else if let Some(natural_width) = natural_sizes.width {
+                        natural_width
                     } else {
                         // Treated as 100%
-                        Au::from_f32_px(positioning_area.size().width).into()
+                        Au::from_f32_px(positioning_area.size().width)
                     };
-                    units::LayoutSize::new(w.px(), h.px())
+                    units::LayoutSize::new(w.to_f32_px(), h.to_f32_px())
                 },
-                // Both comptued values were 'auto', and neither intrinsic size is present
+                // Both comptued values were 'auto', and neither natural size is present
                 (None, None) => size_contain_or_cover(ContainOrCover::Contain),
             }
         },
@@ -299,8 +299,8 @@ fn layout_1d(
     }
     // https://drafts.csswg.org/css-backgrounds/#background-position
     let mut position = position
-        .percentage_relative_to(Length::new(positioning_area_size - *tile_size))
-        .px();
+        .to_used_value(Au::from_f32_px(positioning_area_size - *tile_size))
+        .to_f32_px();
     let mut tile_spacing = 0.0;
     // https://drafts.csswg.org/css-backgrounds/#background-repeat
     if let Repeat::Space = repeat {

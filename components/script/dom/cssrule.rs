@@ -119,6 +119,8 @@ impl CSSRule {
             StyleCssRule::Margin(_) => unimplemented!(),            // TODO
             StyleCssRule::Scope(_) => unimplemented!(),             // TODO
             StyleCssRule::StartingStyle(_) => unimplemented!(),     // TODO
+            StyleCssRule::PositionTry(_) => unimplemented!(),       // TODO
+            StyleCssRule::NestedDeclarations(_) => unimplemented!(), // TODO
         }
     }
 

@@ -17,8 +17,8 @@ use webxr_api::{
 
 use crate::dom::bindings::codegen::Bindings::DOMPointBinding::DOMPointInit;
 use crate::dom::bindings::codegen::Bindings::FakeXRDeviceBinding::{
-    FakeXRDeviceMethods, FakeXRRegionType, FakeXRRigidTransformInit, FakeXRViewInit,
-    FakeXRWorldInit,
+    FakeXRBoundsPoint, FakeXRDeviceMethods, FakeXRRegionType, FakeXRRigidTransformInit,
+    FakeXRViewInit, FakeXRWorldInit,
 };
 use crate::dom::bindings::codegen::Bindings::FakeXRInputControllerBinding::FakeXRInputSourceInit;
 use crate::dom::bindings::codegen::Bindings::XRInputSourceBinding::{
@@ -30,9 +30,10 @@ use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::refcounted::TrustedPromise;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::fakexrinputcontroller::FakeXRInputController;
+use crate::dom::fakexrinputcontroller::{init_to_mock_buttons, FakeXRInputController};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
+use crate::script_runtime::CanGc;
 use crate::task_source::TaskSource;
 
 #[dom_struct]
@@ -80,7 +81,7 @@ pub fn view<Eye>(view: &FakeXRViewInit) -> Fallible<MockViewInit<Eye>> {
     let size = Size2D::new(view.resolution.width, view.resolution.height);
     let origin = match view.eye {
         XREye::Right => Point2D::new(size.width, 0),
-        _ => Point2D::new(0, 0),
+        _ => Point2D::zero(),
     };
     let viewport = Rect::new(origin, size);
 
@@ -183,10 +184,15 @@ impl From<FakeXRRegionType> for EntityType {
 
 impl FakeXRDeviceMethods for FakeXRDevice {
     /// <https://github.com/immersive-web/webxr-test-api/blob/master/explainer.md>
-    fn SetViews(&self, views: Vec<FakeXRViewInit>) -> Fallible<()> {
+    fn SetViews(
+        &self,
+        views: Vec<FakeXRViewInit>,
+        _secondary_views: Option<Vec<FakeXRViewInit>>,
+    ) -> Fallible<()> {
         let _ = self
             .sender
             .send(MockDeviceMsg::SetViews(get_views(&views)?));
+        // TODO: Support setting secondary views for mock backend
         Ok(())
     }
 
@@ -262,7 +268,10 @@ impl FakeXRDeviceMethods for FakeXRDevice {
 
         let profiles = init.profiles.iter().cloned().map(String::from).collect();
 
-        // XXXManishearth deal with supportedButtons and selection*
+        let mut supported_buttons = vec![];
+        if let Some(ref buttons) = init.supportedButtons {
+            supported_buttons.extend(init_to_mock_buttons(buttons));
+        }
 
         let source = InputSource {
             handedness,
@@ -277,6 +286,7 @@ impl FakeXRDeviceMethods for FakeXRDevice {
             source,
             pointer_origin,
             grip_origin,
+            supported_buttons,
         };
 
         let global = self.global();
@@ -288,17 +298,18 @@ impl FakeXRDeviceMethods for FakeXRDevice {
     }
 
     /// <https://immersive-web.github.io/webxr-test-api/#dom-fakexrdevice-disconnect>
-    fn Disconnect(&self) -> Rc<Promise> {
+    fn Disconnect(&self, can_gc: CanGc) -> Rc<Promise> {
         let global = self.global();
-        let p = Promise::new(&global);
+        let p = Promise::new(&global, can_gc);
         let mut trusted = Some(TrustedPromise::new(p.clone()));
         let (task_source, canceller) = global
             .as_window()
             .task_manager()
             .dom_manipulation_task_source_with_canceller();
         let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
-        ROUTER.add_route(
-            receiver.to_opaque(),
+
+        ROUTER.add_typed_route(
+            receiver.to_ipc_receiver(),
             Box::new(move |_| {
                 let trusted = trusted
                     .take()
@@ -308,6 +319,30 @@ impl FakeXRDeviceMethods for FakeXRDevice {
         );
         self.disconnect(sender);
         p
+    }
+
+    /// <https://immersive-web.github.io/webxr-test-api/#dom-fakexrdevice-setboundsgeometry>
+    fn SetBoundsGeometry(&self, bounds_coodinates: Vec<FakeXRBoundsPoint>) -> Fallible<()> {
+        if bounds_coodinates.len() < 3 {
+            return Err(Error::Type(
+                "Bounds geometry must contain at least 3 points".into(),
+            ));
+        }
+        let coords = bounds_coodinates
+            .iter()
+            .map(|coord| {
+                let x = *coord.x.unwrap() as f32;
+                let y = *coord.z.unwrap() as f32;
+                Point2D::new(x, y)
+            })
+            .collect();
+        let _ = self.sender.send(MockDeviceMsg::SetBoundsGeometry(coords));
+        Ok(())
+    }
+
+    /// <https://immersive-web.github.io/webxr-test-api/#dom-fakexrdevice-simulateresetpose>
+    fn SimulateResetPose(&self) {
+        let _ = self.sender.send(MockDeviceMsg::SimulateResetPose);
     }
 }
 
@@ -327,6 +362,7 @@ impl From<XRTargetRayMode> for TargetRayMode {
             XRTargetRayMode::Gaze => TargetRayMode::Gaze,
             XRTargetRayMode::Tracked_pointer => TargetRayMode::TrackedPointer,
             XRTargetRayMode::Screen => TargetRayMode::Screen,
+            XRTargetRayMode::Transient_pointer => TargetRayMode::TransientPointer,
         }
     }
 }

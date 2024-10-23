@@ -187,8 +187,12 @@ where
     fn process(&mut self, node: &ConcreteThreadSafeLayoutNode);
 }
 
-#[allow(unsafe_code)]
+/// # Safety
+///
+/// This function modifies the DOM node represented by the `node` argument, so it is imperitive
+/// that no other thread is modifying the node at the same time.
 #[inline]
+#[allow(unsafe_code)]
 pub unsafe fn construct_flows_at_ancestors<'dom>(
     context: &LayoutContext,
     mut node: impl LayoutNode<'dom>,
@@ -215,7 +219,7 @@ fn construct_flows_at<'dom>(context: &LayoutContext, node: impl LayoutNode<'dom>
         if nonincremental_layout ||
             tnode.restyle_damage() != RestyleDamage::empty() ||
             node.as_element()
-                .map_or(false, |el| el.has_dirty_descendants())
+                .is_some_and(|el| el.has_dirty_descendants())
         {
             let mut flow_constructor = FlowConstructor::new(context);
             if nonincremental_layout || !flow_constructor.repair_if_possible(&tnode) {

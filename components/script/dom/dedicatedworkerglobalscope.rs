@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use base::id::{BrowsingContextId, PipelineId, TopLevelBrowsingContextId};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use devtools_traits::DevtoolScriptControlMsg;
 use dom_struct::dom_struct;
@@ -15,13 +16,11 @@ use ipc_channel::router::ROUTER;
 use js::jsapi::{Heap, JSContext, JSObject, JS_AddInterruptCallback};
 use js::jsval::UndefinedValue;
 use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
-use msg::constellation_msg::{BrowsingContextId, PipelineId, TopLevelBrowsingContextId};
 use net_traits::image_cache::ImageCache;
 use net_traits::request::{
     CredentialsMode, Destination, ParserMetadata, Referrer, RequestBuilder, RequestMode,
 };
 use net_traits::IpcSend;
-use parking_lot::Mutex;
 use script_traits::{WorkerGlobalScopeInit, WorkerScriptLoadOrigin};
 use servo_rand::random;
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -35,7 +34,7 @@ use crate::dom::abstractworkerglobalscope::{
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::DedicatedWorkerGlobalScopeBinding;
 use crate::dom::bindings::codegen::Bindings::DedicatedWorkerGlobalScopeBinding::DedicatedWorkerGlobalScopeMethods;
-use crate::dom::bindings::codegen::Bindings::MessagePortBinding::PostMessageOptions;
+use crate::dom::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeOptions;
 use crate::dom::bindings::codegen::Bindings::WorkerBinding::WorkerType;
 use crate::dom::bindings::error::{ErrorInfo, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
@@ -48,7 +47,7 @@ use crate::dom::errorevent::ErrorEvent;
 use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::identityhub::Identities;
+use crate::dom::identityhub::IdentityHub;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::worker::{TrustedWorkerAddress, Worker};
 use crate::dom::workerglobalscope::WorkerGlobalScope;
@@ -56,8 +55,8 @@ use crate::fetch::load_whole_resource;
 use crate::realms::{enter_realm, AlreadyInRealm, InRealm};
 use crate::script_runtime::ScriptThreadEventCategory::WorkerEvent;
 use crate::script_runtime::{
-    new_child_runtime, CommonScriptMsg, ContextForRequestInterrupt, JSContext as SafeJSContext,
-    Runtime, ScriptChan, ScriptPort,
+    CanGc, CommonScriptMsg, JSContext as SafeJSContext, Runtime, ScriptChan, ScriptPort,
+    ThreadSafeJSContext,
 };
 use crate::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
 use crate::task_source::networking::NetworkingTaskSource;
@@ -86,7 +85,10 @@ impl<'a> AutoWorkerReset<'a> {
 
 impl<'a> Drop for AutoWorkerReset<'a> {
     fn drop(&mut self) {
-        *self.workerscope.worker.borrow_mut() = self.old_worker.clone();
+        self.workerscope
+            .worker
+            .borrow_mut()
+            .clone_from(&self.old_worker)
     }
 }
 
@@ -210,8 +212,8 @@ impl WorkerEventLoopMethods for DedicatedWorkerGlobalScope {
         &self.task_queue
     }
 
-    fn handle_event(&self, event: MixedMessage) -> bool {
-        self.handle_mixed_message(event)
+    fn handle_event(&self, event: MixedMessage, can_gc: CanGc) -> bool {
+        self.handle_mixed_message(event, can_gc)
     }
 
     fn handle_worker_post_event(&self, worker: &TrustedWorkerAddress) -> Option<AutoWorkerReset> {
@@ -219,15 +221,15 @@ impl WorkerEventLoopMethods for DedicatedWorkerGlobalScope {
         Some(ar)
     }
 
-    fn from_control_msg(&self, msg: DedicatedWorkerControlMsg) -> MixedMessage {
+    fn from_control_msg(msg: DedicatedWorkerControlMsg) -> MixedMessage {
         MixedMessage::Control(msg)
     }
 
-    fn from_worker_msg(&self, msg: DedicatedWorkerScriptMsg) -> MixedMessage {
+    fn from_worker_msg(msg: DedicatedWorkerScriptMsg) -> MixedMessage {
         MixedMessage::Worker(msg)
     }
 
-    fn from_devtools_msg(&self, msg: DevtoolScriptControlMsg) -> MixedMessage {
+    fn from_devtools_msg(msg: DevtoolScriptControlMsg) -> MixedMessage {
         MixedMessage::Devtools(msg)
     }
 
@@ -251,7 +253,7 @@ impl DedicatedWorkerGlobalScope {
         closing: Arc<AtomicBool>,
         image_cache: Arc<dyn ImageCache>,
         browsing_context: Option<BrowsingContextId>,
-        gpu_id_hub: Arc<Mutex<Identities>>,
+        gpu_id_hub: Arc<IdentityHub>,
         control_receiver: Receiver<DedicatedWorkerControlMsg>,
     ) -> DedicatedWorkerGlobalScope {
         DedicatedWorkerGlobalScope {
@@ -289,7 +291,7 @@ impl DedicatedWorkerGlobalScope {
         closing: Arc<AtomicBool>,
         image_cache: Arc<dyn ImageCache>,
         browsing_context: Option<BrowsingContextId>,
-        gpu_id_hub: Arc<Mutex<Identities>>,
+        gpu_id_hub: Arc<IdentityHub>,
         control_receiver: Receiver<DedicatedWorkerControlMsg>,
     ) -> DomRoot<DedicatedWorkerGlobalScope> {
         let cx = runtime.cx();
@@ -328,9 +330,9 @@ impl DedicatedWorkerGlobalScope {
         closing: Arc<AtomicBool>,
         image_cache: Arc<dyn ImageCache>,
         browsing_context: Option<BrowsingContextId>,
-        gpu_id_hub: Arc<Mutex<Identities>>,
+        gpu_id_hub: Arc<IdentityHub>,
         control_receiver: Receiver<DedicatedWorkerControlMsg>,
-        context_sender: Sender<ContextForRequestInterrupt>,
+        context_sender: Sender<ThreadSafeJSContext>,
     ) -> JoinHandle<()> {
         let serialized_worker_url = worker_url.to_string();
         let top_level_browsing_context_id = TopLevelBrowsingContextId::installed();
@@ -378,11 +380,11 @@ impl DedicatedWorkerGlobalScope {
                         }),
                         pipeline_id,
                     );
-                    new_child_runtime(parent, Some(task_source))
+                    Runtime::new_with_parent(Some(parent), Some(task_source))
                 };
 
-                let context_for_interrupt = ContextForRequestInterrupt::new(runtime.cx());
-                let _ = context_sender.send(context_for_interrupt.clone());
+                let context_for_interrupt = runtime.thread_safe_js_context();
+                let _ = context_sender.send(context_for_interrupt);
 
                 let (devtools_mpsc_chan, devtools_mpsc_port) = unbounded();
                 ROUTER.route_ipc_receiver_to_crossbeam_sender(
@@ -439,7 +441,7 @@ impl DedicatedWorkerGlobalScope {
                                 TaskSourceName::DOMManipulation,
                             ))
                             .unwrap();
-                        scope.clear_js_runtime(context_for_interrupt);
+                        scope.clear_js_runtime();
                         return;
                     },
                     Ok((metadata, bytes)) => (metadata, bytes),
@@ -454,7 +456,7 @@ impl DedicatedWorkerGlobalScope {
                 }
 
                 if scope.is_closing() {
-                    scope.clear_js_runtime(context_for_interrupt);
+                    scope.clear_js_runtime();
                     return;
                 }
 
@@ -476,7 +478,7 @@ impl DedicatedWorkerGlobalScope {
                             // until the event loop is destroyed,
                             // which happens after the closing flag is set to true.
                             while !scope.is_closing() {
-                                run_worker_event_loop(&*global, Some(&worker));
+                                run_worker_event_loop(&*global, Some(&worker), CanGc::note());
                             }
                         },
                         reporter_name,
@@ -484,7 +486,7 @@ impl DedicatedWorkerGlobalScope {
                         CommonScriptMsg::CollectReports,
                     );
 
-                scope.clear_js_runtime(context_for_interrupt);
+                scope.clear_js_runtime();
             })
             .expect("Thread spawning failed")
     }
@@ -509,7 +511,7 @@ impl DedicatedWorkerGlobalScope {
         (chan, Box::new(rx))
     }
 
-    fn handle_script_event(&self, msg: WorkerScriptMsg) {
+    fn handle_script_event(&self, msg: WorkerScriptMsg, can_gc: CanGc) {
         match msg {
             WorkerScriptMsg::DOMMessage { origin, data } => {
                 let scope = self.upcast::<WorkerGlobalScope>();
@@ -525,9 +527,10 @@ impl DedicatedWorkerGlobalScope {
                         Some(&origin.ascii_serialization()),
                         None,
                         ports,
+                        can_gc,
                     );
                 } else {
-                    MessageEvent::dispatch_error(target, scope.upcast());
+                    MessageEvent::dispatch_error(target, scope.upcast(), can_gc);
                 }
             },
             WorkerScriptMsg::Common(msg) => {
@@ -536,12 +539,12 @@ impl DedicatedWorkerGlobalScope {
         }
     }
 
-    fn handle_mixed_message(&self, msg: MixedMessage) -> bool {
+    fn handle_mixed_message(&self, msg: MixedMessage, can_gc: CanGc) -> bool {
         // FIXME(#26324): `self.worker` is None in devtools messages.
         match msg {
             MixedMessage::Devtools(msg) => match msg {
                 DevtoolScriptControlMsg::EvaluateJS(_pipe_id, string, sender) => {
-                    devtools::handle_evaluate_js(self.upcast(), string, sender)
+                    devtools::handle_evaluate_js(self.upcast(), string, sender, can_gc)
                 },
                 DevtoolScriptControlMsg::WantsLiveNotifications(_pipe_id, bool_val) => {
                     devtools::handle_wants_live_notifications(self.upcast(), bool_val)
@@ -550,7 +553,7 @@ impl DedicatedWorkerGlobalScope {
             },
             MixedMessage::Worker(DedicatedWorkerScriptMsg::CommonWorker(linked_worker, msg)) => {
                 let _ar = AutoWorkerReset::new(self, linked_worker);
-                self.handle_script_event(msg);
+                self.handle_script_event(msg, can_gc);
             },
             MixedMessage::Worker(DedicatedWorkerScriptMsg::WakeUp) => {},
             MixedMessage::Control(DedicatedWorkerControlMsg::Exit) => {
@@ -580,13 +583,14 @@ impl DedicatedWorkerGlobalScope {
                 error_info.lineno,
                 error_info.column,
                 HandleValue::null(),
+                CanGc::note(),
             );
             let event_status =
                 event.upcast::<Event>().fire(worker.upcast::<EventTarget>());
 
             // Step 2.
             if event_status == EventStatus::NotCanceled {
-                global.report_an_error(error_info, HandleValue::null());
+                global.report_an_error(error_info, HandleValue::null(), CanGc::note());
             }
         }));
         self.parent_sender
@@ -611,7 +615,7 @@ impl DedicatedWorkerGlobalScope {
         let global_scope = self.upcast::<GlobalScope>();
         let pipeline_id = global_scope.pipeline_id();
         let task = Box::new(task!(post_worker_message: move || {
-            Worker::handle_message(worker, data);
+            Worker::handle_message(worker, data, CanGc::note());
         }));
         self.parent_sender
             .send(CommonScriptMsg::Task(
@@ -657,7 +661,7 @@ impl DedicatedWorkerGlobalScopeMethods for DedicatedWorkerGlobalScope {
         &self,
         cx: SafeJSContext,
         message: HandleValue,
-        options: RootedTraceableBox<PostMessageOptions>,
+        options: RootedTraceableBox<StructuredSerializeOptions>,
     ) -> ErrorResult {
         let mut rooted = CustomAutoRooter::new(
             options

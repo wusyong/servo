@@ -8,24 +8,25 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use background_hang_monitor::HangMonitorRegister;
+use background_hang_monitor_api::{
+    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangMonitorAlert,
+};
+use base::id::{
+    BrowsingContextId, HistoryStateId, PipelineId, PipelineNamespace, PipelineNamespaceId,
+    PipelineNamespaceRequest, TopLevelBrowsingContextId,
+};
+use base::Epoch;
 use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLPipeline;
 use compositing_traits::{CompositionPipeline, CompositorMsg, CompositorProxy};
 use crossbeam_channel::{unbounded, Sender};
 use devtools_traits::{DevtoolsControlMsg, ScriptToDevtoolsControlMsg};
-use embedder_traits::EventLoopWaker;
-use gfx::font_cache_thread::FontCacheThread;
-use gfx_traits::Epoch;
+use fonts::{SystemFontServiceProxy, SystemFontServiceProxySender};
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
 use ipc_channel::Error;
 use log::{debug, error, warn};
 use media::WindowGLContext;
-use msg::constellation_msg::{
-    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, BrowsingContextId,
-    HangMonitorAlert, HistoryStateId, PipelineId, PipelineNamespace, PipelineNamespaceId,
-    PipelineNamespaceRequest, TopLevelBrowsingContextId,
-};
 use net::image_cache::ImageCacheImpl;
 use net_traits::image_cache::ImageCache;
 use net_traits::ResourceThreads;
@@ -42,6 +43,7 @@ use servo_config::prefs;
 use servo_config::prefs::PrefValue;
 use servo_url::ServoUrl;
 use webrender_api::DocumentId;
+use webrender_traits::CrossProcessCompositorApi;
 
 use crate::event_loop::EventLoop;
 use crate::sandboxing::{spawn_multiprocess, UnprivilegedContent};
@@ -152,8 +154,8 @@ pub struct InitialPipelineState {
     /// A channel to the service worker manager thread
     pub swmanager_thread: IpcSender<SWManagerMsg>,
 
-    /// A channel to the font cache thread.
-    pub font_cache_thread: FontCacheThread,
+    /// A proxy to the system font service, responsible for managing the list of system fonts.
+    pub system_font_service: Arc<SystemFontServiceProxy>,
 
     /// Channels to the resource-related threads.
     pub resource_threads: ResourceThreads,
@@ -182,12 +184,6 @@ pub struct InitialPipelineState {
     /// compositor threads after spawning a pipeline.
     pub prev_throttled: bool,
 
-    /// Webrender api.
-    pub webrender_image_api_sender: net_traits::WebrenderIpcSender,
-
-    /// Webrender api.
-    pub webrender_api_sender: script_traits::WebrenderIpcSender,
-
     /// The ID of the document processed by this script thread.
     pub webrender_document: DocumentId,
 
@@ -199,9 +195,6 @@ pub struct InitialPipelineState {
 
     /// Application window's GL Context for Media player
     pub player_context: WindowGLContext,
-
-    /// Mechanism to force the compositor to process events.
-    pub event_loop_waker: Option<Box<dyn EventLoopWaker>>,
 
     /// User agent string to report in network requests.
     pub user_agent: Cow<'static, str>,
@@ -247,21 +240,19 @@ impl Pipeline {
                         let (script_to_devtools_ipc_sender, script_to_devtools_ipc_receiver) =
                             ipc::channel().expect("Pipeline script to devtools chan");
                         let devtools_sender = (*devtools_sender).clone();
-                        ROUTER.add_route(
-                            script_to_devtools_ipc_receiver.to_opaque(),
-                            Box::new(move |message| {
-                                match message.to::<ScriptToDevtoolsControlMsg>() {
-                                    Err(e) => {
-                                        error!("Cast to ScriptToDevtoolsControlMsg failed ({}).", e)
-                                    },
-                                    Ok(message) => {
-                                        if let Err(e) = devtools_sender
-                                            .send(DevtoolsControlMsg::FromScript(message))
-                                        {
-                                            warn!("Sending to devtools failed ({:?})", e)
-                                        }
-                                    },
-                                }
+                        ROUTER.add_typed_route(
+                            script_to_devtools_ipc_receiver,
+                            Box::new(move |message| match message {
+                                Err(e) => {
+                                    error!("Cast to ScriptToDevtoolsControlMsg failed ({}).", e)
+                                },
+                                Ok(message) => {
+                                    if let Err(e) = devtools_sender
+                                        .send(DevtoolsControlMsg::FromScript(message))
+                                    {
+                                        warn!("Sending to devtools failed ({:?})", e)
+                                    }
+                                },
                             }),
                         );
                         script_to_devtools_ipc_sender
@@ -283,7 +274,7 @@ impl Pipeline {
                     devtools_ipc_sender: script_to_devtools_ipc_sender,
                     bluetooth_thread: state.bluetooth_thread,
                     swmanager_thread: state.swmanager_thread,
-                    font_cache_thread: state.font_cache_thread,
+                    system_font_service: state.system_font_service.to_sender(),
                     resource_threads: state.resource_threads,
                     time_profiler_chan: state.time_profiler_chan,
                     mem_profiler_chan: state.mem_profiler_chan,
@@ -295,9 +286,11 @@ impl Pipeline {
                     opts: (*opts::get()).clone(),
                     prefs: prefs::pref_map().iter().collect(),
                     pipeline_namespace_id: state.pipeline_namespace_id,
-                    webrender_api_sender: state.webrender_api_sender,
-                    webrender_image_api_sender: state.webrender_image_api_sender,
                     webrender_document: state.webrender_document,
+                    cross_process_compositor_api: state
+                        .compositor_proxy
+                        .cross_process_compositor_api
+                        .clone(),
                     webgl_chan: state.webgl_chan,
                     webxr_registry: state.webxr_registry,
                     player_context: state.player_context,
@@ -489,7 +482,7 @@ pub struct UnprivilegedPipelineContent {
     devtools_ipc_sender: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
     bluetooth_thread: IpcSender<BluetoothRequest>,
     swmanager_thread: IpcSender<SWManagerMsg>,
-    font_cache_thread: FontCacheThread,
+    system_font_service: SystemFontServiceProxySender,
     resource_threads: ResourceThreads,
     time_profiler_chan: time::ProfilerChan,
     mem_profiler_chan: profile_mem::ProfilerChan,
@@ -500,8 +493,7 @@ pub struct UnprivilegedPipelineContent {
     opts: Opts,
     prefs: HashMap<String, PrefValue>,
     pipeline_namespace_id: PipelineNamespaceId,
-    webrender_api_sender: script_traits::WebrenderIpcSender,
-    webrender_image_api_sender: net_traits::WebrenderIpcSender,
+    cross_process_compositor_api: CrossProcessCompositorApi,
     webrender_document: DocumentId,
     webgl_chan: Option<WebGLPipeline>,
     webxr_registry: webxr_api::Registry,
@@ -520,7 +512,9 @@ impl UnprivilegedPipelineContent {
         // Idempotent in single-process mode.
         PipelineNamespace::set_installer_sender(self.namespace_request_sender);
 
-        let image_cache = Arc::new(ImageCacheImpl::new(self.webrender_image_api_sender.clone()));
+        let image_cache = Arc::new(ImageCacheImpl::new(
+            self.cross_process_compositor_api.clone(),
+        ));
         let (content_process_shutdown_chan, content_process_shutdown_port) = unbounded();
         STF::create(
             InitialScriptState {
@@ -547,12 +541,12 @@ impl UnprivilegedPipelineContent {
                 webgl_chan: self.webgl_chan,
                 webxr_registry: self.webxr_registry,
                 webrender_document: self.webrender_document,
-                webrender_api_sender: self.webrender_api_sender.clone(),
+                compositor_api: self.cross_process_compositor_api.clone(),
                 player_context: self.player_context.clone(),
                 inherited_secure_context: self.load_data.inherited_secure_context,
             },
             layout_factory,
-            self.font_cache_thread.clone(),
+            Arc::new(self.system_font_service.to_proxy()),
             self.load_data.clone(),
             self.user_agent,
         );

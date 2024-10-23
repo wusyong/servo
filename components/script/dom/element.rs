@@ -15,6 +15,7 @@ use std::{fmt, mem};
 use cssparser::match_ignore_ascii_case;
 use devtools_traits::AttrInfo;
 use dom_struct::dom_struct;
+use embedder_traits::InputMethodType;
 use euclid::default::{Rect, Size2D};
 use html5ever::serialize::TraversalScope::{ChildrenOnly, IncludeNode};
 use html5ever::serialize::{SerializeOpts, TraversalScope};
@@ -25,7 +26,6 @@ use html5ever::{
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::HandleObject;
-use msg::constellation_msg::InputMethodType;
 use net_traits::request::CorsSettings;
 use net_traits::ReferrerPolicy;
 use script_layout_interface::ReflowGoal;
@@ -57,8 +57,8 @@ use style::stylesheets::layer_rule::LayerOrder;
 use style::stylesheets::{CssRuleType, UrlExtraData};
 use style::values::generics::NonNegative;
 use style::values::{computed, specified, AtomIdent, AtomString, CSSFloat};
-use style::{dom_apis, thread_state, CaseSensitivityExt};
-use style_traits::dom::ElementState;
+use style::{dom_apis, thread_state, ArcSlice, CaseSensitivityExt};
+use style_dom::ElementState;
 use xml5ever::serialize as xmlSerialize;
 use xml5ever::serialize::TraversalScope::{
     ChildrenOnly as XmlChildrenOnly, IncludeNode as XmlIncludeNode,
@@ -87,7 +87,7 @@ use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::bindings::xmlname::XMLName::InvalidXMLName;
+use crate::dom::bindings::xmlname::XMLName::Invalid;
 use crate::dom::bindings::xmlname::{
     namespace_from_domstring, validate_and_extract, xml_name_type,
 };
@@ -107,7 +107,6 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::htmlbodyelement::{HTMLBodyElement, HTMLBodyElementLayoutHelpers};
 use crate::dom::htmlbuttonelement::HTMLButtonElement;
-use crate::dom::htmlcanvaselement::{HTMLCanvasElement, LayoutHTMLCanvasElementHelpers};
 use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
@@ -149,6 +148,7 @@ use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::virtualmethods::{vtable_for, VirtualMethods};
 use crate::dom::window::ReflowReason;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 use crate::stylesheet_loader::StylesheetOwner;
 use crate::task::TaskOnce;
@@ -263,8 +263,9 @@ impl Element {
         creator: ElementCreator,
         mode: CustomElementCreationMode,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<Element> {
-        create_element(name, is, document, creator, mode, proto)
+        create_element(name, is, document, creator, mode, proto, can_gc)
     }
 
     pub fn new_inherited(
@@ -398,7 +399,7 @@ impl Element {
         }
     }
 
-    pub fn invoke_reactions(&self) {
+    pub fn invoke_reactions(&self, can_gc: CanGc) {
         loop {
             rooted_vec!(let mut reactions);
             match *self.rare_data_mut() {
@@ -413,7 +414,7 @@ impl Element {
             }
 
             for reaction in reactions.iter() {
-                reaction.invoke(self);
+                reaction.invoke(self, can_gc);
             }
 
             reactions.clear();
@@ -422,18 +423,18 @@ impl Element {
 
     /// style will be `None` for elements in a `display: none` subtree. otherwise, the element has a
     /// layout box iff it doesn't have `display: none`.
-    pub fn style(&self) -> Option<Arc<ComputedValues>> {
-        self.upcast::<Node>().style()
+    pub fn style(&self, can_gc: CanGc) -> Option<Arc<ComputedValues>> {
+        self.upcast::<Node>().style(can_gc)
     }
 
     // https://drafts.csswg.org/cssom-view/#css-layout-box
-    pub fn has_css_layout_box(&self) -> bool {
-        self.style()
-            .map_or(false, |s| !s.get_box().clone_display().is_none())
+    pub fn has_css_layout_box(&self, can_gc: CanGc) -> bool {
+        self.style(can_gc)
+            .is_some_and(|s| !s.get_box().clone_display().is_none())
     }
 
     // https://drafts.csswg.org/cssom-view/#potentially-scrollable
-    fn is_potentially_scrollable_body(&self) -> bool {
+    fn is_potentially_scrollable_body(&self, can_gc: CanGc) -> bool {
         let node = self.upcast::<Node>();
         debug_assert!(
             node.owner_doc().GetBody().as_deref() == self.downcast::<HTMLElement>(),
@@ -443,14 +444,14 @@ impl Element {
         // "An element body (which will be the body element) is potentially
         // scrollable if all of the following conditions are true:
         //  - body has an associated box."
-        if !self.has_css_layout_box() {
+        if !self.has_css_layout_box(can_gc) {
             return false;
         }
 
         // " - body’s parent element’s computed value of the overflow-x or
         //     overflow-y properties is neither visible nor clip."
         if let Some(parent) = node.GetParentElement() {
-            if let Some(style) = parent.style() {
+            if let Some(style) = parent.style(can_gc) {
                 if !style.get_box().clone_overflow_x().is_scrollable() &&
                     !style.get_box().clone_overflow_y().is_scrollable()
                 {
@@ -461,7 +462,7 @@ impl Element {
 
         // " - body’s computed value of the overflow-x or overflow-y properties
         //     is neither visible nor clip."
-        if let Some(style) = self.style() {
+        if let Some(style) = self.style(can_gc) {
             if !style.get_box().clone_overflow_x().is_scrollable() &&
                 !style.get_box().clone_overflow_y().is_scrollable()
             {
@@ -473,17 +474,18 @@ impl Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#scrolling-box
-    fn has_scrolling_box(&self) -> bool {
+    fn has_scrolling_box(&self, can_gc: CanGc) -> bool {
         // TODO: scrolling mechanism, such as scrollbar (We don't have scrollbar yet)
         //       self.has_scrolling_mechanism()
-        self.style().map_or(false, |style| {
+        self.style(can_gc).is_some_and(|style| {
             style.get_box().clone_overflow_x().is_scrollable() ||
                 style.get_box().clone_overflow_y().is_scrollable()
         })
     }
 
-    fn has_overflow(&self) -> bool {
-        self.ScrollHeight() > self.ClientHeight() || self.ScrollWidth() > self.ClientWidth()
+    fn has_overflow(&self, can_gc: CanGc) -> bool {
+        self.ScrollHeight(can_gc) > self.ClientHeight(can_gc) ||
+            self.ScrollWidth(can_gc) > self.ClientWidth(can_gc)
     }
 
     fn shadow_root(&self) -> Option<DomRoot<ShadowRoot>> {
@@ -622,7 +624,7 @@ pub trait LayoutElementHelpers<'dom> {
     fn get_span(self) -> Option<u32>;
     fn get_colspan(self) -> Option<u32>;
     fn get_rowspan(self) -> Option<u32>;
-    fn is_html_element(self) -> bool;
+    fn is_html_element(&self) -> bool;
     fn id_attribute(self) -> *const Option<Atom>;
     fn style_attribute(self) -> *const Option<Arc<Locked<PropertyDeclarationBlock>>>;
     fn local_name(self) -> &'dom LocalName;
@@ -657,8 +659,8 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
 
     #[inline]
     fn has_class_for_layout(self, name: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool {
-        get_attr_for_layout(self, &ns!(), &local_name!("class")).map_or(false, |attr| {
-            attr.as_tokens()
+        get_attr_for_layout(self, &ns!(), &local_name!("class")).is_some_and(|attr| {
+            attr.to_tokens()
                 .unwrap()
                 .iter()
                 .any(|atom| case_sensitivity.eq_atom(atom, name))
@@ -668,7 +670,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
     #[inline]
     fn get_classes_for_layout(self) -> Option<&'dom [Atom]> {
         get_attr_for_layout(self, &ns!(), &local_name!("class"))
-            .map(|attr| attr.as_tokens().unwrap())
+            .map(|attr| attr.to_tokens().unwrap())
     }
 
     fn synthesize_presentational_hints_for_legacy_attributes<V>(self, hints: &mut V)
@@ -751,19 +753,20 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             ));
         }
 
-        let font_family = if let Some(this) = self.downcast::<HTMLFontElement>() {
+        let font_face = if let Some(this) = self.downcast::<HTMLFontElement>() {
             this.get_face()
         } else {
             None
         };
 
-        if let Some(font_family) = font_family {
-            // FIXME(emilio): This in Gecko parses a whole family list.
+        if let Some(font_face) = font_face {
             hints.push(from_declaration(
                 shared_lock,
                 PropertyDeclaration::FontFamily(font_family::SpecifiedValue::Values(
                     computed::font::FontFamilyList {
-                        list: Box::new([computed::font::SingleFontFamily::from_atom(font_family)]),
+                        list: ArcSlice::from_iter(
+                            HTMLFontElement::parse_face_attribute(font_face).into_iter(),
+                        ),
                     },
                 )),
             ));
@@ -848,10 +851,10 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             this.get_width()
         } else if let Some(this) = self.downcast::<HTMLTableCellElement>() {
             this.get_width()
+        } else if let Some(this) = self.downcast::<HTMLTableColElement>() {
+            this.get_width()
         } else if let Some(this) = self.downcast::<HTMLHRElement>() {
             // https://html.spec.whatwg.org/multipage/#the-hr-element-2:attr-hr-width
-            this.get_width()
-        } else if let Some(this) = self.downcast::<HTMLCanvasElement>() {
             this.get_width()
         } else {
             LengthOrPercentageOrAuto::Auto
@@ -886,7 +889,13 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             this.get_height()
         } else if let Some(this) = self.downcast::<HTMLImageElement>() {
             this.get_height()
-        } else if let Some(this) = self.downcast::<HTMLCanvasElement>() {
+        } else if let Some(this) = self.downcast::<HTMLTableElement>() {
+            this.get_height()
+        } else if let Some(this) = self.downcast::<HTMLTableCellElement>() {
+            this.get_height()
+        } else if let Some(this) = self.downcast::<HTMLTableRowElement>() {
+            this.get_height()
+        } else if let Some(this) = self.downcast::<HTMLTableSectionElement>() {
             this.get_height()
         } else {
             LengthOrPercentageOrAuto::Auto
@@ -1037,7 +1046,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
     }
 
     #[inline]
-    fn is_html_element(self) -> bool {
+    fn is_html_element(&self) -> bool {
         *self.namespace() == ns!(html)
     }
 
@@ -1544,7 +1553,7 @@ impl Element {
     // https://html.spec.whatwg.org/multipage/#attr-data-*
     pub fn set_custom_attribute(&self, name: DOMString, value: DOMString) -> ErrorResult {
         // Step 1.
-        if let InvalidXMLName = xml_name_type(&name) {
+        if let Invalid = xml_name_type(&name) {
             return Err(Error::InvalidCharacter);
         }
 
@@ -1643,7 +1652,7 @@ impl Element {
 
     pub fn has_class(&self, name: &Atom, case_sensitivity: CaseSensitivity) -> bool {
         self.get_attribute(&ns!(), &local_name!("class"))
-            .map_or(false, |attr| {
+            .is_some_and(|attr| {
                 attr.value()
                     .as_tokens()
                     .iter()
@@ -1827,7 +1836,7 @@ impl Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    pub fn scroll(&self, x_: f64, y_: f64, behavior: ScrollBehavior) {
+    pub fn scroll(&self, x_: f64, y_: f64, behavior: ScrollBehavior, can_gc: CanGc) {
         // Step 1.2 or 2.3
         let x = if x_.is_finite() { x_ } else { 0.0f64 };
         let y = if y_.is_finite() { y_ } else { 0.0f64 };
@@ -1851,7 +1860,7 @@ impl Element {
         // Step 7
         if *self.root_element() == *self {
             if doc.quirks_mode() != QuirksMode::Quirks {
-                win.scroll(x, y, behavior);
+                win.scroll(x, y, behavior, can_gc);
             }
 
             return;
@@ -1860,31 +1869,38 @@ impl Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
-            win.scroll(x, y, behavior);
+            win.scroll(x, y, behavior, can_gc);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
+        if !self.has_css_layout_box(can_gc) ||
+            !self.has_scrolling_box(can_gc) ||
+            !self.has_overflow(can_gc)
+        {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, x, y, behavior);
+        win.scroll_node(node, x, y, behavior, can_gc);
     }
 
     // https://w3c.github.io/DOM-Parsing/#parsing
-    pub fn parse_fragment(&self, markup: DOMString) -> Fallible<DomRoot<DocumentFragment>> {
+    pub fn parse_fragment(
+        &self,
+        markup: DOMString,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<DocumentFragment>> {
         // Steps 1-2.
         // TODO(#11995): XML case.
-        let new_children = ServoParser::parse_html_fragment(self, markup);
+        let new_children = ServoParser::parse_html_fragment(self, markup, can_gc);
         // Step 3.
         // See https://github.com/w3c/DOM-Parsing/issues/61.
         let context_document = {
             if let Some(template) = self.downcast::<HTMLTemplateElement>() {
-                template.Content().upcast::<Node>().owner_doc()
+                template.Content(can_gc).upcast::<Node>().owner_doc()
             } else {
                 document_from_node(self)
             }
@@ -1990,7 +2006,7 @@ impl Element {
         }
     }
 
-    pub(crate) fn update_sequentially_focusable_status(&self) {
+    pub(crate) fn update_sequentially_focusable_status(&self, can_gc: CanGc) {
         let node = self.upcast::<Node>();
         let is_sequentially_focusable = self.is_sequentially_focusable();
         node.set_flag(NodeFlags::SEQUENTIALLY_FOCUSABLE, is_sequentially_focusable);
@@ -1998,7 +2014,7 @@ impl Element {
         // https://html.spec.whatwg.org/multipage/#focus-fixup-rule
         if !is_sequentially_focusable {
             let document = document_from_node(self);
-            document.perform_focus_fixup_rule(self);
+            document.perform_focus_fixup_rule(self, can_gc);
         }
     }
 
@@ -2131,7 +2147,7 @@ impl ElementMethods for Element {
     // https://dom.spec.whatwg.org/#dom-element-toggleattribute
     fn ToggleAttribute(&self, name: DOMString, force: Option<bool>) -> Fallible<bool> {
         // Step 1.
-        if xml_name_type(&name) == InvalidXMLName {
+        if xml_name_type(&name) == Invalid {
             return Err(Error::InvalidCharacter);
         }
 
@@ -2173,7 +2189,7 @@ impl ElementMethods for Element {
     // https://dom.spec.whatwg.org/#dom-element-setattribute
     fn SetAttribute(&self, name: DOMString, value: DOMString) -> ErrorResult {
         // Step 1.
-        if xml_name_type(&name) == InvalidXMLName {
+        if xml_name_type(&name) == Invalid {
             return Err(Error::InvalidCharacter);
         }
 
@@ -2329,9 +2345,9 @@ impl ElementMethods for Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
-    fn GetClientRects(&self) -> Vec<DomRoot<DOMRect>> {
+    fn GetClientRects(&self, can_gc: CanGc) -> Vec<DomRoot<DOMRect>> {
         let win = window_from_node(self);
-        let raw_rects = self.upcast::<Node>().content_boxes();
+        let raw_rects = self.upcast::<Node>().content_boxes(can_gc);
         raw_rects
             .iter()
             .map(|rect| {
@@ -2341,66 +2357,73 @@ impl ElementMethods for Element {
                     rect.origin.y.to_f64_px(),
                     rect.size.width.to_f64_px(),
                     rect.size.height.to_f64_px(),
+                    can_gc,
                 )
             })
             .collect()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
-    fn GetBoundingClientRect(&self) -> DomRoot<DOMRect> {
+    fn GetBoundingClientRect(&self, can_gc: CanGc) -> DomRoot<DOMRect> {
         let win = window_from_node(self);
-        let rect = self.upcast::<Node>().bounding_content_box_or_zero();
+        let rect = self.upcast::<Node>().bounding_content_box_or_zero(can_gc);
         DOMRect::new(
             win.upcast(),
             rect.origin.x.to_f64_px(),
             rect.origin.y.to_f64_px(),
             rect.size.width.to_f64_px(),
             rect.size.height.to_f64_px(),
+            can_gc,
         )
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    fn Scroll(&self, options: &ScrollToOptions) {
+    fn Scroll(&self, options: &ScrollToOptions, can_gc: CanGc) {
         // Step 1
-        let left = options.left.unwrap_or(self.ScrollLeft());
-        let top = options.top.unwrap_or(self.ScrollTop());
-        self.scroll(left, top, options.parent.behavior);
+        let left = options.left.unwrap_or(self.ScrollLeft(can_gc));
+        let top = options.top.unwrap_or(self.ScrollTop(can_gc));
+        self.scroll(left, top, options.parent.behavior, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    fn Scroll_(&self, x: f64, y: f64) {
-        self.scroll(x, y, ScrollBehavior::Auto);
+    fn Scroll_(&self, x: f64, y: f64, can_gc: CanGc) {
+        self.scroll(x, y, ScrollBehavior::Auto, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollto
     fn ScrollTo(&self, options: &ScrollToOptions) {
-        self.Scroll(options);
+        self.Scroll(options, CanGc::note());
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollto
     fn ScrollTo_(&self, x: f64, y: f64) {
-        self.Scroll_(x, y);
+        self.Scroll_(x, y, CanGc::note());
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollby
-    fn ScrollBy(&self, options: &ScrollToOptions) {
+    fn ScrollBy(&self, options: &ScrollToOptions, can_gc: CanGc) {
         // Step 2
         let delta_left = options.left.unwrap_or(0.0f64);
         let delta_top = options.top.unwrap_or(0.0f64);
-        let left = self.ScrollLeft();
-        let top = self.ScrollTop();
-        self.scroll(left + delta_left, top + delta_top, options.parent.behavior);
+        let left = self.ScrollLeft(can_gc);
+        let top = self.ScrollTop(can_gc);
+        self.scroll(
+            left + delta_left,
+            top + delta_top,
+            options.parent.behavior,
+            can_gc,
+        );
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollby
-    fn ScrollBy_(&self, x: f64, y: f64) {
-        let left = self.ScrollLeft();
-        let top = self.ScrollTop();
-        self.scroll(left + x, top + y, ScrollBehavior::Auto);
+    fn ScrollBy_(&self, x: f64, y: f64, can_gc: CanGc) {
+        let left = self.ScrollLeft(can_gc);
+        let top = self.ScrollTop(can_gc);
+        self.scroll(left + x, top + y, ScrollBehavior::Auto, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn ScrollTop(&self) -> f64 {
+    fn ScrollTop(&self, can_gc: CanGc) -> f64 {
         let node = self.upcast::<Node>();
 
         // Step 1
@@ -2430,13 +2453,13 @@ impl ElementMethods for Element {
         // Step 7
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
             return win.ScrollY() as f64;
         }
 
         // Step 8
-        if !self.has_css_layout_box() {
+        if !self.has_css_layout_box(can_gc) {
             return 0.0;
         }
 
@@ -2446,7 +2469,7 @@ impl ElementMethods for Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn SetScrollTop(&self, y_: f64) {
+    fn SetScrollTop(&self, y_: f64, can_gc: CanGc) {
         let behavior = ScrollBehavior::Auto;
 
         // Step 1, 2
@@ -2471,7 +2494,7 @@ impl ElementMethods for Element {
         // Step 7
         if *self.root_element() == *self {
             if doc.quirks_mode() != QuirksMode::Quirks {
-                win.scroll(win.ScrollX() as f64, y, behavior);
+                win.scroll(win.ScrollX() as f64, y, behavior, can_gc);
             }
 
             return;
@@ -2480,23 +2503,26 @@ impl ElementMethods for Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
-            win.scroll(win.ScrollX() as f64, y, behavior);
+            win.scroll(win.ScrollX() as f64, y, behavior, can_gc);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
+        if !self.has_css_layout_box(can_gc) ||
+            !self.has_scrolling_box(can_gc) ||
+            !self.has_overflow(can_gc)
+        {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, self.ScrollLeft(), y, behavior);
+        win.scroll_node(node, self.ScrollLeft(can_gc), y, behavior, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn ScrollLeft(&self) -> f64 {
+    fn ScrollLeft(&self, can_gc: CanGc) -> f64 {
         let node = self.upcast::<Node>();
 
         // Step 1
@@ -2526,13 +2552,13 @@ impl ElementMethods for Element {
         // Step 7
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
             return win.ScrollX() as f64;
         }
 
         // Step 8
-        if !self.has_css_layout_box() {
+        if !self.has_css_layout_box(can_gc) {
             return 0.0;
         }
 
@@ -2542,7 +2568,7 @@ impl ElementMethods for Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
-    fn SetScrollLeft(&self, x_: f64) {
+    fn SetScrollLeft(&self, x_: f64, can_gc: CanGc) {
         let behavior = ScrollBehavior::Auto;
 
         // Step 1, 2
@@ -2570,56 +2596,59 @@ impl ElementMethods for Element {
                 return;
             }
 
-            win.scroll(x, win.ScrollY() as f64, behavior);
+            win.scroll(x, win.ScrollY() as f64, behavior, can_gc);
             return;
         }
 
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
-            win.scroll(x, win.ScrollY() as f64, behavior);
+            win.scroll(x, win.ScrollY() as f64, behavior, can_gc);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
+        if !self.has_css_layout_box(can_gc) ||
+            !self.has_scrolling_box(can_gc) ||
+            !self.has_overflow(can_gc)
+        {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, x, self.ScrollTop(), behavior);
+        win.scroll_node(node, x, self.ScrollTop(can_gc), behavior, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth
-    fn ScrollWidth(&self) -> i32 {
-        self.upcast::<Node>().scroll_area().size.width
+    fn ScrollWidth(&self, can_gc: CanGc) -> i32 {
+        self.upcast::<Node>().scroll_area(can_gc).size.width
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollheight
-    fn ScrollHeight(&self) -> i32 {
-        self.upcast::<Node>().scroll_area().size.height
+    fn ScrollHeight(&self, can_gc: CanGc) -> i32 {
+        self.upcast::<Node>().scroll_area(can_gc).size.height
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clienttop
-    fn ClientTop(&self) -> i32 {
-        self.client_rect().origin.y
+    fn ClientTop(&self, can_gc: CanGc) -> i32 {
+        self.client_rect(can_gc).origin.y
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientleft
-    fn ClientLeft(&self) -> i32 {
-        self.client_rect().origin.x
+    fn ClientLeft(&self, can_gc: CanGc) -> i32 {
+        self.client_rect(can_gc).origin.x
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientwidth
-    fn ClientWidth(&self) -> i32 {
-        self.client_rect().size.width
+    fn ClientWidth(&self, can_gc: CanGc) -> i32 {
+        self.client_rect(can_gc).size.width
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientheight
-    fn ClientHeight(&self) -> i32 {
-        self.client_rect().size.height
+    fn ClientHeight(&self, can_gc: CanGc) -> i32 {
+        self.client_rect(can_gc).size.height
     }
 
     /// <https://w3c.github.io/DOM-Parsing/#widl-Element-innerHTML>
@@ -2637,11 +2666,11 @@ impl ElementMethods for Element {
     }
 
     /// <https://w3c.github.io/DOM-Parsing/#widl-Element-innerHTML>
-    fn SetInnerHTML(&self, value: DOMString) -> ErrorResult {
+    fn SetInnerHTML(&self, value: DOMString, can_gc: CanGc) -> ErrorResult {
         // Step 2.
         // https://github.com/w3c/DOM-Parsing/issues/1
         let target = if let Some(template) = self.downcast::<HTMLTemplateElement>() {
-            DomRoot::upcast(template.Content())
+            DomRoot::upcast(template.Content(can_gc))
         } else {
             DomRoot::from_ref(self.upcast())
         };
@@ -2660,7 +2689,7 @@ impl ElementMethods for Element {
         }
 
         // Step 1.
-        let frag = self.parse_fragment(value)?;
+        let frag = self.parse_fragment(value, can_gc)?;
 
         Node::replace_all(Some(frag.upcast()), &target);
         Ok(())
@@ -2676,7 +2705,7 @@ impl ElementMethods for Element {
     }
 
     // https://w3c.github.io/DOM-Parsing/#dom-element-outerhtml
-    fn SetOuterHTML(&self, value: DOMString) -> ErrorResult {
+    fn SetOuterHTML(&self, value: DOMString, can_gc: CanGc) -> ErrorResult {
         let context_document = document_from_node(self);
         let context_node = self.upcast::<Node>();
         // Step 1.
@@ -2701,6 +2730,7 @@ impl ElementMethods for Element {
                     ElementCreator::ScriptCreated,
                     CustomElementCreationMode::Synchronous,
                     None,
+                    can_gc,
                 );
                 DomRoot::upcast(body_elem)
             },
@@ -2708,7 +2738,7 @@ impl ElementMethods for Element {
         };
 
         // Step 5.
-        let frag = parent.parse_fragment(value)?;
+        let frag = parent.parse_fragment(value, can_gc)?;
         // Step 6.
         context_parent.ReplaceChild(frag.upcast(), context_node)?;
         Ok(())
@@ -2866,7 +2896,12 @@ impl ElementMethods for Element {
     }
 
     // https://w3c.github.io/DOM-Parsing/#dom-element-insertadjacenthtml
-    fn InsertAdjacentHTML(&self, position: DOMString, text: DOMString) -> ErrorResult {
+    fn InsertAdjacentHTML(
+        &self,
+        position: DOMString,
+        text: DOMString,
+        can_gc: CanGc,
+    ) -> ErrorResult {
         // Step 1.
         let position = position.parse::<AdjacentPosition>()?;
 
@@ -2890,7 +2925,7 @@ impl ElementMethods for Element {
             Element::fragment_parsing_context(&context.owner_doc(), context.downcast::<Element>());
 
         // Step 3.
-        let fragment = context.parse_fragment(text)?;
+        let fragment = context.parse_fragment(text, can_gc)?;
 
         // Step 4.
         self.insert_adjacent(position, fragment.upcast())
@@ -2919,9 +2954,9 @@ impl ElementMethods for Element {
     }
 
     // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
-    fn RequestFullscreen(&self) -> Rc<Promise> {
+    fn RequestFullscreen(&self, can_gc: CanGc) -> Rc<Promise> {
         let doc = document_from_node(self);
-        doc.enter_fullscreen(self)
+        doc.enter_fullscreen(self, can_gc)
     }
 
     // XXX Hidden under dom.shadowdom.enabled pref. Only exposed to be able
@@ -3307,7 +3342,7 @@ impl VirtualMethods for Element {
         let doc = node.owner_doc();
         match attr.local_name() {
             &local_name!("tabindex") | &local_name!("draggable") | &local_name!("hidden") => {
-                self.update_sequentially_focusable_status()
+                self.update_sequentially_focusable_status(CanGc::note())
             },
             &local_name!("style") => {
                 // Modifying the `style` attribute might change style.
@@ -3473,7 +3508,7 @@ impl VirtualMethods for Element {
             return;
         }
 
-        self.update_sequentially_focusable_status();
+        self.update_sequentially_focusable_status(CanGc::note());
 
         if let Some(ref id) = *self.id_attribute.borrow() {
             if let Some(shadow_root) = self.upcast::<Node>().containing_shadow_root() {
@@ -3506,7 +3541,7 @@ impl VirtualMethods for Element {
             return;
         }
 
-        self.update_sequentially_focusable_status();
+        self.update_sequentially_focusable_status(CanGc::note());
 
         let doc = document_from_node(self);
 
@@ -3522,7 +3557,7 @@ impl VirtualMethods for Element {
 
         let fullscreen = doc.GetFullscreenElement();
         if fullscreen.as_deref() == Some(self) {
-            doc.exit_fullscreen();
+            doc.exit_fullscreen(CanGc::note());
         }
         if let Some(ref value) = *self.id_attribute.borrow() {
             doc.unregister_element_id(self, value.clone());
@@ -3634,7 +3669,7 @@ impl SelectorsElement for DomRoot<Element> {
         match *ns {
             NamespaceConstraint::Specific(ns) => self
                 .get_attribute(ns, local_name)
-                .map_or(false, |attr| attr.value().eval_selector(operation)),
+                .is_some_and(|attr| attr.value().eval_selector(operation)),
             NamespaceConstraint::Any => self.attrs.borrow().iter().any(|attr| {
                 *attr.local_name() == **local_name && attr.value().eval_selector(operation)
             }),
@@ -3694,22 +3729,36 @@ impl SelectorsElement for DomRoot<Element> {
             // storing separate <ident> or <string>s for each language tag.
             NonTSPseudoClass::Lang(ref lang) => extended_filtering(&self.get_lang(), lang),
 
-            NonTSPseudoClass::ReadOnly => !Element::state(self).contains(pseudo_class.state_flag()),
+            NonTSPseudoClass::ReadOnly => {
+                !Element::state(self).contains(NonTSPseudoClass::ReadWrite.state_flag())
+            },
 
             NonTSPseudoClass::Active |
+            NonTSPseudoClass::Autofill |
+            NonTSPseudoClass::Checked |
+            NonTSPseudoClass::Default |
+            NonTSPseudoClass::Defined |
+            NonTSPseudoClass::Disabled |
+            NonTSPseudoClass::Enabled |
             NonTSPseudoClass::Focus |
+            NonTSPseudoClass::FocusVisible |
+            NonTSPseudoClass::FocusWithin |
             NonTSPseudoClass::Fullscreen |
             NonTSPseudoClass::Hover |
-            NonTSPseudoClass::Defined |
-            NonTSPseudoClass::Enabled |
-            NonTSPseudoClass::Disabled |
-            NonTSPseudoClass::Checked |
-            NonTSPseudoClass::Valid |
-            NonTSPseudoClass::Invalid |
+            NonTSPseudoClass::InRange |
             NonTSPseudoClass::Indeterminate |
-            NonTSPseudoClass::ReadWrite |
+            NonTSPseudoClass::Invalid |
+            NonTSPseudoClass::Modal |
+            NonTSPseudoClass::Optional |
+            NonTSPseudoClass::OutOfRange |
             NonTSPseudoClass::PlaceholderShown |
-            NonTSPseudoClass::Target => Element::state(self).contains(pseudo_class.state_flag()),
+            NonTSPseudoClass::PopoverOpen |
+            NonTSPseudoClass::ReadWrite |
+            NonTSPseudoClass::Required |
+            NonTSPseudoClass::Target |
+            NonTSPseudoClass::UserInvalid |
+            NonTSPseudoClass::UserValid |
+            NonTSPseudoClass::Valid => Element::state(self).contains(pseudo_class.state_flag()),
         }
     }
 
@@ -3733,7 +3782,7 @@ impl SelectorsElement for DomRoot<Element> {
         self.id_attribute
             .borrow()
             .as_ref()
-            .map_or(false, |atom| case_sensitivity.eq_atom(id, atom))
+            .is_some_and(|atom| case_sensitivity.eq_atom(id, atom))
     }
 
     fn is_part(&self, _name: &AtomIdent) -> bool {
@@ -3816,7 +3865,7 @@ impl SelectorsElement for DomRoot<Element> {
 }
 
 impl Element {
-    fn client_rect(&self) -> Rect<i32> {
+    fn client_rect(&self, can_gc: CanGc) -> Rect<i32> {
         let doc = self.node.owner_doc();
 
         if let Some(rect) = self
@@ -3833,7 +3882,7 @@ impl Element {
             }
         }
 
-        let mut rect = self.upcast::<Node>().client_rect();
+        let mut rect = self.upcast::<Node>().client_rect(can_gc);
         let in_quirks_mode = doc.quirks_mode() == QuirksMode::Quirks;
 
         if (in_quirks_mode && doc.GetBody().as_deref() == self.downcast::<HTMLElement>()) ||
@@ -4295,9 +4344,11 @@ impl TaskOnce for ElementPerformFullscreenEnter {
         // Step 7.5
         element.set_fullscreen_state(true);
         document.set_fullscreen_element(Some(&element));
-        document
-            .window()
-            .reflow(ReflowGoal::Full, ReflowReason::ElementStateChanged);
+        document.window().reflow(
+            ReflowGoal::Full,
+            ReflowReason::ElementStateChanged,
+            CanGc::note(),
+        );
 
         // Step 7.6
         document
@@ -4332,9 +4383,11 @@ impl TaskOnce for ElementPerformFullscreenExit {
         // Step 9.6
         element.set_fullscreen_state(false);
 
-        document
-            .window()
-            .reflow(ReflowGoal::Full, ReflowReason::ElementStateChanged);
+        document.window().reflow(
+            ReflowGoal::Full,
+            ReflowReason::ElementStateChanged,
+            CanGc::note(),
+        );
 
         document.set_fullscreen_element(None);
 

@@ -6,10 +6,10 @@
 
 use std::cell::Cell;
 
+use base::id::PipelineId;
 use cssparser::ToCss;
 use fxhash::{FxHashMap, FxHashSet};
 use libc::c_void;
-use msg::constellation_msg::PipelineId;
 use script_traits::{AnimationState as AnimationsPresentState, ScriptMsg, UntrustedNodeAddress};
 use serde::{Deserialize, Serialize};
 use style::animation::{
@@ -33,6 +33,7 @@ use crate::dom::event::Event;
 use crate::dom::node::{from_untrusted_node_address, window_from_node, Node, NodeDamage};
 use crate::dom::transitionevent::TransitionEvent;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 /// The set of animations for a document.
 #[derive(Default, JSTraceable, MallocSizeOf)]
@@ -422,7 +423,7 @@ impl Animations {
 
         let active_duration = match animation.iteration_state {
             KeyframesIterationState::Finite(_, max) => max * animation.duration,
-            KeyframesIterationState::Infinite(_) => std::f64::MAX,
+            KeyframesIterationState::Infinite(_) => f64::MAX,
         };
 
         // Calculate the `elapsed-time` property of the event and take the absolute
@@ -456,7 +457,7 @@ impl Animations {
             });
     }
 
-    pub(crate) fn send_pending_events(&self, window: &Window) {
+    pub(crate) fn send_pending_events(&self, window: &Window, can_gc: CanGc) {
         // Take all of the events here, in case sending one of these events
         // triggers adding new events by forcing a layout.
         let events = std::mem::take(&mut *self.pending_events.borrow_mut());
@@ -507,7 +508,7 @@ impl Animations {
                     elapsedTime: elapsed_time,
                     pseudoElement: pseudo_element,
                 };
-                TransitionEvent::new(&window, event_atom, &event_init)
+                TransitionEvent::new(&window, event_atom, &event_init, can_gc)
                     .upcast::<Event>()
                     .fire(node.upcast());
             } else {
@@ -517,7 +518,7 @@ impl Animations {
                     elapsedTime: elapsed_time,
                     pseudoElement: pseudo_element,
                 };
-                AnimationEvent::new(&window, event_atom, &event_init)
+                AnimationEvent::new(&window, event_atom, &event_init, can_gc)
                     .upcast::<Event>()
                     .fire(node.upcast());
             }

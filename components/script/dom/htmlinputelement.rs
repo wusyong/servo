@@ -4,14 +4,13 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::{f64, ptr};
 
-use chrono::naive::{NaiveDate, NaiveDateTime};
-use chrono::{DateTime, Datelike, Weekday};
 use dom_struct::dom_struct;
-use embedder_traits::FilterPattern;
+use embedder_traits::{FilterPattern, InputMethodType};
 use encoding_rs::Encoding;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use js::jsapi::{
@@ -21,7 +20,6 @@ use js::jsapi::{
 use js::jsval::UndefinedValue;
 use js::rust::jsapi_wrapped::{ExecuteRegExpNoStatics, ObjectIsRegExp};
 use js::rust::{HandleObject, MutableHandleObject};
-use msg::constellation_msg::InputMethodType;
 use net_traits::blob_url_store::get_blob_origin;
 use net_traits::filemanager_thread::FileManagerThreadMsg;
 use net_traits::{CoreResourceMsg, IpcSend};
@@ -30,10 +28,12 @@ use script_traits::ScriptToConstellationChan;
 use servo_atoms::Atom;
 use style::attr::AttrValue;
 use style::str::{split_commas, str_join};
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
+use time_03::{Month, OffsetDateTime, Time};
 use unicode_bidi::{bidi_class, BidiClass};
 use url::Url;
 
+use super::bindings::str::{FromInputValueString, ToInputValueString};
 use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
@@ -60,7 +60,7 @@ use crate::dom::htmldatalistelement::HTMLDataListElement;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
 use crate::dom::htmlformelement::{
-    FormControl, FormDatum, FormDatumValue, FormSubmitter, HTMLFormElement, ResetFrom,
+    FormControl, FormDatum, FormDatumValue, FormSubmitterElement, HTMLFormElement, ResetFrom,
     SubmittedFrom,
 };
 use crate::dom::keyboardevent::KeyboardEvent;
@@ -75,7 +75,7 @@ use crate::dom::validation::{is_barred_by_datalist_ancestor, Validatable};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::realms::enter_realm;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 use crate::textinput::KeyReaction::{
     DispatchInput, Nothing, RedrawSelection, TriggerDefaultAction,
 };
@@ -148,7 +148,7 @@ impl InputType {
         *self == InputType::Time
     }
 
-    fn to_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         match *self {
             InputType::Button => "button",
             InputType::Checkbox => "checkbox",
@@ -756,7 +756,7 @@ impl HTMLInputElement {
             .traverse_preorder(ShadowIncluding::No)
             .find(|node| {
                 node.downcast::<Element>()
-                    .map_or(false, |e| e.Id() == list_string)
+                    .is_some_and(|e| e.Id() == list_string)
             });
         first_with_id
             .as_ref()
@@ -809,11 +809,9 @@ impl HTMLInputElement {
             // https://html.spec.whatwg.org/multipage/#e-mail-state-(type%3Demail)%3Asuffering-from-a-type-mismatch-2
             InputType::Email => {
                 if self.Multiple() {
-                    !split_commas(value).all(|s| {
-                        DOMString::from_string(s.to_string()).is_valid_email_address_string()
-                    })
+                    !split_commas(value).all(|string| string.is_valid_email_address_string())
                 } else {
-                    !value.is_valid_email_address_string()
+                    !value.str().is_valid_email_address_string()
                 }
             },
             // Other input types don't suffer from type mismatch
@@ -864,20 +862,20 @@ impl HTMLInputElement {
                 false
             },
             // https://html.spec.whatwg.org/multipage/#date-state-(type%3Ddate)%3Asuffering-from-bad-input
-            InputType::Date => !value.is_valid_date_string(),
+            InputType::Date => !value.str().is_valid_date_string(),
             // https://html.spec.whatwg.org/multipage/#month-state-(type%3Dmonth)%3Asuffering-from-bad-input
-            InputType::Month => !value.is_valid_month_string(),
+            InputType::Month => !value.str().is_valid_month_string(),
             // https://html.spec.whatwg.org/multipage/#week-state-(type%3Dweek)%3Asuffering-from-bad-input
-            InputType::Week => !value.is_valid_week_string(),
+            InputType::Week => !value.str().is_valid_week_string(),
             // https://html.spec.whatwg.org/multipage/#time-state-(type%3Dtime)%3Asuffering-from-bad-input
-            InputType::Time => !value.is_valid_time_string(),
+            InputType::Time => !value.str().is_valid_time_string(),
             // https://html.spec.whatwg.org/multipage/#local-date-and-time-state-(type%3Ddatetime-local)%3Asuffering-from-bad-input
-            InputType::DatetimeLocal => value.parse_local_date_and_time_string().is_none(),
+            InputType::DatetimeLocal => !value.str().is_valid_local_date_time_string(),
             // https://html.spec.whatwg.org/multipage/#number-state-(type%3Dnumber)%3Asuffering-from-bad-input
             // https://html.spec.whatwg.org/multipage/#range-state-(type%3Drange)%3Asuffering-from-bad-input
             InputType::Number | InputType::Range => !value.is_valid_floating_point_number_string(),
             // https://html.spec.whatwg.org/multipage/#color-state-(type%3Dcolor)%3Asuffering-from-bad-input
-            InputType::Color => !value.is_valid_simple_color_string(),
+            InputType::Color => !value.str().is_valid_simple_color_string(),
             // Other input types don't suffer from bad input
             _ => false,
         }
@@ -1204,7 +1202,7 @@ impl HTMLInputElementMethods for HTMLInputElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-input-type
     fn Type(&self) -> DOMString {
-        DOMString::from(self.input_type().to_str())
+        DOMString::from(self.input_type().as_str())
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-input-type
@@ -1306,9 +1304,9 @@ impl HTMLInputElementMethods for HTMLInputElement {
     #[allow(unsafe_code)]
     fn GetValueAsDate(&self, cx: SafeJSContext) -> Option<NonNull<JSObject>> {
         self.convert_string_to_naive_datetime(self.Value())
-            .map(|dt| unsafe {
+            .map(|date_time| unsafe {
                 let time = ClippedTime {
-                    t: dt.and_utc().timestamp_millis() as f64,
+                    t: (date_time - OffsetDateTime::UNIX_EPOCH).whole_milliseconds() as f64,
                 };
                 NonNull::new_unchecked(NewDateObject(*cx, time))
             })
@@ -1343,21 +1341,17 @@ impl HTMLInputElementMethods for HTMLInputElement {
                 return self.SetValue(DOMString::from(""));
             }
         }
-        // now we make a Rust date out of it so we can use safe code for the
-        // actual conversion logic
-        match milliseconds_to_datetime(msecs) {
-            Ok(dt) => match self.convert_naive_datetime_to_string(dt) {
-                Ok(converted) => self.SetValue(converted),
-                _ => self.SetValue(DOMString::from("")),
-            },
-            _ => self.SetValue(DOMString::from("")),
-        }
+
+        let Ok(date_time) = OffsetDateTime::from_unix_timestamp_nanos((msecs * 1e6) as i128) else {
+            return self.SetValue(DOMString::from(""));
+        };
+        self.SetValue(self.convert_datetime_to_dom_string(date_time))
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-input-valueasnumber
     fn ValueAsNumber(&self) -> f64 {
         self.convert_string_to_number(&self.Value())
-            .unwrap_or(std::f64::NAN)
+            .unwrap_or(f64::NAN)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-input-valueasnumber
@@ -1368,14 +1362,13 @@ impl HTMLInputElementMethods for HTMLInputElement {
             Err(Error::InvalidState)
         } else if value.is_nan() {
             self.SetValue(DOMString::from(""))
-        } else if let Ok(converted) = self.convert_number_to_string(value) {
+        } else if let Some(converted) = self.convert_number_to_string(value) {
             self.SetValue(converted)
         } else {
-            // The most literal spec-compliant implementation would
-            // use bignum chrono types so overflow is impossible,
-            // but just setting an overflow to the empty string matches
-            // Firefox's behavior.
-            // (for example, try input.valueAsNumber=1e30 on a type="date" input)
+            // The most literal spec-compliant implementation would use bignum types so
+            // overflow is impossible, but just setting an overflow to the empty string
+            // matches Firefox's behavior. For example, try input.valueAsNumber=1e30 on
+            // a type="date" input.
             self.SetValue(DOMString::from(""))
         }
     }
@@ -1566,9 +1559,9 @@ impl HTMLInputElementMethods for HTMLInputElement {
     // enabled by dom.htmlinputelement.select_files.enabled,
     // used for test purpose.
     // check-tidy: no specs after this line
-    fn SelectFiles(&self, paths: Vec<DOMString>) {
+    fn SelectFiles(&self, paths: Vec<DOMString>, can_gc: CanGc) {
         if self.input_type() == InputType::File {
-            self.select_files(Some(paths));
+            self.select_files(Some(paths), can_gc);
         }
     }
 
@@ -1593,13 +1586,13 @@ impl HTMLInputElementMethods for HTMLInputElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -1680,7 +1673,7 @@ impl HTMLInputElement {
     /// Steps range from 5.1 to 5.10 (specific to HTMLInputElement)
     pub fn form_datums(
         &self,
-        submitter: Option<FormSubmitter>,
+        submitter: Option<FormSubmitterElement>,
         encoding: Option<&'static Encoding>,
     ) -> Vec<FormDatum> {
         // 3.1: disabled state check is in get_unclean_dataset
@@ -1691,7 +1684,7 @@ impl HTMLInputElement {
         // Step 5.4
         let name = self.Name();
         let is_submitter = match submitter {
-            Some(FormSubmitter::InputElement(s)) => self == s,
+            Some(FormSubmitterElement::Input(s)) => self == s,
             _ => false,
         };
 
@@ -1833,7 +1826,7 @@ impl HTMLInputElement {
 
     // https://html.spec.whatwg.org/multipage/#file-upload-state-(type=file)
     // Select files by invoking UI or by passed in argument
-    fn select_files(&self, opt_test_paths: Option<Vec<DOMString>>) {
+    fn select_files(&self, opt_test_paths: Option<Vec<DOMString>>, can_gc: CanGc) {
         let window = window_from_node(self);
         let origin = get_blob_origin(&window.get_url());
         let resource_threads = window.upcast::<GlobalScope>().resource_threads();
@@ -1858,7 +1851,7 @@ impl HTMLInputElement {
             match recv.recv().expect("IpcSender side error") {
                 Ok(selected_files) => {
                     for selected in selected_files {
-                        files.push(File::new_from_selected(&window, selected));
+                        files.push(File::new_from_selected(&window, selected, can_gc));
                     }
                 },
                 Err(err) => error = Some(err),
@@ -1884,7 +1877,7 @@ impl HTMLInputElement {
 
             match recv.recv().expect("IpcSender side error") {
                 Ok(selected) => {
-                    files.push(File::new_from_selected(&window, selected));
+                    files.push(File::new_from_selected(&window, selected, can_gc));
                 },
                 Err(err) => error = Some(err),
             };
@@ -1896,8 +1889,8 @@ impl HTMLInputElement {
             let filelist = FileList::new(&window, files);
             self.filelist.set(Some(&filelist));
 
-            target.fire_bubbling_event(atom!("input"));
-            target.fire_bubbling_event(atom!("change"));
+            target.fire_bubbling_event(atom!("input"), can_gc);
+            target.fire_bubbling_event(atom!("change"), can_gc);
         }
     }
 
@@ -1919,38 +1912,40 @@ impl HTMLInputElement {
                 value.strip_leading_and_trailing_ascii_whitespace();
             },
             InputType::Date => {
-                if !value.is_valid_date_string() {
+                if !value.str().is_valid_date_string() {
                     value.clear();
                 }
             },
             InputType::Month => {
-                if !value.is_valid_month_string() {
+                if !value.str().is_valid_month_string() {
                     value.clear();
                 }
             },
             InputType::Week => {
-                if !value.is_valid_week_string() {
+                if !value.str().is_valid_week_string() {
                     value.clear();
                 }
             },
             InputType::Color => {
-                if value.is_valid_simple_color_string() {
+                if value.str().is_valid_simple_color_string() {
                     value.make_ascii_lowercase();
                 } else {
                     *value = "#000000".into();
                 }
             },
             InputType::Time => {
-                if !value.is_valid_time_string() {
+                if !value.str().is_valid_time_string() {
                     value.clear();
                 }
             },
             InputType::DatetimeLocal => {
-                if value
-                    .convert_valid_normalized_local_date_and_time_string()
-                    .is_none()
+                match value
+                    .str()
+                    .parse_local_date_time_string()
+                    .map(|date_time| date_time.to_local_date_time_string())
                 {
-                    value.clear();
+                    Some(normalized_string) => *value = DOMString::from_string(normalized_string),
+                    None => value.clear(),
                 }
             },
             InputType::Number => {
@@ -2053,7 +2048,7 @@ impl HTMLInputElement {
 
     // https://html.spec.whatwg.org/multipage/#implicit-submission
     #[allow(unsafe_code)]
-    fn implicit_submission(&self) {
+    fn implicit_submission(&self, can_gc: CanGc) {
         let doc = document_from_node(self);
         let node = doc.upcast::<Node>();
         let owner = self.form_owner();
@@ -2077,7 +2072,7 @@ impl HTMLInputElement {
                     // but we can get here from synthetic keydown events
                     button
                         .upcast::<Node>()
-                        .fire_synthetic_mouse_event_not_trusted(DOMString::from("click"));
+                        .fire_synthetic_mouse_event_not_trusted(DOMString::from("click"), can_gc);
                 }
             },
             None => {
@@ -2108,49 +2103,65 @@ impl HTMLInputElement {
                     // lazily test for > 1 submission-blocking inputs
                     return;
                 }
-                form.submit(SubmittedFrom::NotFromForm, FormSubmitter::FormElement(form));
+                form.submit(
+                    SubmittedFrom::NotFromForm,
+                    FormSubmitterElement::Form(form),
+                    can_gc,
+                );
             },
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-input-value-string-number
+    /// <https://html.spec.whatwg.org/multipage/#concept-input-value-string-number>
     fn convert_string_to_number(&self, value: &DOMString) -> Option<f64> {
         match self.input_type() {
-            InputType::Date => value
-                .parse_date_string()
-                .and_then(|(year, month, day)| NaiveDate::from_ymd_opt(year, month, day))
-                .and_then(|date| date.and_hms_opt(0, 0, 0))
-                .map(|time| time.and_utc().timestamp_millis() as f64),
-            InputType::Month => match value.parse_month_string() {
-                // This one returns number of months, not milliseconds
-                // (specification requires this, presumably because number of
-                // milliseconds is not consistent across months)
-                // the - 1.0 is because january is 1, not 0
-                Some((year, month)) => Some(((year - 1970) * 12) as f64 + (month as f64 - 1.0)),
-                _ => None,
-            },
-            InputType::Week => value
-                .parse_week_string()
-                .and_then(|(year, weeknum)| NaiveDate::from_isoywd_opt(year, weeknum, Weekday::Mon))
-                .and_then(|date| date.and_hms_opt(0, 0, 0))
-                .map(|time| time.and_utc().timestamp_millis() as f64),
-            InputType::Time => match value.parse_time_string() {
-                Some((hours, minutes, seconds)) => {
-                    Some((seconds + 60.0 * minutes as f64 + 3600.0 * hours as f64) * 1000.0)
-                },
-                _ => None,
-            },
+            // > The algorithm to convert a string to a number, given a string input, is as
+            // > follows: If parsing a date from input results in an error, then return an
+            // > error; otherwise, return the number of milliseconds elapsed from midnight
+            // > UTC on the morning of 1970-01-01 (the time represented by the value
+            // > "1970-01-01T00:00:00.0Z") to midnight UTC on the morning of the parsed
+            // > date, ignoring leap seconds.
+            InputType::Date => value.str().parse_date_string().map(|date_time| {
+                (date_time - OffsetDateTime::UNIX_EPOCH).whole_milliseconds() as f64
+            }),
+            // > The algorithm to convert a string to a number, given a string input, is as
+            // > follows: If parsing a month from input results in an error, then return an
+            // > error; otherwise, return the number of months between January 1970 and the
+            // > parsed month.
+            //
+            // This one returns number of months, not milliseconds (specification requires
+            // this, presumably because number of milliseconds is not consistent across
+            // months) the - 1.0 is because january is 1, not 0
+            InputType::Month => value.str().parse_month_string().map(|date_time| {
+                ((date_time.year() - 1970) * 12) as f64 + (date_time.month() as u8 - 1) as f64
+            }),
+            // > The algorithm to convert a string to a number, given a string input, is as
+            // > follows: If parsing a week string from input results in an error, then
+            // > return an error; otherwise, return the number of milliseconds elapsed from
+            // > midnight UTC on the morning of 1970-01-01 (the time represented by the
+            // > value "1970-01-01T00:00:00.0Z") to midnight UTC on the morning of the
+            // > Monday of the parsed week, ignoring leap seconds.
+            InputType::Week => value.str().parse_week_string().map(|date_time| {
+                (date_time - OffsetDateTime::UNIX_EPOCH).whole_milliseconds() as f64
+            }),
+            // > The algorithm to convert a string to a number, given a string input, is as
+            // > follows: If parsing a time from input results in an error, then return an
+            // > error; otherwise, return the number of milliseconds elapsed from midnight to
+            // > the parsed time on a day with no time changes.
+            InputType::Time => value
+                .str()
+                .parse_time_string()
+                .map(|date_time| (date_time.time() - Time::MIDNIGHT).whole_milliseconds() as f64),
+            // > The algorithm to convert a string to a number, given a string input, is as
+            // > follows: If parsing a date and time from input results in an error, then
+            // > return an error; otherwise, return the number of milliseconds elapsed from
+            // > midnight on the morning of 1970-01-01 (the time represented by the value
+            // > "1970-01-01T00:00:00.0") to the parsed local date and time, ignoring leap
+            // > seconds.
             InputType::DatetimeLocal => {
-                // Is this supposed to know the locale's daylight-savings-time rules?
-                value.parse_local_date_and_time_string().and_then(
-                    |((year, month, day), (hours, minutes, seconds))| {
-                        let hms_millis =
-                            (seconds + 60.0 * minutes as f64 + 3600.0 * hours as f64) * 1000.0;
-                        NaiveDate::from_ymd_opt(year, month, day)
-                            .and_then(|date| date.and_hms_opt(0, 0, 0))
-                            .map(|time| time.and_utc().timestamp_millis() as f64 + hms_millis)
-                    },
-                )
+                value.str().parse_local_date_time_string().map(|date_time| {
+                    (date_time - OffsetDateTime::UNIX_EPOCH).whole_milliseconds() as f64
+                })
             },
             InputType::Number | InputType::Range => value.parse_floating_point_number(),
             // min/max/valueAsNumber/stepDown/stepUp do not apply to
@@ -2159,88 +2170,73 @@ impl HTMLInputElement {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-input-value-string-number
-    fn convert_number_to_string(&self, value: f64) -> Result<DOMString, ()> {
+    /// <https://html.spec.whatwg.org/multipage/#concept-input-value-string-number>
+    fn convert_number_to_string(&self, value: f64) -> Option<DOMString> {
         match self.input_type() {
-            InputType::Date => {
-                let datetime = milliseconds_to_datetime(value)?;
-                Ok(DOMString::from(datetime.format("%Y-%m-%d").to_string()))
+            InputType::Date | InputType::Week | InputType::Time | InputType::DatetimeLocal => {
+                OffsetDateTime::from_unix_timestamp_nanos((value * 1e6) as i128)
+                    .ok()
+                    .map(|value| self.convert_datetime_to_dom_string(value))
             },
             InputType::Month => {
-                // interpret value as months(not millis) in epoch, return monthstring
-                let year_from_1970 = (value / 12.0).floor();
-                let month = (value - year_from_1970 * 12.0).floor() as u32 + 1; // january is 1, not 0
-                let year = (year_from_1970 + 1970.0) as u64;
-                Ok(DOMString::from(format!("{:04}-{:02}", year, month)))
+                // > The algorithm to convert a number to a string, given a number input,
+                // > is as follows: Return a valid month string that represents the month
+                // > that has input months between it and January 1970.
+                let date = OffsetDateTime::UNIX_EPOCH;
+                let years = (value / 12.) as i32;
+                let year = date.year() + years;
+
+                let months = value as i32 - (years * 12);
+                let months = match months.cmp(&0) {
+                    Ordering::Less => (12 - months) as u8,
+                    Ordering::Equal | Ordering::Greater => months as u8,
+                } + 1;
+
+                let date = date
+                    .replace_year(year)
+                    .ok()?
+                    .replace_month(Month::try_from(months).ok()?)
+                    .ok()?;
+                Some(self.convert_datetime_to_dom_string(date))
             },
-            InputType::Week => {
-                let datetime = milliseconds_to_datetime(value)?;
-                let year = datetime.iso_week().year(); // not necessarily the same as datetime.year()
-                let week = datetime.iso_week().week();
-                Ok(DOMString::from(format!("{:04}-W{:02}", year, week)))
+            InputType::Number | InputType::Range => {
+                let mut value = DOMString::from(value.to_string());
+                value.set_best_representation_of_the_floating_point_number();
+                Some(value)
             },
-            InputType::Time => {
-                let datetime = milliseconds_to_datetime(value)?;
-                Ok(DOMString::from(datetime.format("%H:%M:%S%.3f").to_string()))
-            },
-            InputType::DatetimeLocal => {
-                let datetime = milliseconds_to_datetime(value)?;
-                Ok(DOMString::from(
-                    datetime.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
-                ))
-            },
-            InputType::Number | InputType::Range => Ok(DOMString::from(value.to_string())),
-            // this won't be called from other input types
-            _ => unreachable!(),
+            _ => unreachable!("Should not have called convert_number_to_string for non-Date types"),
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-input-value-string-date
+    // <https://html.spec.whatwg.org/multipage/#concept-input-value-string-date>
     // This does the safe Rust part of conversion; the unsafe JS Date part
     // is in GetValueAsDate
-    fn convert_string_to_naive_datetime(&self, value: DOMString) -> Option<NaiveDateTime> {
+    fn convert_string_to_naive_datetime(&self, value: DOMString) -> Option<OffsetDateTime> {
         match self.input_type() {
-            InputType::Date => value
-                .parse_date_string()
-                .and_then(|(y, m, d)| NaiveDate::from_ymd_opt(y, m, d))
-                .and_then(|date| date.and_hms_opt(0, 0, 0)),
-            InputType::Time => value.parse_time_string().and_then(|(h, m, s)| {
-                let whole_seconds = s.floor();
-                let nanos = ((s - whole_seconds) * 1e9).floor() as u32;
-                NaiveDate::from_ymd_opt(1970, 1, 1)
-                    .and_then(|date| date.and_hms_nano_opt(h, m, whole_seconds as u32, nanos))
-            }),
-            InputType::Week => value
-                .parse_week_string()
-                .and_then(|(iso_year, week)| {
-                    NaiveDate::from_isoywd_opt(iso_year, week, Weekday::Mon)
-                })
-                .and_then(|date| date.and_hms_opt(0, 0, 0)),
-            InputType::Month => value
-                .parse_month_string()
-                .and_then(|(y, m)| NaiveDate::from_ymd_opt(y, m, 1))
-                .and_then(|date| date.and_hms_opt(0, 0, 0)),
+            InputType::Date => value.str().parse_date_string(),
+            InputType::Time => value.str().parse_time_string(),
+            InputType::Week => value.str().parse_week_string(),
+            InputType::Month => value.str().parse_month_string(),
+            InputType::DatetimeLocal => value.str().parse_local_date_time_string(),
             // does not apply to other types
             _ => None,
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-input-value-date-string
-    // This does the safe Rust part of conversion; the unsafe JS Date part
-    // is in SetValueAsDate
-    fn convert_naive_datetime_to_string(&self, value: NaiveDateTime) -> Result<DOMString, ()> {
-        match self.input_type() {
-            InputType::Date => Ok(DOMString::from(value.format("%Y-%m-%d").to_string())),
-            InputType::Month => Ok(DOMString::from(value.format("%Y-%m").to_string())),
-            InputType::Week => {
-                let year = value.iso_week().year(); // not necessarily the same as value.year()
-                let week = value.iso_week().week();
-                Ok(DOMString::from(format!("{:04}-W{:02}", year, week)))
+    /// <https://html.spec.whatwg.org/multipage/#concept-input-value-date-string>
+    /// This does the safe Rust part of conversion; the unsafe JS Date part
+    /// is in SetValueAsDate
+    fn convert_datetime_to_dom_string(&self, value: OffsetDateTime) -> DOMString {
+        DOMString::from_string(match self.input_type() {
+            InputType::Date => value.to_date_string(),
+            InputType::Month => value.to_month_string(),
+            InputType::Week => value.to_week_string(),
+            InputType::Time => value.to_time_string(),
+            InputType::DatetimeLocal => value.to_local_date_time_string(),
+            _ => {
+                unreachable!("Should not have called convert_datetime_to_string for non-Date types")
             },
-            InputType::Time => Ok(DOMString::from(value.format("%H:%M:%S%.3f").to_string())),
-            // this won't be called from other input types
-            _ => unreachable!(),
-        }
+        })
     }
 }
 
@@ -2271,7 +2267,7 @@ impl VirtualMethods for HTMLInputElement {
                     el.set_read_write_state(read_write);
                 }
 
-                el.update_sequentially_focusable_status();
+                el.update_sequentially_focusable_status(CanGc::note());
             },
             local_name!("checked") if !self.checked_changed.get() => {
                 let checked_state = match mutation {
@@ -2521,7 +2517,11 @@ impl VirtualMethods for HTMLInputElement {
                     // now.
                     if let Some(point_in_target) = mouse_event.point_in_target() {
                         let window = window_from_node(self);
-                        let index = window.text_index_query(self.upcast::<Node>(), point_in_target);
+                        let index = window.text_index_query(
+                            self.upcast::<Node>(),
+                            point_in_target,
+                            CanGc::note(),
+                        );
                         if let Some(i) = index {
                             self.textinput.borrow_mut().set_edit_point_index(i);
                             // trigger redraw
@@ -2541,7 +2541,7 @@ impl VirtualMethods for HTMLInputElement {
                 let action = self.textinput.borrow_mut().handle_keydown(keyevent);
                 match action {
                     TriggerDefaultAction => {
-                        self.implicit_submission();
+                        self.implicit_submission(CanGc::note());
                     },
                     DispatchInput => {
                         self.value_dirty.set(true);
@@ -2805,7 +2805,7 @@ impl Activatable for HTMLInputElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#run-post-click-activation-steps
-    fn activation_behavior(&self, _event: &Event, _target: &EventTarget) {
+    fn activation_behavior(&self, _event: &Event, _target: &EventTarget, can_gc: CanGc) {
         let ty = self.input_type();
         match ty {
             InputType::Submit => {
@@ -2815,7 +2815,8 @@ impl Activatable for HTMLInputElement {
                 if let Some(o) = self.form_owner() {
                     o.submit(
                         SubmittedFrom::NotFromForm,
-                        FormSubmitter::InputElement(self),
+                        FormSubmitterElement::Input(self),
+                        CanGc::note(),
                     )
                 }
             },
@@ -2835,10 +2836,10 @@ impl Activatable for HTMLInputElement {
                     return;
                 }
                 let target = self.upcast::<EventTarget>();
-                target.fire_bubbling_event(atom!("input"));
-                target.fire_bubbling_event(atom!("change"));
+                target.fire_bubbling_event(atom!("input"), can_gc);
+                target.fire_bubbling_event(atom!("change"), can_gc);
             },
-            InputType::File => self.select_files(None),
+            InputType::File => self.select_files(None, CanGc::note()),
             _ => (),
         }
     }
@@ -2868,16 +2869,6 @@ fn round_halves_positive(n: f64) -> f64 {
         n.ceil()
     } else {
         n.round()
-    }
-}
-
-fn milliseconds_to_datetime(value: f64) -> Result<NaiveDateTime, ()> {
-    let seconds = (value / 1000.0).floor();
-    let milliseconds = value - (seconds * 1000.0);
-    let nanoseconds = milliseconds * 1e6;
-    match DateTime::from_timestamp(seconds as i64, nanoseconds as u32) {
-        Some(datetime) => Ok(datetime.naive_utc()),
-        None => Err(()),
     }
 }
 

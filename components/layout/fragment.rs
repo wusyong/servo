@@ -11,18 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::{f32, fmt};
 
 use app_units::Au;
+use base::id::{BrowsingContextId, PipelineId};
+use base::text::is_bidi_control;
 use bitflags::bitflags;
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
 use euclid::default::{Point2D, Rect, Size2D, Vector2D};
-use gfx::text::glyph::ByteIndex;
-use gfx::text::text_run::{TextRun, TextRunSlice};
-use gfx_traits::StackingContextId;
+use fonts::ByteIndex;
 use html5ever::{local_name, namespace_url, ns};
 use ipc_channel::ipc::IpcSender;
 use log::debug;
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image::base::{Image, ImageMetadata};
 use net_traits::image_cache::{ImageOrMetadataAvailable, UsePlaceholder};
+use pixels::{Image, ImageMetadata};
 use range::*;
 use script_layout_interface::wrapper_traits::{
     PseudoElementType, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
@@ -41,8 +40,9 @@ use style::computed_values::overflow_wrap::T as OverflowWrap;
 use style::computed_values::overflow_x::T as StyleOverflow;
 use style::computed_values::position::T as Position;
 use style::computed_values::text_decoration_line::T as TextDecorationLine;
+use style::computed_values::text_wrap_mode::T as TextWrapMode;
 use style::computed_values::transform_style::T as TransformStyle;
-use style::computed_values::white_space::T as WhiteSpace;
+use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::computed_values::word_break::T as WordBreak;
 use style::logical_geometry::{Direction, LogicalMargin, LogicalRect, LogicalSize, WritingMode};
 use style::properties::ComputedValues;
@@ -50,15 +50,15 @@ use style::selector_parser::RestyleDamage;
 use style::servo::restyle_damage::ServoRestyleDamage;
 use style::str::char_is_whitespace;
 use style::values::computed::counters::ContentItem;
-use style::values::computed::{Length, Size, VerticalAlign};
+use style::values::computed::{Length, VerticalAlign};
 use style::values::generics::box_::{Perspective, VerticalAlignKeyword};
 use style::values::generics::transform;
 use webrender_api::units::LayoutTransform;
 use webrender_api::{self, ImageKey};
 
-use crate::context::{with_thread_local_font_context, LayoutContext};
+use crate::context::LayoutContext;
 use crate::display_list::items::{ClipScrollNodeIndex, OpaqueNode, BLUR_INFLATION_FACTOR};
-use crate::display_list::ToLayout;
+use crate::display_list::{StackingContextId, ToLayout};
 use crate::floats::ClearType;
 use crate::flow::{GetBaseFlow, ImmutableFlowUtils};
 use crate::flow_ref::FlowRef;
@@ -72,6 +72,7 @@ use crate::model::{
     self, style_length, IntrinsicISizes, IntrinsicISizesContribution, MaybeAuto, SizeConstraint,
 };
 use crate::text::TextRunScanner;
+use crate::text_run::{TextRun, TextRunSlice};
 use crate::wrapper::ThreadSafeLayoutNodeHelpers;
 use crate::{text, ServoArc};
 
@@ -88,7 +89,7 @@ static DEFAULT_REPLACED_HEIGHT: i32 = 150;
 /// specification:
 ///
 /// * Several fragments may correspond to the same CSS box or DOM node. For example, a CSS text box
-/// broken across two lines is represented by two fragments.
+///   broken across two lines is represented by two fragments.
 ///
 /// * Some CSS fragments are not created at all, such as some anonymous block fragments induced by
 ///   inline fragments with block-level sibling fragments. In that case, Servo uses an `InlineFlow`
@@ -352,8 +353,10 @@ impl InlineAbsoluteFragmentInfo {
 #[derive(Clone)]
 pub enum CanvasFragmentSource {
     WebGL(ImageKey),
-    Image(Option<Arc<Mutex<IpcSender<CanvasMsg>>>>),
+    Image(Arc<Mutex<IpcSender<CanvasMsg>>>),
     WebGPU(ImageKey),
+    /// Transparent black
+    Empty,
 }
 
 #[derive(Clone)]
@@ -368,10 +371,11 @@ impl CanvasFragmentInfo {
     pub fn new(data: HTMLCanvasData) -> CanvasFragmentInfo {
         let source = match data.source {
             HTMLCanvasDataSource::WebGL(texture_id) => CanvasFragmentSource::WebGL(texture_id),
-            HTMLCanvasDataSource::Image(ipc_sender) => CanvasFragmentSource::Image(
-                ipc_sender.map(|renderer| Arc::new(Mutex::new(renderer))),
-            ),
+            HTMLCanvasDataSource::Image(ipc_sender) => {
+                CanvasFragmentSource::Image(Arc::new(Mutex::new(ipc_sender)))
+            },
             HTMLCanvasDataSource::WebGPU(image_key) => CanvasFragmentSource::WebGPU(image_key),
+            HTMLCanvasDataSource::Empty => CanvasFragmentSource::Empty,
         };
 
         CanvasFragmentInfo {
@@ -851,9 +855,8 @@ impl Fragment {
             ))),
         );
         unscanned_ellipsis_fragments.push_back(ellipsis_fragment);
-        let ellipsis_fragments = with_thread_local_font_context(layout_context, |font_context| {
-            TextRunScanner::new().scan_for_runs(font_context, unscanned_ellipsis_fragments)
-        });
+        let ellipsis_fragments = TextRunScanner::new()
+            .scan_for_runs(&layout_context.font_context, unscanned_ellipsis_fragments);
         debug_assert_eq!(ellipsis_fragments.len(), 1);
         ellipsis_fragment = ellipsis_fragments.fragments.into_iter().next().unwrap();
         ellipsis_fragment.flags |= FragmentFlags::IS_ELLIPSIS;
@@ -868,7 +871,7 @@ impl Fragment {
         node_address == self.node ||
             self.inline_context
                 .as_ref()
-                .map_or(false, |ctx| ctx.contains_node(node_address))
+                .is_some_and(|ctx| ctx.contains_node(node_address))
     }
 
     /// Adds a style to the inline context for this fragment. If the inline context doesn't exist
@@ -959,8 +962,8 @@ impl Fragment {
             QuantitiesIncludedInIntrinsicInlineSizes::INTRINSIC_INLINE_SIZE_INCLUDES_MARGINS,
         ) {
             let margin = style.logical_margin();
-            MaybeAuto::from_style(margin.inline_start, Au(0)).specified_or_zero() +
-                MaybeAuto::from_style(margin.inline_end, Au(0)).specified_or_zero()
+            MaybeAuto::from_margin(margin.inline_start, Au(0)).specified_or_zero() +
+                MaybeAuto::from_margin(margin.inline_end, Au(0)).specified_or_zero()
         } else {
             Au(0)
         };
@@ -1271,10 +1274,10 @@ impl Fragment {
         let logical_padding = self.style.logical_padding();
         let border_width = self.border_width();
         SpeculatedInlineContentEdgeOffsets {
-            start: MaybeAuto::from_style(logical_margin.inline_start, Au(0)).specified_or_zero() +
+            start: MaybeAuto::from_margin(logical_margin.inline_start, Au(0)).specified_or_zero() +
                 logical_padding.inline_start.to_used_value(Au(0)) +
                 border_width.inline_start,
-            end: MaybeAuto::from_style(logical_margin.inline_end, Au(0)).specified_or_zero() +
+            end: MaybeAuto::from_margin(logical_margin.inline_end, Au(0)).specified_or_zero() +
                 logical_padding.inline_end.to_used_value(Au(0)) +
                 border_width.inline_end,
         }
@@ -1346,9 +1349,9 @@ impl Fragment {
                 let (inline_start, inline_end) = {
                     let margin = self.style().logical_margin();
                     (
-                        MaybeAuto::from_style(margin.inline_start, containing_block_inline_size)
+                        MaybeAuto::from_margin(margin.inline_start, containing_block_inline_size)
                             .specified_or_zero(),
-                        MaybeAuto::from_style(margin.inline_end, containing_block_inline_size)
+                        MaybeAuto::from_margin(margin.inline_end, containing_block_inline_size)
                             .specified_or_zero(),
                     )
                 };
@@ -1366,7 +1369,7 @@ impl Fragment {
                 {
                     Au(0)
                 } else {
-                    MaybeAuto::from_style(margin.inline_start, containing_block_inline_size)
+                    MaybeAuto::from_margin(margin.inline_start, containing_block_inline_size)
                         .specified_or_zero()
                 };
                 let this_inline_end_margin = if !node
@@ -1375,7 +1378,7 @@ impl Fragment {
                 {
                     Au(0)
                 } else {
-                    MaybeAuto::from_style(margin.inline_end, containing_block_inline_size)
+                    MaybeAuto::from_margin(margin.inline_end, containing_block_inline_size)
                         .specified_or_zero()
                 };
 
@@ -1405,9 +1408,9 @@ impl Fragment {
                 let (block_start, block_end) = {
                     let margin = self.style().logical_margin();
                     (
-                        MaybeAuto::from_style(margin.block_start, containing_block_inline_size)
+                        MaybeAuto::from_margin(margin.block_start, containing_block_inline_size)
                             .specified_or_zero(),
-                        MaybeAuto::from_style(margin.block_end, containing_block_inline_size)
+                        MaybeAuto::from_margin(margin.block_end, containing_block_inline_size)
                             .specified_or_zero(),
                     )
                 };
@@ -1481,16 +1484,16 @@ impl Fragment {
         fn from_style(style: &ComputedValues, container_size: &LogicalSize<Au>) -> LogicalSize<Au> {
             let offsets = style.logical_position();
             let offset_i = if !offsets.inline_start.is_auto() {
-                MaybeAuto::from_style(offsets.inline_start, container_size.inline)
+                MaybeAuto::from_inset(offsets.inline_start, container_size.inline)
                     .specified_or_zero()
             } else {
-                -MaybeAuto::from_style(offsets.inline_end, container_size.inline)
+                -MaybeAuto::from_inset(offsets.inline_end, container_size.inline)
                     .specified_or_zero()
             };
-            let offset_b = if !offsets.block_start.is_auto() {
-                MaybeAuto::from_style(offsets.block_start, container_size.block).specified_or_zero()
+            let offset_b = if offsets.block_start.is_auto() {
+                MaybeAuto::from_inset(offsets.block_start, container_size.block).specified_or_zero()
             } else {
-                -MaybeAuto::from_style(offsets.block_end, container_size.block).specified_or_zero()
+                -MaybeAuto::from_inset(offsets.block_end, container_size.block).specified_or_zero()
             };
             LogicalSize::new(style.writing_mode, offset_i, offset_b)
         }
@@ -1505,9 +1508,7 @@ impl Fragment {
         if let Some(ref inline_fragment_context) = self.inline_context {
             for node in &inline_fragment_context.nodes {
                 if node.style.get_box().position == Position::Relative {
-                    // TODO(servo#30577) revert once underlying bug is fixed
-                    // rel_pos = rel_pos + from_style(&*node.style, containing_block_size);
-                    rel_pos = rel_pos.add_or_warn(from_style(&node.style, containing_block_size));
+                    rel_pos = rel_pos + from_style(&node.style, containing_block_size);
                 }
             }
         }
@@ -1539,8 +1540,12 @@ impl Fragment {
         &self.selected_style
     }
 
-    pub fn white_space(&self) -> WhiteSpace {
-        self.style().get_inherited_text().white_space
+    pub fn white_space_collapse(&self) -> WhiteSpaceCollapse {
+        self.style().get_inherited_text().white_space_collapse
+    }
+
+    pub fn text_wrap_mode(&self) -> TextWrapMode {
+        self.style().get_inherited_text().text_wrap_mode
     }
 
     pub fn color(&self) -> Color {
@@ -1586,7 +1591,7 @@ impl Fragment {
     /// Returns true if this element can be split. This is true for text fragments, unless
     /// `white-space: pre` or `white-space: nowrap` is set.
     pub fn can_split(&self) -> bool {
-        self.is_scanned_text_fragment() && self.white_space().allow_wrap()
+        self.is_scanned_text_fragment() && self.text_wrap_mode() == TextWrapMode::Wrap
     }
 
     /// Returns true if and only if this fragment is a generated content fragment.
@@ -1640,11 +1645,7 @@ impl Fragment {
             SpecificFragmentInfo::Canvas(_) |
             SpecificFragmentInfo::Iframe(_) |
             SpecificFragmentInfo::Svg(_) => {
-                let inline_size = match self.style.content_inline_size() {
-                    Size::Auto => None,
-                    Size::LengthPercentage(ref lp) => lp.maybe_to_used_value(None),
-                };
-
+                let inline_size = self.style.content_inline_size().maybe_to_used_value(None);
                 let mut inline_size = inline_size.unwrap_or_else(|| {
                     // We have to initialize the `border_padding` field first to make
                     // the size constraints work properly.
@@ -1703,7 +1704,7 @@ impl Fragment {
                 .metrics_for_range(range)
                 .advance_width;
 
-            let min_line_inline_size = if self_.white_space().allow_wrap() {
+            let min_line_inline_size = if self_.text_wrap_mode() == TextWrapMode::Wrap {
                 text_fragment_info.run.min_width_for_range(range)
             } else {
                 max_line_inline_size
@@ -1968,7 +1969,7 @@ impl Fragment {
             // see if we're going to overflow the line. If so, perform a best-effort split.
             let mut remaining_range = slice.text_run_range();
             let split_is_empty = inline_start_range.is_empty() &&
-                (self.white_space().allow_wrap() ||
+                (self.text_wrap_mode() == TextWrapMode::Wrap ||
                     !self.requires_line_break_afterward_if_wrapping_on_newlines());
             if split_is_empty {
                 // We're going to overflow the line.
@@ -2341,9 +2342,10 @@ impl Fragment {
                 return InlineMetrics::new(Au(0), Au(0), Au(0));
             }
             // See CSS 2.1 § 10.8.1.
-            let font_metrics = with_thread_local_font_context(layout_context, |font_context| {
-                text::font_metrics_for_style(font_context, self_.style.clone_font())
-            });
+            let font_metrics = text::font_metrics_for_style(
+                &layout_context.font_context,
+                self_.style.clone_font(),
+            );
             let line_height = text::line_height_from_style(&self_.style, &font_metrics);
             InlineMetrics::from_font_metrics(&info.run.font_metrics, line_height)
         }
@@ -2421,10 +2423,10 @@ impl Fragment {
                 VerticalAlign::Keyword(kw) => match kw {
                     VerticalAlignKeyword::Baseline => {},
                     VerticalAlignKeyword::Middle => {
-                        let font_metrics =
-                            with_thread_local_font_context(layout_context, |font_context| {
-                                text::font_metrics_for_style(font_context, self.style.clone_font())
-                            });
+                        let font_metrics = text::font_metrics_for_style(
+                            &layout_context.font_context,
+                            self.style.clone_font(),
+                        );
                         offset += (content_inline_metrics.ascent -
                             content_inline_metrics.space_below_baseline -
                             font_metrics.x_height)
@@ -2520,7 +2522,8 @@ impl Fragment {
                 // FIXME: Should probably use a whitelist of styles that can safely differ (#3165)
                 if self.style().get_font() != other.style().get_font() ||
                     self.text_decoration_line() != other.text_decoration_line() ||
-                    self.white_space() != other.white_space() ||
+                    self.white_space_collapse() != other.white_space_collapse() ||
+                    self.text_wrap_mode() != other.text_wrap_mode() ||
                     self.color() != other.color()
                 {
                     return false;
@@ -2746,9 +2749,7 @@ impl Fragment {
     /// Returns true if this fragment has a transform applied that causes it to take up no space.
     pub fn has_non_invertible_transform_or_zero_scale(&self) -> bool {
         self.transform_matrix(&Rect::default())
-            .map_or(false, |matrix| {
-                !matrix.is_invertible() || matrix.m11 == 0. || matrix.m22 == 0.
-            })
+            .is_some_and(|matrix| !matrix.is_invertible() || matrix.m11 == 0. || matrix.m22 == 0.)
     }
 
     /// Returns true if this fragment establishes a new stacking context and false otherwise.
@@ -2893,7 +2894,7 @@ impl Fragment {
     }
 
     pub fn strip_leading_whitespace_if_necessary(&mut self) -> WhitespaceStrippingResult {
-        if self.white_space().preserve_spaces() {
+        if self.white_space_collapse() == WhiteSpaceCollapse::Preserve {
             return WhitespaceStrippingResult::RetainFragment;
         }
 
@@ -2909,7 +2910,7 @@ impl Fragment {
                 let mut new_text_string = String::new();
                 let mut modified = false;
                 for (i, character) in unscanned_text_fragment_info.text.char_indices() {
-                    if gfx::text::util::is_bidi_control(character) {
+                    if is_bidi_control(character) {
                         new_text_string.push(character);
                         continue;
                     }
@@ -2963,7 +2964,7 @@ impl Fragment {
 
     /// Returns true if the entire fragment was stripped.
     pub fn strip_trailing_whitespace_if_necessary(&mut self) -> WhitespaceStrippingResult {
-        if self.white_space().preserve_spaces() {
+        if self.white_space_collapse() == WhiteSpaceCollapse::Preserve {
             return WhitespaceStrippingResult::RetainFragment;
         }
 
@@ -2979,7 +2980,7 @@ impl Fragment {
                 let mut trailing_bidi_control_characters_to_retain = Vec::new();
                 let (mut modified, mut last_character_index) = (true, 0);
                 for (i, character) in unscanned_text_fragment_info.text.char_indices().rev() {
-                    if gfx::text::util::is_bidi_control(character) {
+                    if is_bidi_control(character) {
                         trailing_bidi_control_characters_to_retain.push(character);
                         continue;
                     }
@@ -3396,7 +3397,7 @@ impl WhitespaceStrippingResult {
     ) -> WhitespaceStrippingResult {
         if info.text.is_empty() {
             WhitespaceStrippingResult::FragmentContainedOnlyWhitespace
-        } else if info.text.chars().all(gfx::text::util::is_bidi_control) {
+        } else if info.text.chars().all(is_bidi_control) {
             WhitespaceStrippingResult::FragmentContainedOnlyBidiControlCharacters
         } else {
             WhitespaceStrippingResult::RetainFragment

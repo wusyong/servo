@@ -2,26 +2,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use app_units::Au;
 use atomic_refcell::AtomicRef;
 use script_layout_interface::wrapper_traits::{
     LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
 use script_layout_interface::{LayoutElementType, LayoutNodeType};
-use script_traits::compositor::ScrollSensitivity;
 use serde::Serialize;
 use servo_arc::Arc;
 use style::dom::OpaqueNode;
 use style::properties::ComputedValues;
-use style::values::computed::{Length, Overflow};
+use style::values::computed::Overflow;
 use style_traits::CSSPixel;
+use webrender_traits::display_list::ScrollSensitivity;
 
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom::{LayoutBox, NodeExt};
-use crate::dom_traversal::{iter_child_nodes, Contents, NodeAndStyleInfo};
+use crate::dom_traversal::{iter_child_nodes, Contents, NodeAndStyleInfo, NonReplacedContents};
 use crate::flexbox::FlexLevelBox;
 use crate::flow::float::FloatBox;
-use crate::flow::inline::InlineLevelBox;
+use crate::flow::inline::InlineItem;
 use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::FragmentTree;
@@ -66,18 +67,20 @@ impl BoxTree {
         // TODO: This should handle when different overflow is set multiple axes, which requires the
         // compositor scroll tree to allow setting a value per axis.
         let root_style = root_element.style(context);
-        let mut root_overflow = root_style.get_box().overflow_y;
+        let mut root_overflow = root_style.effective_overflow().y;
         if root_overflow == Overflow::Visible && !root_style.get_box().display.is_none() {
             for child in iter_child_nodes(root_element) {
-                if !child.to_threadsafe().as_element().map_or(false, |element| {
-                    element.is_body_element_of_html_element_root()
-                }) {
+                if !child
+                    .to_threadsafe()
+                    .as_element()
+                    .is_some_and(|element| element.is_body_element_of_html_element_root())
+                {
                     continue;
                 }
 
                 let style = child.style(context);
                 if !style.get_box().display.is_none() {
-                    root_overflow = style.get_box().overflow_y;
+                    root_overflow = style.effective_overflow().y;
                     break;
                 }
             }
@@ -122,7 +125,7 @@ impl BoxTree {
         #[allow(clippy::enum_variant_names)]
         enum UpdatePoint {
             AbsolutelyPositionedBlockLevelBox(ArcRefCell<BlockLevelBox>),
-            AbsolutelyPositionedInlineLevelBox(ArcRefCell<InlineLevelBox>),
+            AbsolutelyPositionedInlineLevelBox(ArcRefCell<InlineItem>, usize),
             AbsolutelyPositionedFlexLevelBox(ArcRefCell<FlexLevelBox>),
         }
 
@@ -180,12 +183,14 @@ impl BoxTree {
                         },
                         _ => return None,
                     },
+                    LayoutBox::InlineBox(_) => return None,
                     LayoutBox::InlineLevel(inline_level_box) => match &*inline_level_box.borrow() {
-                        InlineLevelBox::OutOfFlowAbsolutelyPositionedBox(_)
+                        InlineItem::OutOfFlowAbsolutelyPositionedBox(_, text_offset_index)
                             if box_style.position.is_absolutely_positioned() =>
                         {
                             UpdatePoint::AbsolutelyPositionedInlineLevelBox(
                                 inline_level_box.clone(),
+                                *text_offset_index,
                             )
                         },
                         _ => return None,
@@ -205,7 +210,7 @@ impl BoxTree {
         loop {
             if let Some((primary_style, display_inside, update_point)) = update_point(dirty_node) {
                 let contents = ReplacedContent::for_element(dirty_node, context)
-                    .map_or(Contents::OfElement, Contents::Replaced);
+                    .map_or_else(|| NonReplacedContents::OfElement.into(), Contents::Replaced);
                 let info = NodeAndStyleInfo::new(dirty_node, Arc::clone(&primary_style));
                 let out_of_flow_absolutely_positioned_box = ArcRefCell::new(
                     AbsolutelyPositionedBox::construct(context, &info, display_inside, contents),
@@ -217,10 +222,14 @@ impl BoxTree {
                                 out_of_flow_absolutely_positioned_box,
                             );
                     },
-                    UpdatePoint::AbsolutelyPositionedInlineLevelBox(inline_level_box) => {
+                    UpdatePoint::AbsolutelyPositionedInlineLevelBox(
+                        inline_level_box,
+                        text_offset_index,
+                    ) => {
                         *inline_level_box.borrow_mut() =
-                            InlineLevelBox::OutOfFlowAbsolutelyPositionedBox(
+                            InlineItem::OutOfFlowAbsolutelyPositionedBox(
                                 out_of_flow_absolutely_positioned_box,
+                                text_offset_index,
                             );
                     },
                     UpdatePoint::AbsolutelyPositionedFlexLevelBox(flex_level_box) => {
@@ -263,7 +272,7 @@ fn construct_for_root_element<'dom>(
     };
 
     let contents = ReplacedContent::for_element(root_element, context)
-        .map_or(Contents::OfElement, Contents::Replaced);
+        .map_or_else(|| NonReplacedContents::OfElement.into(), Contents::Replaced);
     let root_box = if box_style.position.is_absolutely_positioned() {
         BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(ArcRefCell::new(
             AbsolutelyPositionedBox::construct(context, &info, display_inside, contents),
@@ -299,18 +308,25 @@ impl BoxTree {
         layout_context: &LayoutContext,
         viewport: euclid::Size2D<f32, CSSPixel>,
     ) -> FragmentTree {
-        let style = ComputedValues::initial_values();
+        let style = layout_context
+            .style_context
+            .stylist
+            .device()
+            .default_computed_values();
 
         // FIXME: use the document’s mode:
         // https://drafts.csswg.org/css-writing-modes/#principal-flow
         let physical_containing_block = PhysicalRect::new(
             PhysicalPoint::zero(),
-            PhysicalSize::new(Length::new(viewport.width), Length::new(viewport.height)),
+            PhysicalSize::new(
+                Au::from_f32_px(viewport.width),
+                Au::from_f32_px(viewport.height),
+            ),
         );
         let initial_containing_block = DefiniteContainingBlock {
             size: LogicalVec2 {
-                inline: physical_containing_block.size.width.into(),
-                block: physical_containing_block.size.height.into(),
+                inline: physical_containing_block.size.width,
+                block: physical_containing_block.size.height,
             },
             style,
         };
@@ -344,9 +360,7 @@ impl BoxTree {
         let scrollable_overflow = root_fragments
             .iter()
             .fold(PhysicalRect::zero(), |acc, child| {
-                let child_overflow = child
-                    .borrow()
-                    .scrollable_overflow(&physical_containing_block);
+                let child_overflow = child.borrow().scrollable_overflow();
 
                 // https://drafts.csswg.org/css-overflow/#scrolling-direction
                 // We want to clip scrollable overflow on box-start and inline-start

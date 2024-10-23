@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use crossbeam_channel::{unbounded, Sender};
 use devtools_traits::DevtoolsControlMsg;
@@ -34,10 +34,10 @@ use hyper::server::conn::Http;
 use hyper::server::Server as HyperServer;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
-use lazy_static::lazy_static;
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, CancellationListener, FetchContext};
 use net::filemanager_thread::FileManager;
+use net::protocols::ProtocolRegistry;
 use net::resource_thread::CoreResourceThreadPool;
 use net::test::HttpState;
 use net_traits::filemanager_thread::FileTokenCheck;
@@ -54,15 +54,15 @@ use tokio_rustls::{self, TlsAcceptor};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_test::block_on;
 
-lazy_static! {
-    pub static ref HANDLE: Mutex<Runtime> = Mutex::new(
+pub static HANDLE: LazyLock<Mutex<Runtime>> = LazyLock::new(|| {
+    Mutex::new(
         Builder::new_multi_thread()
             .enable_io()
             .worker_threads(10)
             .build()
-            .unwrap()
-    );
-}
+            .unwrap(),
+    )
+});
 
 const DEFAULT_USER_AGENT: &'static str = "Such Browser. Very Layout. Wow.";
 
@@ -115,15 +115,16 @@ fn new_fetch_context(
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
         ))),
+        protocols: Arc::new(ProtocolRegistry::with_internal_protocols()),
     }
 }
 impl FetchTaskTarget for FetchResponseCollector {
     fn process_request_body(&mut self, _: &Request) {}
     fn process_request_eof(&mut self, _: &Request) {}
-    fn process_response(&mut self, _: &Response) {}
-    fn process_response_chunk(&mut self, _: Vec<u8>) {}
+    fn process_response(&mut self, _: &Request, _: &Response) {}
+    fn process_response_chunk(&mut self, _: &Request, _: Vec<u8>) {}
     /// Fired when the response is fully fetched
-    fn process_response_eof(&mut self, response: &Response) {
+    fn process_response_eof(&mut self, _: &Request, response: &Response) {
         let _ = self.sender.send(response.clone());
     }
 }

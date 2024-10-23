@@ -1,7 +1,7 @@
 [package]
 name = "hyper_serde"
 version = "0.13.2"
-edition = "2018"
+edition.workspace = true
 authors = ["The Servo Project Developers"]
 description = "Serde support for hyper types."
 license = "MIT OR Apache-2.0"
@@ -23,7 +23,6 @@ hyper = { workspace = true }
 mime = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
-time = { workspace = true }
 
 [dev-dependencies]
 serde_test = "1.0"

@@ -22,7 +22,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::realms::enter_realm;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 // Spec mandates at least [8000, 96000], we use [8000, 192000] to match Firefox
 // https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createbuffer
@@ -81,6 +81,7 @@ impl AudioBuffer {
         length: u32,
         sample_rate: f32,
         initial_data: Option<&[Vec<f32>]>,
+        can_gc: CanGc,
     ) -> DomRoot<AudioBuffer> {
         Self::new_with_proto(
             global,
@@ -89,6 +90,7 @@ impl AudioBuffer {
             length,
             sample_rate,
             initial_data,
+            can_gc,
         )
     }
 
@@ -100,36 +102,12 @@ impl AudioBuffer {
         length: u32,
         sample_rate: f32,
         initial_data: Option<&[Vec<f32>]>,
+        can_gc: CanGc,
     ) -> DomRoot<AudioBuffer> {
         let buffer = AudioBuffer::new_inherited(number_of_channels, length, sample_rate);
-        let buffer = reflect_dom_object_with_proto(Box::new(buffer), global, proto);
+        let buffer = reflect_dom_object_with_proto(Box::new(buffer), global, proto, can_gc);
         buffer.set_initial_data(initial_data);
         buffer
-    }
-
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-audiobuffer
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        options: &AudioBufferOptions,
-    ) -> Fallible<DomRoot<AudioBuffer>> {
-        if options.length == 0 ||
-            options.numberOfChannels == 0 ||
-            options.numberOfChannels > MAX_CHANNEL_COUNT ||
-            *options.sampleRate < MIN_SAMPLE_RATE ||
-            *options.sampleRate > MAX_SAMPLE_RATE
-        {
-            return Err(Error::NotSupported);
-        }
-        Ok(AudioBuffer::new_with_proto(
-            window,
-            proto,
-            options.numberOfChannels,
-            options.length,
-            *options.sampleRate,
-            None,
-        ))
     }
 
     // Initialize the underlying channels data with initial data provided by
@@ -206,6 +184,32 @@ impl AudioBuffer {
 }
 
 impl AudioBufferMethods for AudioBuffer {
+    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-audiobuffer
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        options: &AudioBufferOptions,
+    ) -> Fallible<DomRoot<AudioBuffer>> {
+        if options.length == 0 ||
+            options.numberOfChannels == 0 ||
+            options.numberOfChannels > MAX_CHANNEL_COUNT ||
+            *options.sampleRate < MIN_SAMPLE_RATE ||
+            *options.sampleRate > MAX_SAMPLE_RATE
+        {
+            return Err(Error::NotSupported);
+        }
+        Ok(AudioBuffer::new_with_proto(
+            window,
+            proto,
+            options.numberOfChannels,
+            options.length,
+            *options.sampleRate,
+            None,
+            can_gc,
+        ))
+    }
+
     // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-samplerate
     fn SampleRate(&self) -> Finite<f32> {
         Finite::wrap(self.sample_rate)
@@ -278,9 +282,7 @@ impl AudioBufferMethods for AudioBuffer {
             }
         }
 
-        unsafe {
-            destination.update(&dest);
-        }
+        destination.update(&dest);
 
         Ok(())
     }

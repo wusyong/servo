@@ -17,6 +17,7 @@ use crate::dom::event::Event;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::dom::xrsession::XRSession;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct XRSessionEvent {
@@ -39,8 +40,9 @@ impl XRSessionEvent {
         bubbles: bool,
         cancelable: bool,
         session: &XRSession,
+        can_gc: CanGc,
     ) -> DomRoot<XRSessionEvent> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable, session)
+        Self::new_with_proto(global, None, type_, bubbles, cancelable, session, can_gc)
     }
 
     fn new_with_proto(
@@ -50,11 +52,13 @@ impl XRSessionEvent {
         bubbles: bool,
         cancelable: bool,
         session: &XRSession,
+        can_gc: CanGc,
     ) -> DomRoot<XRSessionEvent> {
         let trackevent = reflect_dom_object_with_proto(
             Box::new(XRSessionEvent::new_inherited(session)),
             global,
             proto,
+            can_gc,
         );
         {
             let event = trackevent.upcast::<Event>();
@@ -62,11 +66,14 @@ impl XRSessionEvent {
         }
         trackevent
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl XRSessionEventMethods for XRSessionEvent {
+    // https://immersive-web.github.io/webxr/#dom-xrsessionevent-xrsessionevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &XRSessionEventBinding::XRSessionEventInit,
     ) -> Fallible<DomRoot<XRSessionEvent>> {
@@ -77,11 +84,10 @@ impl XRSessionEvent {
             init.parent.bubbles,
             init.parent.cancelable,
             &init.session,
+            can_gc,
         ))
     }
-}
 
-impl XRSessionEventMethods for XRSessionEvent {
     // https://immersive-web.github.io/webxr/#dom-xrsessioneventinit-session
     fn Session(&self) -> DomRoot<XRSession> {
         DomRoot::from_ref(&*self.session)

@@ -3,6 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::ptr;
+use std::sync::LazyLock;
 
 use js::conversions::jsstr_to_string;
 use js::glue::{AppendToIdVector, CreateProxyHandler, NewProxyObject, ProxyTraps};
@@ -32,48 +33,48 @@ use crate::script_runtime::JSContext as SafeJSContext;
 struct SyncWrapper(*const libc::c_void);
 #[allow(unsafe_code)]
 unsafe impl Sync for SyncWrapper {}
+#[allow(unsafe_code)]
+unsafe impl Send for SyncWrapper {}
 
-lazy_static::lazy_static! {
-    static ref HANDLER: SyncWrapper = {
-        let traps = ProxyTraps {
-            enter: None,
-            getOwnPropertyDescriptor: Some(get_own_property_descriptor),
-            defineProperty: Some(define_property),
-            ownPropertyKeys: Some(own_property_keys),
-            delete_: Some(delete),
-            enumerate: None,
-            getPrototypeIfOrdinary: Some(get_prototype_if_ordinary),
-            getPrototype: None,
-            setPrototype: None,
-            setImmutablePrototype: None,
-            preventExtensions: Some(prevent_extensions),
-            isExtensible: Some(is_extensible),
-            has: None,
-            get: None,
-            set: None,
-            call: None,
-            construct: None,
-            hasOwn: None,
-            getOwnEnumerablePropertyKeys: None,
-            nativeCall: None,
-            objectClassIs: None,
-            className: Some(class_name),
-            fun_toString: None,
-            boxedValue_unbox: None,
-            defaultValue: None,
-            trace: None,
-            finalize: None,
-            objectMoved: None,
-            isCallable: None,
-            isConstructor: None,
-        };
-
-        #[allow(unsafe_code)]
-        unsafe {
-            SyncWrapper(CreateProxyHandler(&traps, ptr::null()))
-        }
+static HANDLER: LazyLock<SyncWrapper> = LazyLock::new(|| {
+    let traps = ProxyTraps {
+        enter: None,
+        getOwnPropertyDescriptor: Some(get_own_property_descriptor),
+        defineProperty: Some(define_property),
+        ownPropertyKeys: Some(own_property_keys),
+        delete_: Some(delete),
+        enumerate: None,
+        getPrototypeIfOrdinary: Some(get_prototype_if_ordinary),
+        getPrototype: None,
+        setPrototype: None,
+        setImmutablePrototype: None,
+        preventExtensions: Some(prevent_extensions),
+        isExtensible: Some(is_extensible),
+        has: None,
+        get: None,
+        set: None,
+        call: None,
+        construct: None,
+        hasOwn: None,
+        getOwnEnumerablePropertyKeys: None,
+        nativeCall: None,
+        objectClassIs: None,
+        className: Some(class_name),
+        fun_toString: None,
+        boxedValue_unbox: None,
+        defaultValue: None,
+        trace: None,
+        finalize: None,
+        objectMoved: None,
+        isCallable: None,
+        isConstructor: None,
     };
-}
+
+    #[allow(unsafe_code)]
+    unsafe {
+        SyncWrapper(CreateProxyHandler(&traps, ptr::null()))
+    }
+});
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn get_own_property_descriptor(
@@ -215,13 +216,13 @@ unsafe extern "C" fn is_extensible(
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn class_name(_cx: *mut JSContext, _proxy: HandleObject) -> *const libc::c_char {
-    &b"WindowProperties\0" as *const _ as *const _
+    c"WindowProperties".as_ptr()
 }
 
 // Maybe this should be a DOMJSClass. See https://bugzilla.mozilla.org/show_bug.cgi?id=787070
 #[allow(unsafe_code)]
 static CLASS: JSClass = JSClass {
-    name: b"WindowProperties\0" as *const u8 as *const libc::c_char,
+    name: c"WindowProperties".as_ptr(),
     flags: JSClass_NON_NATIVE |
         JSCLASS_IS_PROXY |
         JSCLASS_DELAY_METADATA_BUILDER |

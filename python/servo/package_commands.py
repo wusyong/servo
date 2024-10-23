@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 
+import servo.gstreamer
 from mach.decorators import (
     CommandArgument,
     CommandProvider,
@@ -34,18 +35,16 @@ from servo.command_base import (
     archive_deterministically,
     BuildNotFound,
     cd,
+    check_output,
     CommandBase,
-    is_macosx,
     is_windows,
 )
-from servo.build_commands import copy_dependencies
-from servo.gstreamer import macos_gst_root
 from servo.util import delete, get_target_dir
 
 PACKAGES = {
     'android': [
-        'android/armv7-linux-androideabi/production/servoapp.apk',
-        'android/armv7-linux-androideabi/production/servoview.aar',
+        'android/aarch64-linux-android/release/servoapp.apk',
+        'android/aarch64-linux-android/release/servoview.aar',
     ],
     'linux': [
         'production/servo-tech-demo.tar.gz',
@@ -53,13 +52,13 @@ PACKAGES = {
     'mac': [
         'production/servo-tech-demo.dmg',
     ],
-    'maven': [
-        'android/gradle/servoview/maven/org/mozilla/servoview/servoview-armv7/',
-        'android/gradle/servoview/maven/org/mozilla/servoview/servoview-x86/',
-    ],
     'windows-msvc': [
         r'production\msi\Servo.exe',
         r'production\msi\Servo.zip',
+    ],
+    'ohos': [
+        ('openharmony/aarch64-unknown-linux-ohos/release/entry/build/'
+            'default/outputs/default/servoshell-default-signed.hap')
     ],
 }
 
@@ -82,7 +81,7 @@ def copy_windows_dependencies(binary_path, destination):
             shutil.copy(path.join(binary_path, f), destination)
 
 
-def change_prefs(resources_path, platform, vr=False):
+def change_prefs(resources_path, platform):
     print("Swapping prefs")
     prefs_path = path.join(resources_path, "prefs.json")
     package_prefs_path = path.join(resources_path, "package-prefs.json")
@@ -92,8 +91,6 @@ def change_prefs(resources_path, platform, vr=False):
         package_prefs = json.load(package_prefs)
         if "all" in package_prefs:
             pref_sets += [package_prefs["all"]]
-        if vr and "vr" in package_prefs:
-            pref_sets += [package_prefs["vr"]]
         if platform in package_prefs:
             pref_sets += [package_prefs[platform]]
         for pref_set in pref_sets:
@@ -132,42 +129,29 @@ class PackageCommands(CommandBase):
                      default=None,
                      action='store_true',
                      help='Package Android')
+    @CommandArgument('--ohos',
+                     default=None,
+                     action='store_true',
+                     help='Package OpenHarmony')
     @CommandArgument('--target', '-t',
                      default=None,
                      help='Package for given target platform')
-    @CommandArgument('--flavor', '-f',
-                     default=None,
-                     help='Package using the given Gradle flavor')
-    @CommandArgument('--maven',
-                     default=None,
-                     action='store_true',
-                     help='Create a local Maven repository')
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def package(self, build_type: BuildType, android=None, target=None, flavor=None, maven=False):
-        if android is None:
-            android = self.config["build"]["android"]
-        if target and android:
-            print("Please specify either --target or --android.")
-            sys.exit(1)
-        if not android:
-            android = self.setup_configuration_for_android_target(target)
-        else:
-            target = self.config["android"]["target"]
-
-        self.cross_compile_target = target
+    @CommandBase.common_command_arguments(build_configuration=False, build_type=True, package_configuration=True)
+    @CommandBase.allow_target_configuration
+    def package(self, build_type: BuildType, flavor=None, with_asan=False):
         env = self.build_env()
-        binary_path = self.get_binary_path(build_type, target=target, android=android)
+        binary_path = self.get_binary_path(build_type, asan=with_asan)
         dir_to_root = self.get_top_dir()
         target_dir = path.dirname(binary_path)
-        if android:
-            android_target = self.config["android"]["target"]
-            if "aarch64" in android_target:
+        if self.is_android():
+            target_triple = self.target.triple()
+            if "aarch64" in target_triple:
                 arch_string = "Arm64"
-            elif "armv7" in android_target:
+            elif "armv7" in target_triple:
                 arch_string = "Armv7"
-            elif "i686" in android_target:
+            elif "i686" in target_triple:
                 arch_string = "x86"
-            elif "x86_64" in android_target:
+            elif "x86_64" in target_triple:
                 arch_string = "x64"
             else:
                 arch_string = "Arm"
@@ -183,14 +167,12 @@ class PackageCommands(CommandBase):
             if flavor is not None:
                 flavor_name = flavor.title()
 
-            vr = flavor == "googlevr" or flavor == "oculusvr"
-
             dir_to_resources = path.join(self.get_top_dir(), 'target', 'android', 'resources')
             if path.exists(dir_to_resources):
                 delete(dir_to_resources)
 
             shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
-            change_prefs(dir_to_resources, "android", vr=vr)
+            change_prefs(dir_to_resources, "android")
 
             variant = ":assemble" + flavor_name + arch_string + build_type_string
             apk_task_name = ":servoapp" + variant
@@ -202,7 +184,66 @@ class PackageCommands(CommandBase):
             except subprocess.CalledProcessError as e:
                 print("Packaging Android exited with return value %d" % e.returncode)
                 return e.returncode
-        elif is_macosx():
+        elif self.is_openharmony():
+            # hvigor doesn't support an option to place output files in a specific directory
+            # so copy the source files into the target/openharmony directory first.
+            ohos_app_dir = path.join(self.get_top_dir(), "support", "openharmony")
+            build_mode = build_type.directory_name()
+            ohos_target_dir = path.join(
+                self.get_top_dir(), "target", "openharmony", self.target.triple(), build_mode)
+            if path.exists(ohos_target_dir):
+                print("Cleaning up from previous packaging")
+                delete(ohos_target_dir)
+            shutil.copytree(ohos_app_dir, ohos_target_dir)
+            resources_src_dir = path.join(self.get_top_dir(), "resources")
+            resources_app_dir = path.join(ohos_target_dir, "AppScope", "resources", "resfile", "servo")
+            os.makedirs(resources_app_dir, exist_ok=True)
+            shutil.copytree(resources_src_dir, resources_app_dir, dirs_exist_ok=True)
+
+            # Map non-debug profiles to 'release' buildMode HAP.
+            if build_type.is_custom():
+                build_mode = "release"
+
+            flavor_name = "default"
+            if flavor is not None:
+                flavor_name = flavor
+
+            hvigor_command = ["--no-daemon", "assembleHap",
+                              "-p", f"product={flavor_name}",
+                              "-p", f"buildMode={build_mode}"]
+            # Detect if PATH already has hvigor, or else fallback to npm installation
+            # provided via HVIGOR_PATH
+            if "HVIGOR_PATH" not in env:
+                try:
+                    with cd(ohos_target_dir):
+                        version = check_output(["hvigorw", "--version", "--no-daemon"])
+                    print(f"Found `hvigorw` with version {str(version, 'utf-8').strip()} in system PATH")
+                    hvigor_command[0:0] = ["hvigorw"]
+                except FileNotFoundError:
+                    print("Unable to find `hvigor` tool. Please either modify PATH to include the"
+                          "path to hvigorw or set the HVIGOR_PATH environment variable to the npm"
+                          "installation containing `node_modules` directory with hvigor modules.")
+                    sys.exit(1)
+            else:
+                env["NODE_PATH"] = env["HVIGOR_PATH"] + "/node_modules"
+                hvigor_script = f"{env['HVIGOR_PATH']}/node_modules/@ohos/hvigor/bin/hvigor.js"
+                hvigor_command[0:0] = ["node", hvigor_script]
+
+            abi_string = self.target.abi_string()
+            ohos_libs_dir = path.join(ohos_target_dir, "entry", "libs", abi_string)
+            os.makedirs(ohos_libs_dir)
+            # The libservoshell.so binary that was built needs to be copied
+            # into the app folder heirarchy where hvigor expects it.
+            print(f"Copying {binary_path} to {ohos_libs_dir}")
+            shutil.copy(binary_path, ohos_libs_dir)
+            try:
+                with cd(ohos_target_dir):
+                    print("Calling", hvigor_command)
+                    subprocess.check_call(hvigor_command, env=env)
+            except subprocess.CalledProcessError as e:
+                print("Packaging OpenHarmony exited with return value %d" % e.returncode)
+                return e.returncode
+        elif 'darwin' in self.target.triple():
             print("Creating Servo.app")
             dir_to_dmg = path.join(target_dir, 'dmg')
             dir_to_app = path.join(dir_to_dmg, 'Servo.app')
@@ -222,10 +263,9 @@ class PackageCommands(CommandBase):
 
             change_prefs(dir_to_resources, "macosx")
 
-            print("Finding dylibs and relinking")
+            print("Packaging GStreamer...")
             dmg_binary = path.join(content_dir, "servo")
-            dir_to_gst_lib = path.join(macos_gst_root(), 'lib', '')
-            copy_dependencies(dmg_binary, lib_dir, dir_to_gst_lib)
+            servo.gstreamer.package_gstreamer_dylibs(dmg_binary, lib_dir, self.target)
 
             print("Adding version to Credits.rtf")
             version_command = [binary_path, '--version']
@@ -272,7 +312,7 @@ class PackageCommands(CommandBase):
             delete(dir_to_dmg)
             print("Packaged Servo into " + dmg_path)
 
-        elif is_windows():
+        elif 'windows' in self.target.triple():
             dir_to_msi = path.join(target_dir, 'msi')
             if path.exists(dir_to_msi):
                 print("Cleaning up from previous packaging")
@@ -372,6 +412,9 @@ class PackageCommands(CommandBase):
     @CommandArgument('--android',
                      action='store_true',
                      help='Install on Android')
+    @CommandArgument('--ohos',
+                     action='store_true',
+                     help='Install on OpenHarmony')
     @CommandArgument('--emulator',
                      action='store_true',
                      help='For Android, install to the only emulated device')
@@ -381,32 +424,27 @@ class PackageCommands(CommandBase):
     @CommandArgument('--target', '-t',
                      default=None,
                      help='Install the given target platform')
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def install(self, build_type: BuildType, android=False, emulator=False, usb=False, target=None):
-        if target and android:
-            print("Please specify either --target or --android.")
-            sys.exit(1)
-        if not android:
-            android = self.setup_configuration_for_android_target(target)
-        self.cross_compile_target = target
-
+    @CommandBase.common_command_arguments(build_configuration=False, build_type=True, package_configuration=True)
+    @CommandBase.allow_target_configuration
+    def install(self, build_type: BuildType, emulator=False, usb=False, with_asan=False, flavor=None):
         env = self.build_env()
         try:
-            binary_path = self.get_binary_path(build_type, android=android)
+            binary_path = self.get_binary_path(build_type, asan=with_asan)
         except BuildNotFound:
             print("Servo build not found. Building servo...")
             result = Registrar.dispatch(
-                "build", context=self.context, build_type=build_type, android=android,
+                "build", context=self.context, build_type=build_type, flavor=flavor
             )
             if result:
                 return result
             try:
-                binary_path = self.get_binary_path(build_type, android=android)
+                binary_path = self.get_binary_path(build_type, asan=with_asan)
             except BuildNotFound:
                 print("Rebuilding Servo did not solve the missing build problem.")
                 return 1
-        if android:
-            pkg_path = self.get_apk_path(build_type)
+
+        if self.is_android():
+            pkg_path = self.target.get_package_path(build_type.directory_name())
             exec_command = [self.android_adb_path(env)]
             if emulator and usb:
                 print("Cannot install to both emulator and USB at the same time.")
@@ -416,6 +454,10 @@ class PackageCommands(CommandBase):
             if usb:
                 exec_command += ["-d"]
             exec_command += ["install", "-r", pkg_path]
+        elif self.is_openharmony():
+            pkg_path = self.target.get_package_path(build_type.directory_name(), flavor=flavor)
+            hdc_path = path.join(env["OHOS_SDK_NATIVE"], "../", "toolchains", "hdc")
+            exec_command = [hdc_path, "install", "-r", pkg_path]
         elif is_windows():
             pkg_path = path.join(path.dirname(binary_path), 'msi', 'Servo.msi')
             exec_command = ["msiexec", "/i", pkg_path]
@@ -423,7 +465,7 @@ class PackageCommands(CommandBase):
         if not path.exists(pkg_path):
             print("Servo package not found. Packaging servo...")
             result = Registrar.dispatch(
-                "package", context=self.context, build_type=build_type, android=android,
+                "package", context=self.context, build_type=build_type, flavor=flavor
             )
             if result != 0:
                 return result
@@ -531,32 +573,6 @@ class PackageCommands(CommandBase):
                 }
             )
 
-        def update_maven(directory):
-            (aws_access_key, aws_secret_access_key) = get_s3_secret()
-            s3 = boto3.client(
-                's3',
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_access_key
-            )
-            BUCKET = 'servo-builds2'
-
-            nightly_dir = 'nightly/maven'
-            dest_key_base = directory.replace("target/android/gradle/servoview/maven", nightly_dir)
-            if dest_key_base[-1] == '/':
-                dest_key_base = dest_key_base[:-1]
-
-            # Given a directory with subdirectories like 0.0.1.20181005.caa4d190af...
-            for artifact_dir in os.listdir(directory):
-                base_dir = os.path.join(directory, artifact_dir)
-                if not os.path.isdir(base_dir):
-                    continue
-                package_upload_base = "{}/{}".format(dest_key_base, artifact_dir)
-                # Upload all of the files inside the subdirectory.
-                for f in os.listdir(base_dir):
-                    file_upload_key = "{}/{}".format(package_upload_base, f)
-                    print("Uploading %s to %s" % (os.path.join(base_dir, f), file_upload_key))
-                    s3.upload_file(os.path.join(base_dir, f), BUCKET, file_upload_key)
-
         timestamp = datetime.utcnow().replace(microsecond=0)
         for package in packages_for_platform(platform):
             if path.isdir(package):
@@ -581,9 +597,5 @@ class PackageCommands(CommandBase):
 
             upload_to_s3(platform, package, package_hash, timestamp)
             upload_to_github_release(platform, package, package_hash)
-
-        if platform == 'maven':
-            for package in packages_for_platform(platform):
-                update_maven(package)
 
         return 0

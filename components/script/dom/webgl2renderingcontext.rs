@@ -5,6 +5,7 @@
 use std::cell::Cell;
 use std::cmp;
 use std::ptr::{self, NonNull};
+use std::rc::Rc;
 
 use canvas_traits::webgl::WebGLError::*;
 use canvas_traits::webgl::{
@@ -33,6 +34,7 @@ use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::{
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     ArrayBufferViewOrArrayBuffer, Float32ArrayOrUnrestrictedFloatSequence,
+    HTMLCanvasElementOrOffscreenCanvas,
     ImageDataOrHTMLImageElementOrHTMLCanvasElementOrHTMLVideoElement, Int32ArrayOrLongSequence,
     Uint32ArrayOrUnsignedLongSequence,
 };
@@ -41,7 +43,8 @@ use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlcanvaselement::{HTMLCanvasElement, LayoutCanvasRenderingContextHelpers};
+use crate::dom::htmlcanvaselement::LayoutCanvasRenderingContextHelpers;
+use crate::dom::promise::Promise;
 use crate::dom::webgl_validations::tex_image_2d::{
     TexImage2DValidator, TexImage2DValidatorResult, TexStorageValidator, TexStorageValidatorResult,
 };
@@ -66,7 +69,7 @@ use crate::dom::webgluniformlocation::WebGLUniformLocation;
 use crate::dom::webglvertexarrayobject::WebGLVertexArrayObject;
 use crate::dom::window::Window;
 use crate::js::conversions::ToJSValConvertible;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[crown::unrooted_must_root_lint::must_root]
 #[derive(JSTraceable, MallocSizeOf)]
@@ -110,10 +113,12 @@ pub struct WebGL2RenderingContext {
     default_fb_drawbuffer: Cell<u32>,
 }
 
+// TODO: This should be in mozjs
+// upstream: https://searchfox.org/mozilla-central/source/js/public/ScalarType.h#66
 fn typedarray_elem_size(typeid: Type) -> usize {
     match typeid {
         Type::Int8 | Type::Uint8 | Type::Uint8Clamped => 1,
-        Type::Int16 | Type::Uint16 => 2,
+        Type::Int16 | Type::Uint16 | Type::Float16 => 2,
         Type::Int32 | Type::Uint32 | Type::Float32 => 4,
         Type::Int64 | Type::Float64 => 8,
         Type::BigInt64 | Type::BigUint64 => 8,
@@ -135,11 +140,13 @@ struct ReadPixelsSizes {
 impl WebGL2RenderingContext {
     fn new_inherited(
         window: &Window,
-        canvas: &HTMLCanvasElement,
+        canvas: &HTMLCanvasElementOrOffscreenCanvas,
         size: Size2D<u32>,
         attrs: GLContextAttributes,
+        can_gc: CanGc,
     ) -> Option<WebGL2RenderingContext> {
-        let base = WebGLRenderingContext::new(window, canvas, WebGLVersion::WebGL2, size, attrs)?;
+        let base =
+            WebGLRenderingContext::new(window, canvas, WebGLVersion::WebGL2, size, attrs, can_gc)?;
 
         let samplers = (0..base.limits().max_combined_texture_image_units)
             .map(|_| Default::default())
@@ -182,11 +189,12 @@ impl WebGL2RenderingContext {
     #[allow(crown::unrooted_must_root)]
     pub fn new(
         window: &Window,
-        canvas: &HTMLCanvasElement,
+        canvas: &HTMLCanvasElementOrOffscreenCanvas,
         size: Size2D<u32>,
         attrs: GLContextAttributes,
+        can_gc: CanGc,
     ) -> Option<DomRoot<WebGL2RenderingContext>> {
-        WebGL2RenderingContext::new_inherited(window, canvas, size, attrs)
+        WebGL2RenderingContext::new_inherited(window, canvas, size, attrs, can_gc)
             .map(|ctx| reflect_dom_object(Box::new(ctx), window))
     }
 
@@ -346,7 +354,7 @@ impl WebGL2RenderingContext {
     }
 
     fn unbind_from(&self, slot: &MutNullableDom<WebGLBuffer>, buffer: &WebGLBuffer) {
-        if slot.get().map_or(false, |b| buffer == &*b) {
+        if slot.get().is_some_and(|b| buffer == &*b) {
             buffer.decrement_attached_counter(Operation::Infallible);
             slot.set(None);
         }
@@ -898,7 +906,7 @@ impl WebGL2RenderingContext {
 
 impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
     /// <https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.1>
-    fn Canvas(&self) -> DomRoot<HTMLCanvasElement> {
+    fn Canvas(&self) -> HTMLCanvasElementOrOffscreenCanvas {
         self.base.Canvas()
     }
 
@@ -1448,10 +1456,10 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         }
         let src_is_elemarray = read_buffer
             .target()
-            .map_or(false, |t| t == constants::ELEMENT_ARRAY_BUFFER);
+            .is_some_and(|t| t == constants::ELEMENT_ARRAY_BUFFER);
         let dst_is_elemarray = write_buffer
             .target()
-            .map_or(false, |t| t == constants::ELEMENT_ARRAY_BUFFER);
+            .is_some_and(|t| t == constants::ELEMENT_ARRAY_BUFFER);
         if src_is_elemarray != dst_is_elemarray {
             return self.base.webgl_error(InvalidOperation);
         }
@@ -3134,16 +3142,14 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
 
         let buff = IpcSharedMemory::from_bytes(unsafe { &src_data.as_slice()[src_byte_offset..] });
 
-        let expected_byte_length = match {
-            self.base.validate_tex_image_2d_data(
-                width,
-                height,
-                format,
-                data_type,
-                unpacking_alignment,
-                Some(&*src_data),
-            )
-        } {
+        let expected_byte_length = match self.base.validate_tex_image_2d_data(
+            width,
+            height,
+            format,
+            data_type,
+            unpacking_alignment,
+            Some(&*src_data),
+        ) {
             Ok(byte_length) => byte_length,
             Err(()) => return Ok(()),
         };
@@ -3422,7 +3428,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         if let Some(sampler) = sampler {
             handle_potential_webgl_error!(self.base, self.base.validate_ownership(sampler), return);
             for slot in self.samplers.iter() {
-                if slot.get().map_or(false, |s| sampler == &*s) {
+                if slot.get().is_some_and(|s| sampler == &*s) {
                     slot.set(None);
                 }
             }
@@ -3968,7 +3974,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
             buffer.map(|b| b.id()),
         ));
 
-        for slot in &[&generic_slot, &indexed_binding.buffer] {
+        for slot in &[generic_slot, &indexed_binding.buffer] {
             if let Some(old) = slot.get() {
                 old.decrement_attached_counter(Operation::Infallible);
             }
@@ -4046,7 +4052,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
             size,
         ));
 
-        for slot in &[&generic_slot, &indexed_binding.buffer] {
+        for slot in &[generic_slot, &indexed_binding.buffer] {
             if let Some(old) = slot.get() {
                 old.decrement_attached_counter(Operation::Infallible);
             }
@@ -4470,6 +4476,14 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         depth: i32,
     ) {
         self.tex_storage(3, target, levels, internal_format, width, height, depth)
+    }
+
+    /// <https://immersive-web.github.io/webxr/#dom-webglrenderingcontextbase-makexrcompatible>
+    fn MakeXRCompatible(&self, can_gc: CanGc) -> Rc<Promise> {
+        // XXXManishearth Fill in with compatibility checks when rust-webxr supports this
+        let p = Promise::new(&self.global(), can_gc);
+        p.resolve_native(&());
+        p
     }
 }
 

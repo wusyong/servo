@@ -8,13 +8,16 @@ use servo_media::audio::node::AudioNodeInit;
 
 use crate::dom::audiocontext::AudioContext;
 use crate::dom::audionode::AudioNode;
-use crate::dom::bindings::codegen::Bindings::MediaStreamTrackAudioSourceNodeBinding::MediaStreamTrackAudioSourceOptions;
+use crate::dom::bindings::codegen::Bindings::MediaStreamTrackAudioSourceNodeBinding::{
+    MediaStreamTrackAudioSourceNodeMethods, MediaStreamTrackAudioSourceOptions,
+};
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::mediastreamtrack::MediaStreamTrack;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct MediaStreamTrackAudioSourceNode {
@@ -45,8 +48,9 @@ impl MediaStreamTrackAudioSourceNode {
         window: &Window,
         context: &AudioContext,
         track: &MediaStreamTrack,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaStreamTrackAudioSourceNode>> {
-        Self::new_with_proto(window, None, context, track)
+        Self::new_with_proto(window, None, context, track, can_gc)
     }
 
     #[allow(crown::unrooted_must_root)]
@@ -55,15 +59,24 @@ impl MediaStreamTrackAudioSourceNode {
         proto: Option<HandleObject>,
         context: &AudioContext,
         track: &MediaStreamTrack,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaStreamTrackAudioSourceNode>> {
         let node = MediaStreamTrackAudioSourceNode::new_inherited(context, track)?;
-        Ok(reflect_dom_object_with_proto(Box::new(node), window, proto))
+        Ok(reflect_dom_object_with_proto(
+            Box::new(node),
+            window,
+            proto,
+            can_gc,
+        ))
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl MediaStreamTrackAudioSourceNodeMethods for MediaStreamTrackAudioSourceNode {
+    /// <https://webaudio.github.io/web-audio-api/#dom-mediastreamtrackaudiosourcenode-mediastreamtrackaudiosourcenode>
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         context: &AudioContext,
         options: &MediaStreamTrackAudioSourceOptions,
     ) -> Fallible<DomRoot<MediaStreamTrackAudioSourceNode>> {
@@ -72,6 +85,7 @@ impl MediaStreamTrackAudioSourceNode {
             proto,
             context,
             &options.mediaStreamTrack,
+            can_gc,
         )
     }
 }

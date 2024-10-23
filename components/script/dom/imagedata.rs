@@ -21,7 +21,7 @@ use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
 pub struct ImageData {
@@ -39,6 +39,7 @@ impl ImageData {
         width: u32,
         height: u32,
         mut data: Option<Vec<u8>>,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<ImageData>> {
         let len = width * height * 4;
         unsafe {
@@ -48,9 +49,9 @@ impl ImageData {
                 d.resize(len as usize, 0);
                 let data = CreateWith::Slice(&d[..]);
                 Uint8ClampedArray::create(*cx, data, js_object.handle_mut()).unwrap();
-                Self::new_with_jsobject(global, None, width, Some(height), js_object.get())
+                Self::new_with_jsobject(global, None, width, Some(height), js_object.get(), can_gc)
             } else {
-                Self::new_without_jsobject(global, None, width, height)
+                Self::new_without_jsobject(global, None, width, height, can_gc)
             }
         }
     }
@@ -62,6 +63,7 @@ impl ImageData {
         width: u32,
         opt_height: Option<u32>,
         jsobject: *mut JSObject,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<ImageData>> {
         let heap_typed_array = match new_initialized_heap_buffer_source::<ClampedU8>(
             HeapTypedArrayInit::Buffer(BufferSource::Uint8ClampedArray(Heap::boxed(jsobject))),
@@ -90,7 +92,7 @@ impl ImageData {
         }
 
         let height = len / width;
-        if opt_height.map_or(false, |x| height != x) {
+        if opt_height.is_some_and(|x| height != x) {
             return Err(Error::IndexSize);
         }
 
@@ -101,7 +103,9 @@ impl ImageData {
             data: heap_typed_array,
         });
 
-        Ok(reflect_dom_object_with_proto(imagedata, global, proto))
+        Ok(reflect_dom_object_with_proto(
+            imagedata, global, proto, can_gc,
+        ))
     }
 
     fn new_without_jsobject(
@@ -109,6 +113,7 @@ impl ImageData {
         proto: Option<HandleObject>,
         width: u32,
         height: u32,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<ImageData>> {
         if width == 0 || height == 0 {
             return Err(Error::IndexSize);
@@ -131,30 +136,22 @@ impl ImageData {
             data: heap_typed_array,
         });
 
-        Ok(reflect_dom_object_with_proto(imagedata, global, proto))
+        Ok(reflect_dom_object_with_proto(
+            imagedata, global, proto, can_gc,
+        ))
     }
-    /// <https://html.spec.whatwg.org/multipage/#pixel-manipulation:dom-imagedata-3>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        width: u32,
-        height: u32,
-    ) -> Fallible<DomRoot<Self>> {
-        Self::new_without_jsobject(global, proto, width, height)
+    #[allow(unsafe_code)]
+    pub fn to_shared_memory(&self) -> IpcSharedMemory {
+        IpcSharedMemory::from_bytes(unsafe { self.as_slice() })
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#pixel-manipulation:dom-imagedata-4>
-    #[allow(unused_variables, non_snake_case)]
-    pub fn Constructor_(
-        cx: JSContext,
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        jsobject: *mut JSObject,
-        width: u32,
-        opt_height: Option<u32>,
-    ) -> Fallible<DomRoot<Self>> {
-        Self::new_with_jsobject(global, proto, width, opt_height, jsobject)
+    #[allow(unsafe_code)]
+    pub unsafe fn get_rect(&self, rect: Rect<u64>) -> Cow<[u8]> {
+        pixels::rgba8_get_rect(self.as_slice(), self.get_size().to_u64(), rect)
+    }
+
+    pub fn get_size(&self) -> Size2D<u32> {
+        Size2D::new(self.Width(), self.Height())
     }
 
     /// Nothing must change the array on the JS side while the slice is live.
@@ -173,23 +170,33 @@ impl ImageData {
         let ptr: *const [u8] = internal_data.as_slice() as *const _;
         &*ptr
     }
-
-    #[allow(unsafe_code)]
-    pub fn to_shared_memory(&self) -> IpcSharedMemory {
-        IpcSharedMemory::from_bytes(unsafe { self.as_slice() })
-    }
-
-    #[allow(unsafe_code)]
-    pub unsafe fn get_rect(&self, rect: Rect<u64>) -> Cow<[u8]> {
-        pixels::rgba8_get_rect(self.as_slice(), self.get_size().to_u64(), rect)
-    }
-
-    pub fn get_size(&self) -> Size2D<u32> {
-        Size2D::new(self.Width(), self.Height())
-    }
 }
 
 impl ImageDataMethods for ImageData {
+    /// <https://html.spec.whatwg.org/multipage/#pixel-manipulation:dom-imagedata-3>
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        width: u32,
+        height: u32,
+    ) -> Fallible<DomRoot<Self>> {
+        Self::new_without_jsobject(global, proto, width, height, can_gc)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#pixel-manipulation:dom-imagedata-4>
+    fn Constructor_(
+        _cx: JSContext,
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        jsobject: *mut JSObject,
+        width: u32,
+        opt_height: Option<u32>,
+    ) -> Fallible<DomRoot<Self>> {
+        Self::new_with_jsobject(global, proto, width, opt_height, jsobject, can_gc)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-imagedata-width>
     fn Width(&self) -> u32 {
         self.width

@@ -9,12 +9,16 @@ use std::collections::{HashMap, VecDeque};
 use std::ops::Index;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{mem, ptr};
 
-use content_security_policy::CspList;
+use base::id::{
+    BlobId, BroadcastChannelRouterId, MessagePortId, MessagePortRouterId, PipelineId,
+    ServiceWorkerId, ServiceWorkerRegistrationId,
+};
+use content_security_policy::{CheckResult, CspList, PolicyDisposition};
 use crossbeam_channel::Sender;
 use devtools_traits::{PageError, ScriptToDevtoolsControlMsg};
 use dom_struct::dom_struct;
@@ -24,42 +28,45 @@ use ipc_channel::router::ROUTER;
 use js::glue::{IsWrapper, UnwrapObjectDynamic};
 use js::jsapi::{
     Compile1, CurrentGlobalOrNull, GetNonCCWObjectGlobal, HandleObject, Heap,
-    InstantiateGlobalStencil, InstantiateOptions, JSContext, JSObject, JSScript, SetScriptPrivate,
+    InstantiateGlobalStencil, InstantiateOptions, JSContext, JSObject, JSScript, RuntimeCode,
+    SetScriptPrivate,
 };
 use js::jsval::{JSVal, PrivateValue, UndefinedValue};
 use js::panic::maybe_resume_unwind;
 use js::rust::wrappers::{JS_ExecuteScript, JS_GetScriptPrivate};
 use js::rust::{
-    get_object_class, transform_str_to_source_text, CompileOptionsWrapper, HandleValue,
+    describe_scripted_caller, get_object_class, transform_str_to_source_text,
+    CompileOptionsWrapper, CustomAutoRooter, CustomAutoRooterGuard, HandleValue,
     MutableHandleValue, ParentRuntime, Runtime,
 };
 use js::{JSCLASS_IS_DOMJSCLASS, JSCLASS_IS_GLOBAL};
-use msg::constellation_msg::{
-    BlobId, BroadcastChannelRouterId, MessagePortId, MessagePortRouterId, PipelineId,
-    ServiceWorkerId, ServiceWorkerRegistrationId,
-};
 use net_traits::blob_url_store::{get_blob_origin, BlobBuf};
 use net_traits::filemanager_thread::{
     FileManagerResult, FileManagerThreadMsg, ReadFileProgress, RelativePos,
 };
 use net_traits::image_cache::ImageCache;
-use net_traits::request::Referrer;
+use net_traits::request::{Referrer, RequestBuilder};
 use net_traits::response::HttpsState;
-use net_traits::{CoreResourceMsg, CoreResourceThread, IpcSend, ResourceThreads};
-use parking_lot::Mutex;
+use net_traits::{
+    fetch_async, CoreResourceMsg, CoreResourceThread, FetchResponseListener, IpcSend,
+    ResourceThreads,
+};
 use profile_traits::{ipc as profile_ipc, mem as profile_mem, time as profile_time};
 use script_traits::serializable::{BlobData, BlobImpl, FileBlob};
 use script_traits::transferable::MessagePortImpl;
 use script_traits::{
-    BroadcastMsg, GamepadEvent, GamepadUpdateType, MessagePortMsg, MsDuration, PortMessageTask,
-    ScriptMsg, ScriptToConstellationChan, TimerEvent, TimerEventId, TimerSchedulerMsg, TimerSource,
+    BroadcastMsg, GamepadEvent, GamepadSupportedHapticEffects, GamepadUpdateType, MessagePortMsg,
+    PortMessageTask, ScriptMsg, ScriptToConstellationChan, TimerEvent, TimerEventId,
+    TimerSchedulerMsg, TimerSource,
 };
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use uuid::Uuid;
-use webgpu::identity::WebGPUOpResult;
-use webgpu::{ErrorScopeId, WebGPUDevice};
+use webgpu::{DeviceLostReason, WebGPUDevice};
 
-use super::bindings::trace::HashMapTracedValues;
+use super::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeOptions;
+use super::bindings::codegen::Bindings::WebGPUBinding::GPUDeviceLostReason;
+use super::bindings::error::Fallible;
+use super::bindings::trace::{HashMapTracedValues, RootedTraceableBox};
 use crate::dom::bindings::cell::{DomRefCell, RefMut};
 use crate::dom::bindings::codegen::Bindings::BroadcastChannelBinding::BroadcastChannelMethods;
 use crate::dom::bindings::codegen::Bindings::EventSourceBinding::EventSource_Binding::EventSourceMethods;
@@ -98,7 +105,7 @@ use crate::dom::gamepad::{contains_user_gesture, Gamepad};
 use crate::dom::gamepadevent::GamepadEventType;
 use crate::dom::gpudevice::GPUDevice;
 use crate::dom::htmlscriptelement::{ScriptId, SourceCode};
-use crate::dom::identityhub::Identities;
+use crate::dom::identityhub::IdentityHub;
 use crate::dom::imagebitmap::ImageBitmap;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::messageport::MessagePort;
@@ -113,12 +120,14 @@ use crate::dom::window::Window;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::dom::workletglobalscope::WorkletGlobalScope;
 use crate::microtask::{Microtask, MicrotaskQueue, UserMicrotask};
+use crate::network_listener::{NetworkListener, PreInvoke};
 use crate::realms::{enter_realm, AlreadyInRealm, InRealm};
 use crate::script_module::{DynamicModuleList, ModuleScript, ModuleTree, ScriptFetchOptions};
 use crate::script_runtime::{
-    CommonScriptMsg, ContextForRequestInterrupt, JSContext as SafeJSContext, ScriptChan, ScriptPort,
+    CanGc, CommonScriptMsg, JSContext as SafeJSContext, ScriptChan, ScriptPort, ThreadSafeJSContext,
 };
 use crate::script_thread::{MainThreadScriptChan, ScriptThread};
+use crate::security_manager::CSPViolationReporter;
 use crate::task::TaskCanceller;
 use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
 use crate::task_source::file_reading::FileReadingTaskSource;
@@ -145,7 +154,8 @@ pub struct AutoCloseWorker {
     #[no_trace]
     control_sender: Sender<DedicatedWorkerControlMsg>,
     /// The context to request an interrupt on the worker thread.
-    context: ContextForRequestInterrupt,
+    #[no_trace]
+    context: ThreadSafeJSContext,
 }
 
 impl Drop for AutoCloseWorker {
@@ -162,7 +172,7 @@ impl Drop for AutoCloseWorker {
             warn!("Couldn't send an exit message to a dedicated worker.");
         }
 
-        self.context.request_interrupt();
+        self.context.request_interrupt_callback();
 
         // TODO: step 2 and 3.
         // Step 4 is unnecessary since we don't use actual ports for dedicated workers.
@@ -319,10 +329,10 @@ pub struct GlobalScope {
     /// Identity Manager for WebGPU resources
     #[ignore_malloc_size_of = "defined in wgpu"]
     #[no_trace]
-    gpu_id_hub: Arc<Mutex<Identities>>,
+    gpu_id_hub: Arc<IdentityHub>,
 
     /// WebGPU devices
-    gpu_devices: DomRefCell<HashMapTracedValues<WebGPUDevice, Dom<GPUDevice>>>,
+    gpu_devices: DomRefCell<HashMapTracedValues<WebGPUDevice, WeakRef<GPUDevice>>>,
 
     // https://w3c.github.io/performance-timeline/#supportedentrytypes-attribute
     #[ignore_malloc_size_of = "mozjs"]
@@ -368,6 +378,8 @@ struct TimerListener {
     context: Trusted<GlobalScope>,
 }
 
+type FileListenerCallback = Box<dyn Fn(Rc<Promise>, Fallible<Vec<u8>>) + Send>;
+
 /// A wrapper for the handling of file data received by the ipc router
 struct FileListener {
     /// State should progress as either of:
@@ -378,19 +390,14 @@ struct FileListener {
     task_canceller: TaskCanceller,
 }
 
-enum FileListenerCallback {
-    Promise(Box<dyn Fn(Rc<Promise>, Result<Vec<u8>, Error>) + Send>),
-    Stream,
-}
-
 enum FileListenerTarget {
-    Promise(TrustedPromise),
+    Promise(TrustedPromise, FileListenerCallback),
     Stream(Trusted<ReadableStream>),
 }
 
 enum FileListenerState {
-    Empty(FileListenerCallback, FileListenerTarget),
-    Receiving(Vec<u8>, FileListenerCallback, FileListenerTarget),
+    Empty(FileListenerTarget),
+    Receiving(Vec<u8>, FileListenerTarget),
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -526,7 +533,7 @@ impl TimerListener {
                     },
                 };
                 // Step 7, substeps run in a task.
-                global.fire_timer(id);
+                global.fire_timer(id, CanGc::note());
             }),
             &self.canceller,
         );
@@ -590,7 +597,7 @@ impl MessageListener {
                 let _ = self.task_source.queue_with_canceller(
                     task!(process_new_task: move || {
                         let global = context.root();
-                        global.route_task_to_port(port_id, task);
+                        global.route_task_to_port(port_id, task, CanGc::note());
                     }),
                     &self.canceller,
                 );
@@ -610,7 +617,7 @@ impl MessageListener {
 }
 
 /// Callback used to enqueue file chunks to streams as part of FileListener.
-fn stream_handle_incoming(stream: &ReadableStream, bytes: Result<Vec<u8>, Error>) {
+fn stream_handle_incoming(stream: &ReadableStream, bytes: Fallible<Vec<u8>>) {
     match bytes {
         Ok(b) => {
             stream.enqueue_native(b);
@@ -630,7 +637,7 @@ impl FileListener {
     fn handle(&mut self, msg: FileManagerResult<ReadFileProgress>) {
         match msg {
             Ok(ReadFileProgress::Meta(blob_buf)) => match self.state.take() {
-                Some(FileListenerState::Empty(callback, target)) => {
+                Some(FileListenerState::Empty(target)) => {
                     let bytes = if let FileListenerTarget::Stream(ref trusted_stream) = target {
                         let trusted = trusted_stream.clone();
 
@@ -647,14 +654,14 @@ impl FileListener {
                         blob_buf.bytes
                     };
 
-                    self.state = Some(FileListenerState::Receiving(bytes, callback, target));
+                    self.state = Some(FileListenerState::Receiving(bytes, target));
                 },
                 _ => panic!(
                     "Unexpected FileListenerState when receiving ReadFileProgress::Meta msg."
                 ),
             },
             Ok(ReadFileProgress::Partial(mut bytes_in)) => match self.state.take() {
-                Some(FileListenerState::Receiving(mut bytes, callback, target)) => {
+                Some(FileListenerState::Receiving(mut bytes, target)) => {
                     if let FileListenerTarget::Stream(ref trusted_stream) = target {
                         let trusted = trusted_stream.clone();
 
@@ -670,19 +677,15 @@ impl FileListener {
                         bytes.append(&mut bytes_in);
                     };
 
-                    self.state = Some(FileListenerState::Receiving(bytes, callback, target));
+                    self.state = Some(FileListenerState::Receiving(bytes, target));
                 },
                 _ => panic!(
                     "Unexpected FileListenerState when receiving ReadFileProgress::Partial msg."
                 ),
             },
             Ok(ReadFileProgress::EOF) => match self.state.take() {
-                Some(FileListenerState::Receiving(bytes, callback, target)) => match target {
-                    FileListenerTarget::Promise(trusted_promise) => {
-                        let callback = match callback {
-                            FileListenerCallback::Promise(callback) => callback,
-                            _ => panic!("Expected promise callback."),
-                        };
+                Some(FileListenerState::Receiving(bytes, target)) => match target {
+                    FileListenerTarget::Promise(trusted_promise, callback) => {
                         let task = task!(resolve_promise: move || {
                             let promise = trusted_promise.root();
                             let _ac = enter_realm(&*promise.global());
@@ -711,16 +714,12 @@ impl FileListener {
                 },
             },
             Err(_) => match self.state.take() {
-                Some(FileListenerState::Receiving(_, callback, target)) |
-                Some(FileListenerState::Empty(callback, target)) => {
+                Some(FileListenerState::Receiving(_, target)) |
+                Some(FileListenerState::Empty(target)) => {
                     let error = Err(Error::Network);
 
                     match target {
-                        FileListenerTarget::Promise(trusted_promise) => {
-                            let callback = match callback {
-                                FileListenerCallback::Promise(callback) => callback,
-                                _ => panic!("Expected promise callback."),
-                            };
+                        FileListenerTarget::Promise(trusted_promise, callback) => {
                             let _ = self.task_source.queue_with_canceller(
                                 task!(reject_promise: move || {
                                     let promise = trusted_promise.root();
@@ -762,7 +761,7 @@ impl GlobalScope {
         microtask_queue: Rc<MicrotaskQueue>,
         is_headless: bool,
         user_agent: Cow<'static, str>,
-        gpu_id_hub: Arc<Mutex<Identities>>,
+        gpu_id_hub: Arc<IdentityHub>,
         inherited_secure_context: Option<bool>,
     ) -> Self {
         Self {
@@ -848,10 +847,10 @@ impl GlobalScope {
             task_source,
             canceller,
         };
-        ROUTER.add_route(
-            timer_ipc_port.to_opaque(),
+        ROUTER.add_typed_route(
+            timer_ipc_port,
             Box::new(move |message| {
-                let event = message.to().unwrap();
+                let event = message.unwrap();
                 timer_listener.handle(event);
             }),
         );
@@ -1088,7 +1087,7 @@ impl GlobalScope {
                     let _ = self.port_message_queue().queue(
                         task!(process_pending_port_messages: move || {
                             let target_global = this.root();
-                            target_global.route_task_to_port(port_id, task);
+                            target_global.route_task_to_port(port_id, task, CanGc::note());
                         }),
                         self,
                     );
@@ -1144,7 +1143,7 @@ impl GlobalScope {
                         let global = this.root();
                         // Note: we do this in a task, as this will ensure the global and constellation
                         // are aware of any transfer that might still take place in the current task.
-                        global.route_task_to_port(entangled_id, task);
+                        global.route_task_to_port(entangled_id, task, CanGc::note());
                     }),
                     self,
                 );
@@ -1258,10 +1257,11 @@ impl GlobalScope {
                                         Some(&origin.ascii_serialization()),
                                         None,
                                         ports,
+                                        CanGc::note()
                                     );
                                 } else {
                                     // Step 10.3, fire an event named messageerror at destination.
-                                    MessageEvent::dispatch_error(destination.upcast(), &global);
+                                    MessageEvent::dispatch_error(destination.upcast(), &global, CanGc::note());
                                 }
                             }),
                             self,
@@ -1272,7 +1272,7 @@ impl GlobalScope {
     }
 
     /// Route the task to be handled by the relevant port.
-    pub fn route_task_to_port(&self, port_id: MessagePortId, task: PortMessageTask) {
+    pub fn route_task_to_port(&self, port_id: MessagePortId, task: PortMessageTask, can_gc: CanGc) {
         let should_dispatch = if let MessagePortState::Managed(_id, message_ports) =
             &mut *self.message_port_state.borrow_mut()
         {
@@ -1286,8 +1286,8 @@ impl GlobalScope {
                     // If the port is not enabled yet, or if is awaiting the completion of it's transfer,
                     // the task will be buffered and dispatched upon enablement or completion of the transfer.
                     if let Some(port_impl) = managed_port.port_impl.as_mut() {
-                        port_impl.handle_incoming(task).and_then(|to_dispatch| {
-                            Some((DomRoot::from_ref(&*managed_port.dom_port), to_dispatch))
+                        port_impl.handle_incoming(task).map(|to_dispatch| {
+                            (DomRoot::from_ref(&*managed_port.dom_port), to_dispatch)
                         })
                     } else {
                         panic!("managed-port has no port-impl.");
@@ -1311,10 +1311,11 @@ impl GlobalScope {
                     Some(&origin.ascii_serialization()),
                     None,
                     ports,
+                    can_gc,
                 );
             } else {
                 // Step 4, fire messageerror event.
-                MessageEvent::dispatch_error(dom_port.upcast(), self);
+                MessageEvent::dispatch_error(dom_port.upcast(), self, can_gc);
             }
         }
     }
@@ -1436,14 +1437,11 @@ impl GlobalScope {
                 task_source,
                 context,
             };
-            ROUTER.add_route(
-                broadcast_control_receiver.to_opaque(),
-                Box::new(move |message| {
-                    let msg = message.to();
-                    match msg {
-                        Ok(msg) => listener.handle(msg),
-                        Err(err) => warn!("Error receiving a BroadcastMsg: {:?}", err),
-                    }
+            ROUTER.add_typed_route(
+                broadcast_control_receiver,
+                Box::new(move |message| match message {
+                    Ok(msg) => listener.handle(msg),
+                    Err(err) => warn!("Error receiving a BroadcastMsg: {:?}", err),
                 }),
             );
             let router_id = BroadcastChannelRouterId::new();
@@ -1492,14 +1490,11 @@ impl GlobalScope {
                 task_source,
                 context,
             };
-            ROUTER.add_route(
-                port_control_receiver.to_opaque(),
-                Box::new(move |message| {
-                    let msg = message.to();
-                    match msg {
-                        Ok(msg) => listener.notify(msg),
-                        Err(err) => warn!("Error receiving a MessagePortMsg: {:?}", err),
-                    }
+            ROUTER.add_typed_route(
+                port_control_receiver,
+                Box::new(move |message| match message {
+                    Ok(msg) => listener.notify(msg),
+                    Err(err) => warn!("Error receiving a MessagePortMsg: {:?}", err),
                 }),
             );
             let router_id = MessagePortRouterId::new();
@@ -1928,8 +1923,8 @@ impl GlobalScope {
     /// Promote non-Slice blob:
     /// 1. Memory-based: The bytes in data slice will be transferred to file manager thread.
     /// 2. File-based: If set_valid, then activate the FileID so it can serve as URL
-    /// Depending on set_valid, the returned FileID can be part of
-    /// valid or invalid Blob URL.
+    ///     Depending on set_valid, the returned FileID can be part of
+    ///     valid or invalid Blob URL.
     pub fn promote(&self, blob_info: &mut BlobInfo, set_valid: bool) -> Uuid {
         let mut bytes = vec![];
         let global_url = self.get_url();
@@ -2015,33 +2010,24 @@ impl GlobalScope {
         let task_source = self.file_reading_task_source();
 
         let mut file_listener = FileListener {
-            state: Some(FileListenerState::Empty(
-                FileListenerCallback::Stream,
-                FileListenerTarget::Stream(trusted_stream),
-            )),
+            state: Some(FileListenerState::Empty(FileListenerTarget::Stream(
+                trusted_stream,
+            ))),
             task_source,
             task_canceller,
         };
 
-        ROUTER.add_route(
-            recv.to_opaque(),
+        ROUTER.add_typed_route(
+            recv.to_ipc_receiver(),
             Box::new(move |msg| {
-                file_listener.handle(
-                    msg.to()
-                        .expect("Deserialization of file listener msg failed."),
-                );
+                file_listener.handle(msg.expect("Deserialization of file listener msg failed."));
             }),
         );
 
         stream
     }
 
-    pub fn read_file_async(
-        &self,
-        id: Uuid,
-        promise: Rc<Promise>,
-        callback: Box<dyn Fn(Rc<Promise>, Result<Vec<u8>, Error>) + Send>,
-    ) {
+    pub fn read_file_async(&self, id: Uuid, promise: Rc<Promise>, callback: FileListenerCallback) {
         let recv = self.send_msg(id);
 
         let trusted_promise = TrustedPromise::new(promise);
@@ -2049,21 +2035,18 @@ impl GlobalScope {
         let task_source = self.file_reading_task_source();
 
         let mut file_listener = FileListener {
-            state: Some(FileListenerState::Empty(
-                FileListenerCallback::Promise(callback),
-                FileListenerTarget::Promise(trusted_promise),
-            )),
+            state: Some(FileListenerState::Empty(FileListenerTarget::Promise(
+                trusted_promise,
+                callback,
+            ))),
             task_source,
             task_canceller,
         };
 
-        ROUTER.add_route(
-            recv.to_opaque(),
+        ROUTER.add_typed_route(
+            recv.to_ipc_receiver(),
             Box::new(move |msg| {
-                file_listener.handle(
-                    msg.to()
-                        .expect("Deserialization of file listener msg failed."),
-                );
+                file_listener.handle(msg.expect("Deserialization of file listener msg failed."));
             }),
         );
     }
@@ -2109,7 +2092,7 @@ impl GlobalScope {
         closing: Arc<AtomicBool>,
         join_handle: JoinHandle<()>,
         control_sender: Sender<DedicatedWorkerControlMsg>,
-        context: ContextForRequestInterrupt,
+        context: ThreadSafeJSContext,
     ) {
         self.list_auto_close_worker
             .borrow_mut()
@@ -2280,6 +2263,21 @@ impl GlobalScope {
         }
     }
 
+    /// Computes the delta time since a label has been created
+    ///
+    /// Returns an error if the label does not exist.
+    pub fn time_log(&self, label: &str) -> Result<u64, ()> {
+        self.console_timers
+            .borrow()
+            .get(label)
+            .ok_or(())
+            .map(|&start| (Instant::now() - start).as_millis() as u64)
+    }
+
+    /// Computes the delta time since a label has been created and stops
+    /// tracking the label.
+    ///
+    /// Returns an error if the label does not exist.
     pub fn time_end(&self, label: &str) -> Result<u64, ()> {
         self.console_timers
             .borrow_mut()
@@ -2300,13 +2298,16 @@ impl GlobalScope {
                 self.pipeline_id,
                 PageError {
                     type_: "PageError".to_string(),
-                    errorMessage: warning.to_string(),
-                    sourceName: self.get_url().to_string(),
-                    lineText: "".to_string(),
-                    lineNumber: 0,
-                    columnNumber: 0,
+                    error_message: warning.to_string(),
+                    source_name: self.get_url().to_string(),
+                    line_text: "".to_string(),
+                    line_number: 0,
+                    column_number: 0,
                     category: "script".to_string(),
-                    timeStamp: 0, //TODO
+                    time_stamp: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
                     error: false,
                     warning: true,
                     exception: true,
@@ -2423,14 +2424,18 @@ impl GlobalScope {
 
             // Substep 3.1.3
             while url.as_str() == "about:srcdoc" {
-                document = document
-                    .browsing_context()
-                    .expect("iframe should have browsing context")
-                    .parent()
-                    .expect("iframes browsing_context should have parent")
-                    .document()
-                    .expect("iframes parent should have document");
-
+                // Return early if we cannot get a parent document. This might happen if
+                // this iframe was already removed from the parent page.
+                let Some(parent_document) =
+                    document.browsing_context().and_then(|browsing_context| {
+                        browsing_context
+                            .parent()
+                            .and_then(|parent| parent.document())
+                    })
+                else {
+                    return Referrer::NoReferrer;
+                };
+                document = parent_document;
                 url = document.url();
             }
 
@@ -2448,7 +2453,7 @@ impl GlobalScope {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#report-the-error>
-    pub fn report_an_error(&self, error_info: ErrorInfo, value: HandleValue) {
+    pub fn report_an_error(&self, error_info: ErrorInfo, value: HandleValue, can_gc: CanGc) {
         // Step 1.
         if self.in_error_reporting_mode.get() {
             return;
@@ -2469,6 +2474,7 @@ impl GlobalScope {
             error_info.lineno,
             error_info.column,
             value,
+            can_gc,
         );
 
         // Step 7.
@@ -2488,13 +2494,16 @@ impl GlobalScope {
                         self.pipeline_id,
                         PageError {
                             type_: "PageError".to_string(),
-                            errorMessage: error_info.message.clone(),
-                            sourceName: error_info.filename.clone(),
-                            lineText: "".to_string(), //TODO
-                            lineNumber: error_info.lineno,
-                            columnNumber: error_info.column,
+                            error_message: error_info.message.clone(),
+                            source_name: error_info.filename.clone(),
+                            line_text: "".to_string(), //TODO
+                            line_number: error_info.lineno,
+                            column_number: error_info.column,
                             category: "script".to_string(),
-                            timeStamp: 0, //TODO
+                            time_stamp: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
                             error: true,
                             warning: false,
                             exception: true,
@@ -2605,6 +2614,7 @@ impl GlobalScope {
         rval: MutableHandleValue,
         fetch_options: ScriptFetchOptions,
         script_base_url: ServoUrl,
+        can_gc: CanGc,
     ) -> bool {
         let source_code = SourceCode::Text(Rc::new(DOMString::from_string((*code).to_string())));
         self.evaluate_script_on_global_with_result(
@@ -2614,11 +2624,13 @@ impl GlobalScope {
             1,
             fetch_options,
             script_base_url,
+            can_gc,
         )
     }
 
     /// Evaluate a JS script on this global scope.
     #[allow(unsafe_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate_script_on_global_with_result(
         &self,
         code: &SourceCode,
@@ -2627,6 +2639,7 @@ impl GlobalScope {
         line_number: u32,
         fetch_options: ScriptFetchOptions,
         script_base_url: ServoUrl,
+        can_gc: CanGc,
     ) -> bool {
         let metadata = profile_time::TimerMetadata {
             url: if filename.is_empty() {
@@ -2663,7 +2676,7 @@ impl GlobalScope {
 
                             if compiled_script.is_null() {
                                 debug!("error compiling Dom string");
-                                report_pending_exception(*cx, true, InRealm::Entered(&ar));
+                                report_pending_exception(*cx, true, InRealm::Entered(&ar), can_gc);
                                 return false;
                             }
                         },
@@ -2712,7 +2725,7 @@ impl GlobalScope {
 
                     if !result {
                         debug!("error evaluating Dom string");
-                        report_pending_exception(*cx, true, InRealm::Entered(&ar));
+                        report_pending_exception(*cx, true, InRealm::Entered(&ar), can_gc);
                     }
 
                     maybe_resume_unwind();
@@ -2726,7 +2739,7 @@ impl GlobalScope {
     pub fn schedule_callback(
         &self,
         callback: OneshotTimerCallback,
-        duration: MsDuration,
+        duration: Duration,
     ) -> OneshotTimerHandle {
         self.setup_timers();
         self.timers
@@ -2742,7 +2755,7 @@ impl GlobalScope {
         &self,
         callback: TimerCallback,
         arguments: Vec<HandleValue>,
-        timeout: i32,
+        timeout: Duration,
         is_interval: IsInterval,
     ) -> i32 {
         self.setup_timers();
@@ -2767,19 +2780,51 @@ impl GlobalScope {
         }))
     }
 
+    #[allow(unsafe_code)]
+    pub fn is_js_evaluation_allowed(&self, cx: SafeJSContext) -> bool {
+        let Some(csp_list) = self.get_csp_list() else {
+            return true;
+        };
+
+        let scripted_caller = unsafe { describe_scripted_caller(*cx) }.unwrap_or_default();
+        let is_js_evaluation_allowed = csp_list.is_js_evaluation_allowed() == CheckResult::Allowed;
+
+        if !is_js_evaluation_allowed {
+            // FIXME: Don't fire event if `script-src` and `default-src`
+            // were not passed.
+            for policy in csp_list.0 {
+                let task = CSPViolationReporter::new(
+                    self,
+                    None,
+                    policy.disposition == PolicyDisposition::Report,
+                    RuntimeCode::JS,
+                    scripted_caller.filename.clone(),
+                    scripted_caller.line,
+                    scripted_caller.col,
+                );
+                self.dom_manipulation_task_source()
+                    .queue(task, self)
+                    .unwrap();
+            }
+        }
+
+        is_js_evaluation_allowed
+    }
+
     pub fn create_image_bitmap(
         &self,
         image: ImageBitmapSource,
         options: &ImageBitmapOptions,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
         let in_realm_proof = AlreadyInRealm::assert();
-        let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof));
-        if options.resizeWidth.map_or(false, |w| w == 0) {
+        let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc);
+        if options.resizeWidth.is_some_and(|w| w == 0) {
             p.reject_error(Error::InvalidState);
             return p;
         }
 
-        if options.resizeHeight.map_or(false, |w| w == 0) {
+        if options.resizeHeight.is_some_and(|w| w == 0) {
             p.reject_error(Error::InvalidState);
             return p;
         }
@@ -2831,8 +2876,8 @@ impl GlobalScope {
         }
     }
 
-    pub fn fire_timer(&self, handle: TimerEventId) {
-        self.timers.fire_timer(handle, self);
+    pub fn fire_timer(&self, handle: TimerEventId, can_gc: CanGc) {
+        self.timers.fire_timer(handle, self, can_gc);
     }
 
     pub fn resume(&self) {
@@ -2864,7 +2909,7 @@ impl GlobalScope {
     /// Returns a boolean indicating whether the event-loop
     /// where this global is running on can continue running JS.
     pub fn can_continue_running(&self) -> bool {
-        if self.downcast::<Window>().is_some() {
+        if self.is::<Window>() {
             return ScriptThread::can_continue_running();
         }
         if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
@@ -2891,13 +2936,14 @@ impl GlobalScope {
     }
 
     /// Perform a microtask checkpoint.
-    pub fn perform_a_microtask_checkpoint(&self) {
+    pub fn perform_a_microtask_checkpoint(&self, can_gc: CanGc) {
         // Only perform the checkpoint if we're not shutting down.
         if self.can_continue_running() {
             self.microtask_queue.checkpoint(
                 GlobalScope::get_cx(),
                 |_| Some(DomRoot::from_ref(self)),
                 vec![DomRoot::from_ref(self)],
+                can_gc,
             );
         }
     }
@@ -3084,41 +3130,76 @@ impl GlobalScope {
         None
     }
 
-    pub fn wgpu_id_hub(&self) -> Arc<Mutex<Identities>> {
+    pub fn status_code(&self) -> Option<u16> {
+        if let Some(window) = self.downcast::<Window>() {
+            return window.Document().status_code();
+        }
+        None
+    }
+
+    pub fn wgpu_id_hub(&self) -> Arc<IdentityHub> {
         self.gpu_id_hub.clone()
     }
 
     pub fn add_gpu_device(&self, device: &GPUDevice) {
         self.gpu_devices
             .borrow_mut()
-            .insert(device.id(), Dom::from_ref(device));
+            .insert(device.id(), WeakRef::new(device));
     }
 
     pub fn remove_gpu_device(&self, device: WebGPUDevice) {
-        let _ = self.gpu_devices.borrow_mut().remove(&device);
+        let device = self
+            .gpu_devices
+            .borrow_mut()
+            .remove(&device)
+            .expect("GPUDevice should still be in devices hashmap");
+        assert!(device.root().is_none())
     }
 
-    pub fn handle_wgpu_msg(
+    pub fn gpu_device_lost(&self, device: WebGPUDevice, reason: DeviceLostReason, msg: String) {
+        let reason = match reason {
+            DeviceLostReason::Unknown => GPUDeviceLostReason::Unknown,
+            DeviceLostReason::Destroyed => GPUDeviceLostReason::Destroyed,
+        };
+        let _ac = enter_realm(self);
+        if let Some(device) = self
+            .gpu_devices
+            .borrow_mut()
+            .get_mut(&device)
+            .expect("GPUDevice should still be in devices hashmap")
+            .root()
+        {
+            device.lose(reason, msg);
+        }
+    }
+
+    pub fn handle_uncaptured_gpu_error(
         &self,
         device: WebGPUDevice,
-        scope: Option<ErrorScopeId>,
-        result: WebGPUOpResult,
+        error: webgpu::Error,
+        can_gc: CanGc,
     ) {
-        self.gpu_devices
+        if let Some(gpu_device) = self
+            .gpu_devices
             .borrow()
             .get(&device)
-            .expect("GPUDevice not found")
-            .handle_server_msg(scope, result);
+            .and_then(|device| device.root())
+        {
+            gpu_device.fire_uncaptured_error(error, can_gc);
+        } else {
+            warn!("Recived error for lost GPUDevice!")
+        }
     }
 
     pub fn handle_gamepad_event(&self, gamepad_event: GamepadEvent) {
         match gamepad_event {
-            GamepadEvent::Connected(index, name, bounds) => {
+            GamepadEvent::Connected(index, name, bounds, supported_haptic_effects) => {
                 self.handle_gamepad_connect(
                     index.0,
                     name,
                     bounds.axis_bounds,
                     bounds.button_bounds,
+                    supported_haptic_effects,
                 );
             },
             GamepadEvent::Disconnected(index) => {
@@ -3131,7 +3212,7 @@ impl GlobalScope {
     }
 
     /// <https://www.w3.org/TR/gamepad/#dfn-gamepadconnected>
-    pub fn handle_gamepad_connect(
+    fn handle_gamepad_connect(
         &self,
         // As the spec actually defines how to set the gamepad index, the GilRs index
         // is currently unused, though in practice it will almost always be the same.
@@ -3140,24 +3221,36 @@ impl GlobalScope {
         name: String,
         axis_bounds: (f64, f64),
         button_bounds: (f64, f64),
+        supported_haptic_effects: GamepadSupportedHapticEffects,
     ) {
         // TODO: 2. If document is not null and is not allowed to use the "gamepad" permission,
         //          then abort these steps.
         let this = Trusted::new(self);
-        self.gamepad_task_source().queue_with_canceller(
-            task!(gamepad_connected: move || {
-                let global = this.root();
+        self.gamepad_task_source()
+            .queue_with_canceller(
+                task!(gamepad_connected: move || {
+                    let global = this.root();
 
-                if let Some(window) = global.downcast::<Window>() {
-                    let navigator = window.Navigator();
-                    let selected_index = navigator.select_gamepad_index();
-                    let gamepad = Gamepad::new(&global, selected_index, name, axis_bounds, button_bounds);
-                    navigator.set_gamepad(selected_index as usize, &gamepad);
-                }
-            }),
-            &self.task_canceller(TaskSourceName::Gamepad)
-        )
-        .expect("Failed to queue gamepad connected task.");
+                    if let Some(window) = global.downcast::<Window>() {
+                        let navigator = window.Navigator();
+                        let selected_index = navigator.select_gamepad_index();
+                        let gamepad = Gamepad::new(
+                            &global,
+                            selected_index,
+                            name,
+                            "standard".into(),
+                            axis_bounds,
+                            button_bounds,
+                            supported_haptic_effects,
+                            false,
+                            CanGc::note(),
+                        );
+                        navigator.set_gamepad(selected_index as usize, &gamepad, CanGc::note());
+                    }
+                }),
+                &self.task_canceller(TaskSourceName::Gamepad),
+            )
+            .expect("Failed to queue gamepad connected task.");
     }
 
     /// <https://www.w3.org/TR/gamepad/#dfn-gamepaddisconnected>
@@ -3171,7 +3264,7 @@ impl GlobalScope {
                         let navigator = window.Navigator();
                         if let Some(gamepad) = navigator.get_gamepad(index) {
                             if window.Document().is_fully_active() {
-                                gamepad.update_connected(false, gamepad.exposed());
+                                gamepad.update_connected(false, gamepad.exposed(), CanGc::note());
                                 navigator.remove_gamepad(index);
                             }
                         }
@@ -3217,7 +3310,7 @@ impl GlobalScope {
                                             window.task_manager().gamepad_task_source().queue_with_canceller(
                                                 task!(update_gamepad_connect: move || {
                                                     let gamepad = new_gamepad.root();
-                                                    gamepad.notify_event(GamepadEventType::Connected);
+                                                    gamepad.notify_event(GamepadEventType::Connected, CanGc::note());
                                                 }),
                                                 &window.upcast::<GlobalScope>()
                                                     .task_canceller(TaskSourceName::Gamepad),
@@ -3270,6 +3363,63 @@ impl GlobalScope {
 
     pub(crate) fn dynamic_module_list(&self) -> RefMut<DynamicModuleList> {
         self.dynamic_modules.borrow_mut()
+    }
+
+    pub(crate) fn structured_clone(
+        &self,
+        cx: SafeJSContext,
+        value: HandleValue,
+        options: RootedTraceableBox<StructuredSerializeOptions>,
+    ) -> Fallible<js::jsval::JSVal> {
+        let mut rooted = CustomAutoRooter::new(
+            options
+                .transfer
+                .iter()
+                .map(|js: &RootedTraceableBox<Heap<*mut JSObject>>| js.get())
+                .collect(),
+        );
+        let guard = CustomAutoRooterGuard::new(*cx, &mut rooted);
+
+        let data = structuredclone::write(cx, value, Some(guard))?;
+
+        rooted!(in(*cx) let mut message_clone = UndefinedValue());
+
+        structuredclone::read(self, data, message_clone.handle_mut())
+            .map_err(|_| Error::DataClone)?;
+
+        Ok(message_clone.get())
+    }
+
+    pub(crate) fn fetch<Listener: FetchResponseListener + PreInvoke + Send + 'static>(
+        &self,
+        request_builder: RequestBuilder,
+        context: Arc<Mutex<Listener>>,
+        task_source: NetworkingTaskSource,
+        cancellation_sender: Option<ipc::IpcReceiver<()>>,
+    ) {
+        let canceller = Some(self.task_canceller(TaskSourceName::Networking));
+        let network_listener = NetworkListener {
+            context,
+            task_source,
+            canceller,
+        };
+        self.fetch_with_network_listener(request_builder, network_listener, cancellation_sender);
+    }
+
+    pub(crate) fn fetch_with_network_listener<
+        Listener: FetchResponseListener + PreInvoke + Send + 'static,
+    >(
+        &self,
+        request_builder: RequestBuilder,
+        network_listener: NetworkListener<Listener>,
+        cancellation_receiver: Option<ipc::IpcReceiver<()>>,
+    ) {
+        fetch_async(
+            &self.core_resource_thread(),
+            request_builder,
+            cancellation_receiver,
+            network_listener.into_callback(),
+        );
     }
 }
 

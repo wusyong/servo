@@ -20,6 +20,7 @@ use crate::dom::window::Window;
 use crate::dom::worklet::Worklet;
 use crate::dom::workletglobalscope::WorkletGlobalScopeType;
 use crate::realms::InRealm;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
 #[dom_struct]
@@ -36,33 +37,35 @@ impl TestWorklet {
         }
     }
 
-    fn new(window: &Window, proto: Option<HandleObject>) -> DomRoot<TestWorklet> {
+    fn new(window: &Window, proto: Option<HandleObject>, can_gc: CanGc) -> DomRoot<TestWorklet> {
         let worklet = Worklet::new(window, WorkletGlobalScopeType::Test);
         reflect_dom_object_with_proto(
             Box::new(TestWorklet::new_inherited(&worklet)),
             window,
             proto,
+            can_gc,
         )
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<TestWorklet>> {
-        Ok(TestWorklet::new(window, proto))
     }
 }
 
 impl TestWorkletMethods for TestWorklet {
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<TestWorklet>> {
+        Ok(TestWorklet::new(window, proto, can_gc))
+    }
+
     #[allow(non_snake_case)]
     fn AddModule(
         &self,
         moduleURL: USVString,
         options: &WorkletOptions,
         comp: InRealm,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
-        self.worklet.AddModule(moduleURL, options, comp)
+        self.worklet.AddModule(moduleURL, options, comp, can_gc)
     }
 
     fn Lookup(&self, key: DOMString) -> Option<DOMString> {

@@ -8,15 +8,15 @@ use std::convert::TryInto;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
+use base::id::{MessagePortId, MessagePortIndex, PipelineNamespaceId};
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject, MutableHandleObject};
 use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
-use msg::constellation_msg::{MessagePortId, MessagePortIndex, PipelineNamespaceId};
 use script_traits::PortMessageTask;
 
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use crate::dom::bindings::codegen::Bindings::MessagePortBinding::{
-    MessagePortMethods, PostMessageOptions,
+    MessagePortMethods, StructuredSerializeOptions,
 };
 use crate::dom::bindings::conversions::root_from_object;
 use crate::dom::bindings::error::{Error, ErrorResult};
@@ -28,7 +28,7 @@ use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[dom_struct]
 /// The MessagePort used in the DOM.
@@ -288,7 +288,7 @@ impl MessagePortMethods for MessagePort {
         &self,
         cx: SafeJSContext,
         message: HandleValue,
-        options: RootedTraceableBox<PostMessageOptions>,
+        options: RootedTraceableBox<StructuredSerializeOptions>,
     ) -> ErrorResult {
         if self.detached.get() {
             return Ok(());
@@ -327,7 +327,7 @@ impl MessagePortMethods for MessagePort {
             return None;
         }
         let eventtarget = self.upcast::<EventTarget>();
-        eventtarget.get_event_handler_common("message")
+        eventtarget.get_event_handler_common("message", CanGc::note())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>

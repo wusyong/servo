@@ -17,6 +17,7 @@ use crate::dom::event::Event;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 #[allow(non_snake_case)]
@@ -39,8 +40,9 @@ impl SubmitEvent {
         bubbles: bool,
         cancelable: bool,
         submitter: Option<DomRoot<HTMLElement>>,
+        can_gc: CanGc,
     ) -> DomRoot<SubmitEvent> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable, submitter)
+        Self::new_with_proto(global, None, type_, bubbles, cancelable, submitter, can_gc)
     }
 
     fn new_with_proto(
@@ -50,11 +52,13 @@ impl SubmitEvent {
         bubbles: bool,
         cancelable: bool,
         submitter: Option<DomRoot<HTMLElement>>,
+        can_gc: CanGc,
     ) -> DomRoot<SubmitEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(SubmitEvent::new_inherited(submitter)),
             global,
             proto,
+            can_gc,
         );
         {
             let event = ev.upcast::<Event>();
@@ -62,11 +66,14 @@ impl SubmitEvent {
         }
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl SubmitEventMethods for SubmitEvent {
+    /// <https://html.spec.whatwg.org/multipage/#submitevent>
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &SubmitEventBinding::SubmitEventInit,
     ) -> DomRoot<SubmitEvent> {
@@ -77,11 +84,10 @@ impl SubmitEvent {
             init.parent.bubbles,
             init.parent.cancelable,
             init.submitter.as_ref().map(|s| DomRoot::from_ref(&**s)),
+            can_gc,
         )
     }
-}
 
-impl SubmitEventMethods for SubmitEvent {
     /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()

@@ -9,9 +9,10 @@ use serde_json::{Map, Value};
 
 use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
 use crate::protocol::JsonPacketStream;
-use crate::StreamId;
+use crate::{EmptyReplyMsg, StreamId};
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ThreadAttached {
     from: String,
     #[serde(rename = "type")]
@@ -19,9 +20,9 @@ struct ThreadAttached {
     actor: String,
     frame: u32,
     error: u32,
-    recordingEndpoint: u32,
-    executionPoint: u32,
-    poppedFrames: Vec<PoppedFrameMsg>,
+    recording_endpoint: u32,
+    execution_point: u32,
+    popped_frames: Vec<PoppedFrameMsg>,
     why: WhyMsg,
 }
 
@@ -49,11 +50,6 @@ struct ThreadInterruptedReply {
 }
 
 #[derive(Serialize)]
-struct ReconfigureReply {
-    from: String,
-}
-
-#[derive(Serialize)]
 struct SourcesReply {
     from: String,
     sources: Vec<Source>,
@@ -61,11 +57,6 @@ struct SourcesReply {
 
 #[derive(Serialize)]
 enum Source {}
-
-#[derive(Serialize)]
-struct VoidAttachedReply {
-    from: String,
-}
 
 pub struct ThreadActor {
     name: String,
@@ -98,15 +89,15 @@ impl Actor for ThreadActor {
                     actor: registry.new_name("pause"),
                     frame: 0,
                     error: 0,
-                    recordingEndpoint: 0,
-                    executionPoint: 0,
-                    poppedFrames: vec![],
+                    recording_endpoint: 0,
+                    execution_point: 0,
+                    popped_frames: vec![],
                     why: WhyMsg {
                         type_: "attached".to_owned(),
                     },
                 };
                 let _ = stream.write_json_packet(&msg);
-                let _ = stream.write_json_packet(&VoidAttachedReply { from: self.name() });
+                let _ = stream.write_json_packet(&EmptyReplyMsg { from: self.name() });
                 ActorMessageStatus::Processed
             },
 
@@ -116,7 +107,7 @@ impl Actor for ThreadActor {
                     type_: "resumed".to_owned(),
                 };
                 let _ = stream.write_json_packet(&msg);
-                let _ = stream.write_json_packet(&VoidAttachedReply { from: self.name() });
+                let _ = stream.write_json_packet(&EmptyReplyMsg { from: self.name() });
                 ActorMessageStatus::Processed
             },
 
@@ -130,14 +121,14 @@ impl Actor for ThreadActor {
             },
 
             "reconfigure" => {
-                let _ = stream.write_json_packet(&ReconfigureReply { from: self.name() });
+                let _ = stream.write_json_packet(&EmptyReplyMsg { from: self.name() });
                 ActorMessageStatus::Processed
             },
 
             "sources" => {
                 let msg = SourcesReply {
                     from: self.name(),
-                    sources: vec![],
+                    sources: vec![], // TODO: Add sources for the debugger here
                 };
                 let _ = stream.write_json_packet(&msg);
                 ActorMessageStatus::Processed

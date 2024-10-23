@@ -2,24 +2,35 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use app_units::Au;
+use euclid::Size2D;
 use style::color::mix::ColorInterpolationMethod;
 use style::properties::ComputedValues;
 use style::values::computed::image::{EndingShape, Gradient, LineDirection};
-use style::values::computed::{
-    Angle, AngleOrPercentage, Color, Length, LengthPercentage, Position,
-};
+use style::values::computed::{Angle, AngleOrPercentage, Color, LengthPercentage, Position};
 use style::values::generics::image::{
     Circle, ColorStop, Ellipse, GradientFlags, GradientItem, ShapeExtent,
 };
-use webrender_api::{self as wr, units};
+use style::Zero;
+use webrender_api::units::LayoutPixel;
+use webrender_api::{
+    self as wr, units, ConicGradient as WebRenderConicGradient,
+    Gradient as WebRenderLinearGradient, RadialGradient as WebRenderRadialGradient,
+};
 use wr::ColorF;
+
+pub(super) enum WebRenderGradient {
+    Linear(WebRenderLinearGradient),
+    Radial(WebRenderRadialGradient),
+    Conic(WebRenderConicGradient),
+}
 
 pub(super) fn build(
     style: &ComputedValues,
     gradient: &Gradient,
-    layer: &super::background::BackgroundLayer,
+    size: Size2D<f32, LayoutPixel>,
     builder: &mut super::DisplayListBuilder,
-) {
+) -> WebRenderGradient {
     match gradient {
         Gradient::Linear {
             ref items,
@@ -33,7 +44,7 @@ pub(super) fn build(
             direction,
             color_interpolation_method,
             *flags,
-            layer,
+            size,
             builder,
         ),
         Gradient::Radial {
@@ -50,7 +61,7 @@ pub(super) fn build(
             position,
             color_interpolation_method,
             *flags,
-            layer,
+            size,
             builder,
         ),
         Gradient::Conic {
@@ -66,7 +77,7 @@ pub(super) fn build(
             *color_interpolation_method,
             items,
             *flags,
-            layer,
+            size,
             builder,
         ),
     }
@@ -79,13 +90,12 @@ pub(super) fn build_linear(
     line_direction: &LineDirection,
     _color_interpolation_method: &ColorInterpolationMethod,
     flags: GradientFlags,
-    layer: &super::background::BackgroundLayer,
+    gradient_box: Size2D<f32, LayoutPixel>,
     builder: &mut super::DisplayListBuilder,
-) {
+) -> WebRenderGradient {
     use style::values::specified::position::HorizontalPositionKeyword::*;
     use style::values::specified::position::VerticalPositionKeyword::*;
     use units::LayoutVector2D as Vec2;
-    let gradient_box = layer.tile_size;
 
     // A vector of length 1.0 in the direction of the gradient line
     let direction = match line_direction {
@@ -161,23 +171,19 @@ pub(super) fn build_linear(
     let end_point = center + half_gradient_line;
 
     let mut color_stops =
-        gradient_items_to_color_stops(style, items, Length::new(gradient_line_length));
+        gradient_items_to_color_stops(style, items, Au::from_f32_px(gradient_line_length));
     let stops = fixup_stops(&mut color_stops);
     let extend_mode = if flags.contains(GradientFlags::REPEATING) {
         wr::ExtendMode::Repeat
     } else {
         wr::ExtendMode::Clamp
     };
-    let linear_gradient = builder
-        .wr()
-        .create_gradient(start_point, end_point, stops, extend_mode);
-    builder.wr().push_gradient(
-        &layer.common,
-        layer.bounds,
-        linear_gradient,
-        layer.tile_size,
-        layer.tile_spacing,
-    )
+    WebRenderGradient::Linear(builder.wr().create_gradient(
+        start_point,
+        end_point,
+        stops,
+        extend_mode,
+    ))
 }
 
 /// <https://drafts.csswg.org/css-images-3/#radial-gradients>
@@ -189,19 +195,18 @@ pub(super) fn build_radial(
     center: &Position,
     _color_interpolation_method: &ColorInterpolationMethod,
     flags: GradientFlags,
-    layer: &super::background::BackgroundLayer,
+    gradient_box: Size2D<f32, LayoutPixel>,
     builder: &mut super::DisplayListBuilder,
-) {
-    let gradient_box = layer.tile_size;
+) -> WebRenderGradient {
     let center = units::LayoutPoint::new(
         center
             .horizontal
-            .percentage_relative_to(Length::new(gradient_box.width))
-            .px(),
+            .to_used_value(Au::from_f32_px(gradient_box.width))
+            .to_f32_px(),
         center
             .vertical
-            .percentage_relative_to(Length::new(gradient_box.height))
-            .px(),
+            .to_used_value(Au::from_f32_px(gradient_box.height))
+            .to_f32_px(),
     );
     let radii = match shape {
         EndingShape::Circle(circle) => {
@@ -227,10 +232,10 @@ pub(super) fn build_radial(
             units::LayoutSize::new(radius, radius)
         },
         EndingShape::Ellipse(Ellipse::Radii(rx, ry)) => units::LayoutSize::new(
-            rx.0.percentage_relative_to(Length::new(gradient_box.width))
-                .px(),
-            ry.0.percentage_relative_to(Length::new(gradient_box.height))
-                .px(),
+            rx.0.to_used_value(Au::from_f32_px(gradient_box.width))
+                .to_f32_px(),
+            ry.0.to_used_value(Au::from_f32_px(gradient_box.height))
+                .to_f32_px(),
         ),
         EndingShape::Ellipse(Ellipse::Extent(extent)) => match extent {
             ShapeExtent::ClosestSide | ShapeExtent::Contain => {
@@ -270,23 +275,19 @@ pub(super) fn build_radial(
     let gradient_line_length = radii.width;
 
     let mut color_stops =
-        gradient_items_to_color_stops(style, items, Length::new(gradient_line_length));
+        gradient_items_to_color_stops(style, items, Au::from_f32_px(gradient_line_length));
     let stops = fixup_stops(&mut color_stops);
     let extend_mode = if flags.contains(GradientFlags::REPEATING) {
         wr::ExtendMode::Repeat
     } else {
         wr::ExtendMode::Clamp
     };
-    let radial_gradient = builder
-        .wr()
-        .create_radial_gradient(center, radii, stops, extend_mode);
-    builder.wr().push_radial_gradient(
-        &layer.common,
-        layer.bounds,
-        radial_gradient,
-        layer.tile_size,
-        layer.tile_spacing,
-    )
+    WebRenderGradient::Radial(builder.wr().create_radial_gradient(
+        center,
+        radii,
+        stops,
+        extend_mode,
+    ))
 }
 
 /// <https://drafts.csswg.org/css-images-4/#conic-gradients>
@@ -298,19 +299,18 @@ fn build_conic(
     _color_interpolation_method: ColorInterpolationMethod,
     items: &[GradientItem<Color, AngleOrPercentage>],
     flags: GradientFlags,
-    layer: &super::background::BackgroundLayer,
+    gradient_box: Size2D<f32, LayoutPixel>,
     builder: &mut super::DisplayListBuilder<'_>,
-) {
-    let gradient_box = layer.tile_size;
+) -> WebRenderGradient {
     let center = units::LayoutPoint::new(
         center
             .horizontal
-            .percentage_relative_to(Length::new(gradient_box.width))
-            .px(),
+            .to_used_value(Au::from_f32_px(gradient_box.width))
+            .to_f32_px(),
         center
             .vertical
-            .percentage_relative_to(Length::new(gradient_box.height))
-            .px(),
+            .to_used_value(Au::from_f32_px(gradient_box.height))
+            .to_f32_px(),
     );
     let mut color_stops = conic_gradient_items_to_color_stops(style, items);
     let stops = fixup_stops(&mut color_stops);
@@ -319,17 +319,12 @@ fn build_conic(
     } else {
         wr::ExtendMode::Clamp
     };
-    let conic_gradient =
-        builder
-            .wr()
-            .create_conic_gradient(center, angle.radians(), stops, extend_mode);
-    builder.wr().push_conic_gradient(
-        &layer.common,
-        layer.bounds,
-        conic_gradient,
-        layer.tile_size,
-        layer.tile_spacing,
-    )
+    WebRenderGradient::Conic(builder.wr().create_conic_gradient(
+        center,
+        angle.radians(),
+        stops,
+        extend_mode,
+    ))
 }
 
 fn conic_gradient_items_to_color_stops(
@@ -372,7 +367,7 @@ fn conic_gradient_items_to_color_stops(
 fn gradient_items_to_color_stops(
     style: &ComputedValues,
     items: &[GradientItem<Color, LengthPercentage>],
-    gradient_line_length: Length,
+    gradient_line_length: Au,
 ) -> Vec<ColorStop<ColorF, f32>> {
     // Remove color transititon hints, which are not supported yet.
     // https://drafts.csswg.org/css-images-4/#color-transition-hint
@@ -394,11 +389,13 @@ fn gradient_items_to_color_stops(
                 }),
                 GradientItem::ComplexColorStop { color, position } => Some(ColorStop {
                     color: super::rgba(style.resolve_color(color.clone())),
-                    position: Some(if gradient_line_length.px() == 0. {
+                    position: Some(if gradient_line_length.is_zero() {
                         0.
                     } else {
-                        position.percentage_relative_to(gradient_line_length).px() /
-                            gradient_line_length.px()
+                        position
+                            .to_used_value(gradient_line_length)
+                            .scale_by(1. / gradient_line_length.to_f32_px())
+                            .to_f32_px()
                     }),
                 }),
                 // FIXME: approximate like in:
@@ -410,7 +407,7 @@ fn gradient_items_to_color_stops(
 }
 
 /// <https://drafts.csswg.org/css-images-4/#color-stop-fixup>
-fn fixup_stops(stops: &mut Vec<ColorStop<ColorF, f32>>) -> Vec<wr::GradientStop> {
+fn fixup_stops(stops: &mut [ColorStop<ColorF, f32>]) -> Vec<wr::GradientStop> {
     assert!(stops.len() >= 2);
 
     // https://drafts.csswg.org/css-images-4/#color-stop-fixup

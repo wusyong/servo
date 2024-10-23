@@ -14,17 +14,18 @@ from typing import Optional
 import urllib
 import zipfile
 
-from .. import util
-from .base import Base
+from servo import util
 
-DEPS_URL = "https://github.com/servo/servo-build-deps/releases/download/msvc-deps/"
+from .base import Base
+from .build_target import BuildTarget
+
+DEPS_URL = "https://github.com/servo/servo-build-deps/releases/download/msvc-deps"
 DEPENDENCIES = {
     "moztools": "4.0",
 }
 
-URL_BASE = "https://github.com/servo/servo-build-deps/releases/download/msvc-deps/"
-GSTREAMER_URL = f"{URL_BASE}/gstreamer-1.0-msvc-x86_64-1.22.8.msi"
-GSTREAMER_DEVEL_URL = f"{URL_BASE}/gstreamer-1.0-devel-msvc-x86_64-1.22.8.msi"
+GSTREAMER_URL = f"{DEPS_URL}/gstreamer-1.0-msvc-x86_64-1.22.8.msi"
+GSTREAMER_DEVEL_URL = f"{DEPS_URL}/gstreamer-1.0-devel-msvc-x86_64-1.22.8.msi"
 DEPENDENCIES_DIR = os.path.join(util.get_target_dir(), "dependencies")
 
 
@@ -44,7 +45,7 @@ class Windows(Base):
     @classmethod
     def download_and_extract_dependency(cls, zip_path: str, full_spec: str):
         if not os.path.isfile(zip_path):
-            zip_url = f"{DEPS_URL}{urllib.parse.quote(full_spec)}.zip"
+            zip_url = f"{DEPS_URL}/{urllib.parse.quote(full_spec)}.zip"
             util.download_file(full_spec, zip_url, zip_path)
 
         zip_dir = os.path.dirname(zip_path)
@@ -58,14 +59,14 @@ class Windows(Base):
         else:
             print("done")
 
-    def _platform_bootstrap(self, force: bool = False) -> bool:
+    def _platform_bootstrap(self, force: bool) -> bool:
         installed_something = self.passive_bootstrap()
 
         try:
             choco_config = os.path.join(util.SERVO_ROOT, "support", "windows", "chocolatey.config")
 
             # This is the format that PowerShell wants arguments passed to it.
-            cmd_exe_args = f"'/K','choco','install','-y','{choco_config}'"
+            cmd_exe_args = f"'/K','choco','install','-y', '\"{choco_config}\"'"
             if force:
                 cmd_exe_args += ",'-f'"
 
@@ -78,7 +79,8 @@ class Windows(Base):
             print("Could not run chocolatey.  Follow manual build setup instructions.")
             raise e
 
-        installed_something |= self._platform_bootstrap_gstreamer(force)
+        target = BuildTarget.from_triple(None)
+        installed_something |= self._platform_bootstrap_gstreamer(target, force)
         return installed_something
 
     def passive_bootstrap(self) -> bool:
@@ -104,8 +106,8 @@ class Windows(Base):
 
         return True
 
-    def gstreamer_root(self, cross_compilation_target: Optional[str]) -> Optional[str]:
-        build_target_triple = cross_compilation_target or self.triple
+    def gstreamer_root(self, target: BuildTarget) -> Optional[str]:
+        build_target_triple = target.triple()
         gst_arch_names = {
             "x86_64": "X86_64",
             "x86": "X86",
@@ -133,11 +135,11 @@ class Windows(Base):
 
         return None
 
-    def is_gstreamer_installed(self, cross_compilation_target: Optional[str]) -> bool:
-        return self.gstreamer_root(cross_compilation_target) is not None
+    def is_gstreamer_installed(self, target: BuildTarget) -> bool:
+        return self.gstreamer_root(target) is not None
 
-    def _platform_bootstrap_gstreamer(self, force: bool) -> bool:
-        if not force and self.is_gstreamer_installed(cross_compilation_target=None):
+    def _platform_bootstrap_gstreamer(self, target: BuildTarget, force: bool) -> bool:
+        if not force and self.is_gstreamer_installed(target):
             return False
 
         if "x86_64" not in self.triple:
@@ -158,12 +160,19 @@ class Windows(Base):
 
             print(f"Installing GStreamer packages to {DEPENDENCIES_DIR}...")
             os.makedirs(DEPENDENCIES_DIR, exist_ok=True)
-            common_args = [
-                f"TARGETDIR={DEPENDENCIES_DIR}",  # Install destination
-                "/qn",  # Quiet mode
-            ]
-            subprocess.check_call(["msiexec", "/a", libs_msi] + common_args)
-            subprocess.check_call(["msiexec", "/a", devel_msi] + common_args)
 
-            assert self.is_gstreamer_installed(cross_compilation_target=None)
+            for installer in [libs_msi, devel_msi]:
+                arguments = [
+                    "/a",
+                    f'"{installer}"'
+                    f'TARGETDIR="{DEPENDENCIES_DIR}"',  # Install destination
+                    "/qn",  # Quiet mode
+                ]
+                quoted_arguments = ",".join((f"'{arg}'" for arg in arguments))
+                subprocess.check_call([
+                    "powershell", "exit (Start-Process", "-PassThru", "-Wait", "-verb", "runAs",
+                    "msiexec.exe", "-ArgumentList", f"@({quoted_arguments})", ").ExitCode"
+                ])
+
+            assert self.is_gstreamer_installed(target)
             return True

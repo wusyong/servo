@@ -138,11 +138,11 @@ pub mod buffer_source;
 pub mod callback;
 pub mod cell;
 pub mod constant;
+pub mod constructor;
 pub mod conversions;
 pub mod error;
 pub mod finalize;
 pub mod guard;
-pub mod htmlconstructor;
 pub mod import;
 pub mod inheritance;
 pub mod interface;
@@ -169,7 +169,7 @@ pub mod xmlname;
 /// Generated JS-Rust bindings.
 #[allow(missing_docs, non_snake_case)]
 pub mod codegen {
-    #[allow(dead_code, crown::unrooted_must_root)]
+    #[allow(dead_code)]
     pub mod Bindings {
         include!(concat!(env!("OUT_DIR"), "/Bindings/mod.rs"));
     }

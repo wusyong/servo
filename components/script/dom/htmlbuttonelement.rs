@@ -8,7 +8,7 @@ use std::default::Default;
 use dom_struct::dom_struct;
 use html5ever::{local_name, namespace_url, LocalName, Prefix};
 use js::rust::HandleObject;
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
 use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
@@ -23,7 +23,7 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
 use crate::dom::htmlformelement::{
-    FormControl, FormDatum, FormDatumValue, FormSubmitter, HTMLFormElement, ResetFrom,
+    FormControl, FormDatum, FormDatumValue, FormSubmitterElement, HTMLFormElement, ResetFrom,
     SubmittedFrom,
 };
 use crate::dom::node::{window_from_node, BindContext, Node, UnbindContext};
@@ -31,6 +31,7 @@ use crate::dom::nodelist::NodeList;
 use crate::dom::validation::{is_barred_by_datalist_ancestor, Validatable};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 enum ButtonType {
@@ -169,13 +170,13 @@ impl HTMLButtonElementMethods for HTMLButtonElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -192,11 +193,11 @@ impl HTMLButtonElementMethods for HTMLButtonElement {
 impl HTMLButtonElement {
     /// <https://html.spec.whatwg.org/multipage/#constructing-the-form-data-set>
     /// Steps range from 3.1 to 3.7 (specific to HTMLButtonElement)
-    pub fn form_datum(&self, submitter: Option<FormSubmitter>) -> Option<FormDatum> {
+    pub fn form_datum(&self, submitter: Option<FormSubmitterElement>) -> Option<FormDatum> {
         // Step 3.1: disabled state check is in get_unclean_dataset
 
         // Step 3.1: only run steps if this is the submitter
-        if let Some(FormSubmitter::ButtonElement(submitter)) = submitter {
+        if let Some(FormSubmitterElement::Button(submitter)) = submitter {
             if submitter != self {
                 return None;
             }
@@ -244,7 +245,7 @@ impl VirtualMethods for HTMLButtonElement {
                         el.check_ancestors_disabled_state_for_form_control();
                     },
                 }
-                el.update_sequentially_focusable_status();
+                el.update_sequentially_focusable_status(CanGc::note());
                 self.validity_state()
                     .perform_validation_and_update(ValidationFlags::all());
             },
@@ -342,7 +343,7 @@ impl Activatable for HTMLButtonElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#run-post-click-activation-steps
-    fn activation_behavior(&self, _event: &Event, _target: &EventTarget) {
+    fn activation_behavior(&self, _event: &Event, _target: &EventTarget, _can_gc: CanGc) {
         let ty = self.button_type.get();
         match ty {
             //https://html.spec.whatwg.org/multipage/#attr-button-type-submit-state
@@ -351,7 +352,8 @@ impl Activatable for HTMLButtonElement {
                 if let Some(owner) = self.form_owner() {
                     owner.submit(
                         SubmittedFrom::NotFromForm,
-                        FormSubmitter::ButtonElement(self),
+                        FormSubmitterElement::Button(self),
+                        CanGc::note(),
                     );
                 }
             },

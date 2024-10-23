@@ -11,7 +11,7 @@ interface mixin GPUObjectBase {
 };
 
 dictionary GPUObjectDescriptorBase {
-    USVString label;
+    USVString label = "";
 };
 
 [Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
@@ -21,7 +21,7 @@ interface GPUSupportedLimits {
     readonly attribute unsigned long maxTextureDimension3D;
     readonly attribute unsigned long maxTextureArrayLayers;
     readonly attribute unsigned long maxBindGroups;
-    //readonly attribute unsigned long maxBindGroupsPlusVertexBuffers;
+    readonly attribute unsigned long maxBindGroupsPlusVertexBuffers;
     readonly attribute unsigned long maxBindingsPerBindGroup;
     readonly attribute unsigned long maxDynamicUniformBuffersPerPipelineLayout;
     readonly attribute unsigned long maxDynamicStorageBuffersPerPipelineLayout;
@@ -39,9 +39,9 @@ interface GPUSupportedLimits {
     readonly attribute unsigned long maxVertexAttributes;
     readonly attribute unsigned long maxVertexBufferArrayStride;
     readonly attribute unsigned long maxInterStageShaderComponents;
-    //readonly attribute unsigned long maxInterStageShaderVariables;
-    //readonly attribute unsigned long maxColorAttachments;
-    //readonly attribute unsigned long maxColorAttachmentBytesPerSample;
+    readonly attribute unsigned long maxInterStageShaderVariables;
+    readonly attribute unsigned long maxColorAttachments;
+    readonly attribute unsigned long maxColorAttachmentBytesPerSample;
     readonly attribute unsigned long maxComputeWorkgroupStorageSize;
     readonly attribute unsigned long maxComputeInvocationsPerWorkgroup;
     readonly attribute unsigned long maxComputeWorkgroupSizeX;
@@ -100,21 +100,26 @@ interface GPUAdapter {
     Promise<GPUAdapterInfo> requestAdapterInfo(optional sequence<DOMString> unmaskHints = []);
 };
 
-dictionary GPUDeviceDescriptor {
+dictionary GPUDeviceDescriptor: GPUObjectDescriptorBase {
     sequence<GPUFeatureName> requiredFeatures = [];
-    record<DOMString, GPUSize64> requiredLimits;
+    record<DOMString, GPUSize64> requiredLimits;// = {};
 };
 
 enum GPUFeatureName {
     "depth-clip-control",
-    "depth24unorm-stencil8",
     "depth32float-stencil8",
-    "pipeline-statistics-query",
     "texture-compression-bc",
+    "texture-compression-bc-sliced-3d",
     "texture-compression-etc2",
     "texture-compression-astc",
     "timestamp-query",
     "indirect-first-instance",
+    "shader-f16",
+    "rg11b10ufloat-renderable",
+    "bgra8unorm-storage",
+    "float32-filterable",
+    "clip-distances",
+    "dual-source-blending",
 };
 
 [Exposed=(Window, DedicatedWorker), /*Serializable,*/ Pref="dom.webgpu.enabled"]
@@ -134,22 +139,24 @@ interface GPUDevice: EventTarget {
     [NewObject]
     GPUSampler createSampler(optional GPUSamplerDescriptor descriptor = {});
 
+    [Throws]
     GPUBindGroupLayout createBindGroupLayout(GPUBindGroupLayoutDescriptor descriptor);
     GPUPipelineLayout createPipelineLayout(GPUPipelineLayoutDescriptor descriptor);
     GPUBindGroup createBindGroup(GPUBindGroupDescriptor descriptor);
 
     GPUShaderModule createShaderModule(GPUShaderModuleDescriptor descriptor);
     GPUComputePipeline createComputePipeline(GPUComputePipelineDescriptor descriptor);
+    [Throws]
     GPURenderPipeline createRenderPipeline(GPURenderPipelineDescriptor descriptor);
 
     [NewObject]
     Promise<GPUComputePipeline> createComputePipelineAsync(GPUComputePipelineDescriptor descriptor);
-    [NewObject]
+    [Throws, NewObject]
     Promise<GPURenderPipeline> createRenderPipelineAsync(GPURenderPipelineDescriptor descriptor);
 
     [NewObject]
     GPUCommandEncoder createCommandEncoder(optional GPUCommandEncoderDescriptor descriptor = {});
-    [NewObject]
+    [Throws, NewObject]
     GPURenderBundleEncoder createRenderBundleEncoder(GPURenderBundleEncoderDescriptor descriptor);
     //[NewObject]
     //GPUQuerySet createQuerySet(GPUQuerySetDescriptor descriptor);
@@ -158,16 +165,27 @@ GPUDevice includes GPUObjectBase;
 
 [Exposed=(Window, DedicatedWorker), Serializable, Pref="dom.webgpu.enabled"]
 interface GPUBuffer {
+    readonly attribute GPUSize64Out size;
+    readonly attribute GPUFlagsConstant usage;
+
+    readonly attribute GPUBufferMapState mapState;
+
     [NewObject]
     Promise<undefined> mapAsync(GPUMapModeFlags mode, optional GPUSize64 offset = 0, optional GPUSize64 size);
     [NewObject, Throws]
     ArrayBuffer getMappedRange(optional GPUSize64 offset = 0, optional GPUSize64 size);
-    [Throws]
     undefined unmap();
-    [Throws]
+
     undefined destroy();
 };
 GPUBuffer includes GPUObjectBase;
+
+
+enum GPUBufferMapState {
+    "unmapped",
+    "pending",
+    "mapped",
+};
 
 dictionary GPUBufferDescriptor : GPUObjectDescriptorBase {
     required GPUSize64 size;
@@ -177,32 +195,41 @@ dictionary GPUBufferDescriptor : GPUObjectDescriptorBase {
 
 typedef [EnforceRange] unsigned long GPUBufferUsageFlags;
 [Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
-interface GPUBufferUsage {
-    const GPUBufferUsageFlags MAP_READ      = 0x0001;
-    const GPUBufferUsageFlags MAP_WRITE     = 0x0002;
-    const GPUBufferUsageFlags COPY_SRC      = 0x0004;
-    const GPUBufferUsageFlags COPY_DST      = 0x0008;
-    const GPUBufferUsageFlags INDEX         = 0x0010;
-    const GPUBufferUsageFlags VERTEX        = 0x0020;
-    const GPUBufferUsageFlags UNIFORM       = 0x0040;
-    const GPUBufferUsageFlags STORAGE       = 0x0080;
-    const GPUBufferUsageFlags INDIRECT      = 0x0100;
-    const GPUBufferUsageFlags QUERY_RESOLVE = 0x0200;
+namespace GPUBufferUsage {
+    const GPUFlagsConstant MAP_READ      = 0x0001;
+    const GPUFlagsConstant MAP_WRITE     = 0x0002;
+    const GPUFlagsConstant COPY_SRC      = 0x0004;
+    const GPUFlagsConstant COPY_DST      = 0x0008;
+    const GPUFlagsConstant INDEX         = 0x0010;
+    const GPUFlagsConstant VERTEX        = 0x0020;
+    const GPUFlagsConstant UNIFORM       = 0x0040;
+    const GPUFlagsConstant STORAGE       = 0x0080;
+    const GPUFlagsConstant INDIRECT      = 0x0100;
+    const GPUFlagsConstant QUERY_RESOLVE = 0x0200;
 };
 
 typedef [EnforceRange] unsigned long GPUMapModeFlags;
 [Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
-interface GPUMapMode {
-    const GPUMapModeFlags READ  = 0x0001;
-    const GPUMapModeFlags WRITE = 0x0002;
+namespace GPUMapMode {
+    const GPUFlagsConstant READ  = 0x0001;
+    const GPUFlagsConstant WRITE = 0x0002;
 };
 
 [Exposed=(Window, DedicatedWorker), Serializable , Pref="dom.webgpu.enabled"]
 interface GPUTexture {
-    [NewObject]
+    [Throws, NewObject]
     GPUTextureView createView(optional GPUTextureViewDescriptor descriptor = {});
 
     undefined destroy();
+
+    readonly attribute GPUIntegerCoordinateOut width;
+    readonly attribute GPUIntegerCoordinateOut height;
+    readonly attribute GPUIntegerCoordinateOut depthOrArrayLayers;
+    readonly attribute GPUIntegerCoordinateOut mipLevelCount;
+    readonly attribute GPUSize32Out sampleCount;
+    readonly attribute GPUTextureDimension dimension;
+    readonly attribute GPUTextureFormat format;
+    readonly attribute GPUFlagsConstant usage;
 };
 GPUTexture includes GPUObjectBase;
 
@@ -293,8 +320,10 @@ enum GPUTextureFormat {
     "bgra8unorm",
     "bgra8unorm-srgb",
     // Packed 32-bit formats
+    "rgb9e5ufloat",
+    "rgb10a2uint",
     "rgb10a2unorm",
-    "rg11b10float",
+    "rg11b10ufloat",
 
     // 64-bit formats
     "rg32uint",
@@ -309,12 +338,15 @@ enum GPUTextureFormat {
     "rgba32sint",
     "rgba32float",
 
-    // Depth and stencil formats
-    //"stencil8", //TODO
-    //"depth16unorm",
+    // Depth/stencil formats
+    "stencil8",
+    "depth16unorm",
     "depth24plus",
     "depth24plus-stencil8",
     "depth32float",
+
+    // "depth32float-stencil8" feature
+    "depth32float-stencil8",
 
     // BC compressed formats usable if "texture-compression-bc" is both
     // supported by the device/user agent and enabled in requestDevice.
@@ -333,11 +365,49 @@ enum GPUTextureFormat {
     "bc7-rgba-unorm",
     "bc7-rgba-unorm-srgb",
 
-    // "depth24unorm-stencil8" feature
-    //"depth24unorm-stencil8",
+    // ETC2 compressed formats usable if "texture-compression-etc2" is both
+    // supported by the device/user agent and enabled in requestDevice.
+    "etc2-rgb8unorm",
+    "etc2-rgb8unorm-srgb",
+    "etc2-rgb8a1unorm",
+    "etc2-rgb8a1unorm-srgb",
+    "etc2-rgba8unorm",
+    "etc2-rgba8unorm-srgb",
+    "eac-r11unorm",
+    "eac-r11snorm",
+    "eac-rg11unorm",
+    "eac-rg11snorm",
 
-    // "depth32float-stencil8" feature
-    //"depth32float-stencil8",
+    // ASTC compressed formats usable if "texture-compression-astc" is both
+    // supported by the device/user agent and enabled in requestDevice.
+    "astc-4x4-unorm",
+    "astc-4x4-unorm-srgb",
+    "astc-5x4-unorm",
+    "astc-5x4-unorm-srgb",
+    "astc-5x5-unorm",
+    "astc-5x5-unorm-srgb",
+    "astc-6x5-unorm",
+    "astc-6x5-unorm-srgb",
+    "astc-6x6-unorm",
+    "astc-6x6-unorm-srgb",
+    "astc-8x5-unorm",
+    "astc-8x5-unorm-srgb",
+    "astc-8x6-unorm",
+    "astc-8x6-unorm-srgb",
+    "astc-8x8-unorm",
+    "astc-8x8-unorm-srgb",
+    "astc-10x5-unorm",
+    "astc-10x5-unorm-srgb",
+    "astc-10x6-unorm",
+    "astc-10x6-unorm-srgb",
+    "astc-10x8-unorm",
+    "astc-10x8-unorm-srgb",
+    "astc-10x10-unorm",
+    "astc-10x10-unorm-srgb",
+    "astc-12x10-unorm",
+    "astc-12x10-unorm-srgb",
+    "astc-12x12-unorm",
+    "astc-12x12-unorm-srgb",
 };
 
 [Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
@@ -392,10 +462,12 @@ dictionary GPUBindGroupLayoutDescriptor : GPUObjectDescriptorBase {
 dictionary GPUBindGroupLayoutEntry {
     required GPUIndex32 binding;
     required GPUShaderStageFlags visibility;
+
     GPUBufferBindingLayout buffer;
     GPUSamplerBindingLayout sampler;
     GPUTextureBindingLayout texture;
     GPUStorageTextureBindingLayout storageTexture;
+    GPUExternalTextureBindingLayout externalTexture;
 };
 
 typedef [EnforceRange] unsigned long GPUShaderStageFlags;
@@ -444,12 +516,17 @@ dictionary GPUTextureBindingLayout {
 
 enum GPUStorageTextureAccess {
     "write-only",
+    "read-only",
+    "read-write",
 };
 
 dictionary GPUStorageTextureBindingLayout {
     GPUStorageTextureAccess access = "write-only";
     required GPUTextureFormat format;
     GPUTextureViewDimension viewDimension = "2d";
+};
+
+dictionary GPUExternalTextureBindingLayout {
 };
 
 [Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
@@ -486,7 +563,6 @@ dictionary GPUPipelineLayoutDescriptor : GPUObjectDescriptorBase {
 
 [Exposed=(Window, DedicatedWorker), Serializable, Pref="dom.webgpu.enabled"]
 interface GPUShaderModule {
-    [Throws]
     Promise<GPUCompilationInfo> getCompilationInfo();
 };
 GPUShaderModule includes GPUObjectBase;
@@ -515,9 +591,23 @@ interface GPUCompilationMessage {
 
 [Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
 interface GPUCompilationInfo {
-    // codegen hates it
-    //[Cached, Frozen, Pure]
-    readonly attribute /*sequence<GPUCompilationMessage>*/ any messages;
+    //readonly attribute FrozenArray<GPUCompilationMessage> messages;
+    readonly attribute any messages;
+};
+
+[Exposed=(Window, Worker), Pref="dom.webgpu.enabled"]
+interface GPUPipelineError : DOMException {
+    constructor(optional DOMString message = "", GPUPipelineErrorInit options);
+    readonly attribute GPUPipelineErrorReason reason;
+};
+
+dictionary GPUPipelineErrorInit {
+    required GPUPipelineErrorReason reason;
+};
+
+enum GPUPipelineErrorReason {
+    "validation",
+    "internal",
 };
 
 enum GPUAutoLayoutMode {
@@ -534,8 +624,11 @@ interface mixin GPUPipelineBase {
 
 dictionary GPUProgrammableStage {
     required GPUShaderModule module;
-    required USVString entryPoint;
+    USVString entryPoint;
+    record<USVString, GPUPipelineConstantValue> constants;
 };
+
+typedef double GPUPipelineConstantValue; // May represent WGSL's bool, f32, i32, u32, and f16 if enabled.
 
 [Exposed=(Window, DedicatedWorker), Serializable, Pref="dom.webgpu.enabled"]
 interface GPUComputePipeline {
@@ -784,7 +877,7 @@ dictionary GPUCommandBufferDescriptor : GPUObjectDescriptorBase {
 interface GPUCommandEncoder {
     [NewObject]
     GPUComputePassEncoder beginComputePass(optional GPUComputePassDescriptor descriptor = {});
-    [NewObject]
+    [NewObject, Throws]
     GPURenderPassEncoder beginRenderPass(GPURenderPassDescriptor descriptor);
 
     undefined copyBufferToBuffer(
@@ -794,16 +887,19 @@ interface GPUCommandEncoder {
         GPUSize64 destinationOffset,
         GPUSize64 size);
 
+    [Throws]
     undefined copyBufferToTexture(
         GPUImageCopyBuffer source,
         GPUImageCopyTexture destination,
         GPUExtent3D copySize);
 
+    [Throws]
     undefined copyTextureToBuffer(
         GPUImageCopyTexture source,
         GPUImageCopyBuffer destination,
         GPUExtent3D copySize);
 
+    [Throws]
     undefined copyTextureToTexture(
         GPUImageCopyTexture source,
         GPUImageCopyTexture destination,
@@ -842,7 +938,6 @@ interface GPUComputePassEncoder {
     //[Pref="dom.webgpu.indirect-dispatch.enabled"]
     undefined dispatchWorkgroupsIndirect(GPUBuffer indirectBuffer, GPUSize64 indirectOffset);
 
-    [Throws]
     undefined end();
 };
 GPUComputePassEncoder includes GPUObjectBase;
@@ -860,6 +955,7 @@ interface GPURenderPassEncoder {
     undefined setScissorRect(GPUIntegerCoordinate x, GPUIntegerCoordinate y,
                              GPUIntegerCoordinate width, GPUIntegerCoordinate height);
 
+    [Throws]
     undefined setBlendConstant(GPUColor color);
     undefined setStencilReference(GPUStencilValue reference);
 
@@ -873,7 +969,6 @@ interface GPURenderPassEncoder {
 
     undefined executeBundles(sequence<GPURenderBundle> bundles);
 
-    [Throws]
     undefined end();
 };
 GPURenderPassEncoder includes GPUObjectBase;
@@ -1048,6 +1143,7 @@ interface GPUCanvasContext {
 
     // Calling configure() a second time invalidates the previous one,
     // and all of the textures it's produced.
+    [Throws]
     undefined configure(GPUCanvasConfiguration descriptor);
     undefined unconfigure();
 
@@ -1074,30 +1170,38 @@ enum GPUDeviceLostReason {
     "destroyed",
 };
 
-[Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
+[Exposed=(Window, Worker), Pref="dom.webgpu.enabled"]
 interface GPUDeviceLostInfo {
     readonly attribute GPUDeviceLostReason reason;
     readonly attribute DOMString message;
 };
 
 partial interface GPUDevice {
-    [Throws]
     readonly attribute Promise<GPUDeviceLostInfo> lost;
 };
 
-[Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
-interface GPUValidationError {
-    [Throws]
-    constructor(DOMString message);
+[Exposed=(Window, Worker), Pref="dom.webgpu.enabled"]
+interface GPUError {
     readonly attribute DOMString message;
 };
 
-[Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
-interface GPUOutOfMemoryError {
-    constructor();
+[Exposed=(Window, Worker), Pref="dom.webgpu.enabled"]
+interface GPUValidationError
+        : GPUError {
+    constructor(DOMString message);
 };
 
-typedef (GPUOutOfMemoryError or GPUValidationError) GPUError;
+[Exposed=(Window, Worker), Pref="dom.webgpu.enabled"]
+interface GPUOutOfMemoryError
+        : GPUError {
+    constructor(DOMString message);
+};
+
+[Exposed=(Window, Worker), Pref="dom.webgpu.enabled"]
+interface GPUInternalError
+        : GPUError {
+    constructor(DOMString message);
+};
 
 enum GPUErrorFilter {
     "validation",
@@ -1111,7 +1215,7 @@ partial interface GPUDevice {
     Promise<GPUError?> popErrorScope();
 };
 
-[Exposed=(Window, DedicatedWorker), Pref="dom.webgpu.enabled"]
+[Exposed=(Window, Worker), Pref="dom.webgpu.enabled"]
 interface GPUUncapturedErrorEvent : Event {
     constructor(
         DOMString type,
@@ -1139,6 +1243,12 @@ typedef [EnforceRange] unsigned long GPUIntegerCoordinate;
 typedef [EnforceRange] unsigned long GPUIndex32;
 typedef [EnforceRange] unsigned long GPUSize32;
 typedef [EnforceRange] long GPUSignedOffset32;
+
+typedef unsigned long long GPUSize64Out;
+typedef unsigned long GPUIntegerCoordinateOut;
+typedef unsigned long GPUSize32Out;
+
+typedef unsigned long GPUFlagsConstant;
 
 dictionary GPUColorDict {
     required double r;

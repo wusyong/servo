@@ -15,8 +15,10 @@ use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGL
 use crate::dom::bindings::codegen::Bindings::XRWebGLLayerBinding::{
     XRWebGLLayerInit, XRWebGLLayerMethods, XRWebGLRenderingContext,
 };
+use crate::dom::bindings::codegen::UnionTypes::HTMLCanvasElementOrOffscreenCanvas;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
@@ -30,6 +32,7 @@ use crate::dom::xrlayer::XRLayer;
 use crate::dom::xrsession::XRSession;
 use crate::dom::xrview::XRView;
 use crate::dom::xrviewport::XRViewport;
+use crate::script_runtime::CanGc;
 
 impl<'a> From<&'a XRWebGLLayerInit> for LayerInit {
     fn from(init: &'a XRWebGLLayerInit) -> LayerInit {
@@ -75,6 +78,7 @@ impl XRWebGLLayer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -83,6 +87,7 @@ impl XRWebGLLayer {
         init: &XRWebGLLayerInit,
         framebuffer: Option<&WebGLFramebuffer>,
         layer_id: Option<LayerId>,
+        can_gc: CanGc,
     ) -> DomRoot<XRWebGLLayer> {
         reflect_dom_object_with_proto(
             Box::new(XRWebGLLayer::new_inherited(
@@ -94,66 +99,8 @@ impl XRWebGLLayer {
             )),
             global,
             proto,
+            can_gc,
         )
-    }
-
-    /// <https://immersive-web.github.io/webxr/#dom-xrwebgllayer-xrwebgllayer>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &Window,
-        proto: Option<HandleObject>,
-        session: &XRSession,
-        context: XRWebGLRenderingContext,
-        init: &XRWebGLLayerInit,
-    ) -> Fallible<DomRoot<Self>> {
-        let context = match context {
-            XRWebGLRenderingContext::WebGLRenderingContext(ctx) => ctx,
-            XRWebGLRenderingContext::WebGL2RenderingContext(ctx) => ctx.base_context(),
-        };
-
-        // Step 2
-        if session.is_ended() {
-            return Err(Error::InvalidState);
-        }
-        // XXXManishearth step 3: throw error if context is lost
-        // XXXManishearth step 4: check XR compat flag for immersive sessions
-
-        let (framebuffer, layer_id) = if session.is_immersive() {
-            // Step 9.2. "Initialize layer’s framebuffer to a new opaque framebuffer created with context."
-            let size = session
-                .with_session(|session| session.recommended_framebuffer_resolution())
-                .ok_or(Error::Operation)?;
-            let framebuffer = WebGLFramebuffer::maybe_new_webxr(session, &context, size)
-                .ok_or(Error::Operation)?;
-
-            // Step 9.3. "Allocate and initialize resources compatible with session’s XR device,
-            // including GPU accessible memory buffers, as required to support the compositing of layer."
-            let context_id = WebXRContextId::from(context.context_id());
-            let layer_init = LayerInit::from(init);
-            let layer_id = session
-                .with_session(|session| session.create_layer(context_id, layer_init))
-                .map_err(|_| Error::Operation)?;
-
-            // Step 9.4: "If layer’s resources were unable to be created for any reason,
-            // throw an OperationError and abort these steps."
-            (Some(framebuffer), Some(layer_id))
-        } else {
-            (None, None)
-        };
-
-        // Ensure that we finish setting up this layer before continuing.
-        context.Finish();
-
-        // Step 10. "Return layer."
-        Ok(XRWebGLLayer::new(
-            &global.global(),
-            proto,
-            session,
-            &context,
-            init,
-            framebuffer.as_deref(),
-            layer_id,
-        ))
     }
 
     pub fn layer_id(&self) -> Option<LayerId> {
@@ -176,16 +123,25 @@ impl XRWebGLLayer {
                 size.1.try_into().unwrap_or(0),
             )
         } else {
-            let size = self.context().Canvas().get_size();
+            let size = match self.context().Canvas() {
+                HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => canvas.get_size(),
+                HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(canvas) => {
+                    let size = canvas.get_size();
+                    Size2D::new(
+                        size.width.try_into().unwrap_or(0),
+                        size.height.try_into().unwrap_or(0),
+                    )
+                },
+            };
             Size2D::from_untyped(size)
         }
     }
 
     fn texture_target(&self) -> u32 {
         if cfg!(target_os = "macos") {
-            sparkle::gl::TEXTURE_RECTANGLE
+            glow::TEXTURE_RECTANGLE
         } else {
-            sparkle::gl::TEXTURE_2D
+            glow::TEXTURE_2D
         }
     }
 
@@ -282,6 +238,72 @@ impl XRWebGLLayer {
 }
 
 impl XRWebGLLayerMethods for XRWebGLLayer {
+    /// <https://immersive-web.github.io/webxr/#dom-xrwebgllayer-xrwebgllayer>
+    fn Constructor(
+        global: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        session: &XRSession,
+        context: XRWebGLRenderingContext,
+        init: &XRWebGLLayerInit,
+    ) -> Fallible<DomRoot<Self>> {
+        let context = match context {
+            XRWebGLRenderingContext::WebGLRenderingContext(ctx) => ctx,
+            XRWebGLRenderingContext::WebGL2RenderingContext(ctx) => ctx.base_context(),
+        };
+
+        // Step 2
+        if session.is_ended() {
+            return Err(Error::InvalidState);
+        }
+        // XXXManishearth step 3: throw error if context is lost
+        // XXXManishearth step 4: check XR compat flag for immersive sessions
+
+        let (framebuffer, layer_id) = if session.is_immersive() {
+            // Step 9.2. "Initialize layer’s framebuffer to a new opaque framebuffer created with context."
+            let size = session
+                .with_session(|session| session.recommended_framebuffer_resolution())
+                .ok_or(Error::Operation)?;
+            let framebuffer = WebGLFramebuffer::maybe_new_webxr(session, &context, size)
+                .ok_or(Error::Operation)?;
+
+            // Step 9.3. "Allocate and initialize resources compatible with session’s XR device,
+            // including GPU accessible memory buffers, as required to support the compositing of layer."
+            let context_id = WebXRContextId::from(context.context_id());
+            let layer_init = LayerInit::from(init);
+            let layer_id = session
+                .with_session(|session| session.create_layer(context_id, layer_init))
+                .map_err(|_| Error::Operation)?;
+
+            // Step 9.4: "If layer’s resources were unable to be created for any reason,
+            // throw an OperationError and abort these steps."
+            (Some(framebuffer), Some(layer_id))
+        } else {
+            (None, None)
+        };
+
+        // Ensure that we finish setting up this layer before continuing.
+        context.Finish();
+
+        // Step 10. "Return layer."
+        Ok(XRWebGLLayer::new(
+            &global.global(),
+            proto,
+            session,
+            &context,
+            init,
+            framebuffer.as_deref(),
+            layer_id,
+            can_gc,
+        ))
+    }
+
+    /// <https://www.w3.org/TR/webxr/#dom-xrwebgllayer-getnativeframebufferscalefactor>
+    fn GetNativeFramebufferScaleFactor(_window: &Window, session: &XRSession) -> Finite<f64> {
+        let value: f64 = if session.is_ended() { 0.0 } else { 1.0 };
+        Finite::wrap(value)
+    }
+
     /// <https://immersive-web.github.io/webxr/#dom-xrwebgllayer-antialias>
     fn Antialias(&self) -> bool {
         self.antialias
@@ -290,6 +312,17 @@ impl XRWebGLLayerMethods for XRWebGLLayer {
     /// <https://immersive-web.github.io/webxr/#dom-xrwebgllayer-ignoredepthvalues>
     fn IgnoreDepthValues(&self) -> bool {
         self.ignore_depth_values
+    }
+
+    /// <https://www.w3.org/TR/webxr/#dom-xrwebgllayer-fixedfoveation>
+    fn GetFixedFoveation(&self) -> Option<Finite<f32>> {
+        // Fixed foveation is only available on Quest/Pico headset runtimes
+        None
+    }
+
+    /// <https://www.w3.org/TR/webxr/#dom-xrwebgllayer-fixedfoveation>
+    fn SetFixedFoveation(&self, _value: Option<Finite<f32>>) {
+        // no-op until fixed foveation is supported
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrwebgllayer-framebuffer>
@@ -316,13 +349,18 @@ impl XRWebGLLayerMethods for XRWebGLLayer {
         let index = view.viewport_index();
 
         let viewport = self.session().with_session(|s| {
-            // Inline sssions
+            // Inline sessions
             if s.viewports().is_empty() {
                 Rect::from_size(self.size().to_i32())
             } else {
                 s.viewports()[index]
             }
         });
+
+        // NOTE: According to spec, viewport sizes should be recalculated here if the
+        // requested viewport scale has changed. However, existing browser implementations
+        // don't seem to do this for stereoscopic immersive sessions.
+        // Revisit if Servo gets support for handheld AR/VR via ARCore/ARKit
 
         Some(XRViewport::new(&self.global(), viewport))
     }

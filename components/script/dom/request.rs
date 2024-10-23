@@ -13,10 +13,11 @@ use http::method::InvalidMethod;
 use http::Method as HttpMethod;
 use js::jsapi::JSObject;
 use js::rust::HandleObject;
+use net_traits::fetch::headers::is_forbidden_method;
 use net_traits::request::{
     CacheMode as NetTraitsRequestCache, CredentialsMode as NetTraitsRequestCredentials,
     Destination as NetTraitsRequestDestination, Origin, RedirectMode as NetTraitsRequestRedirect,
-    Referrer as NetTraitsRequestReferrer, Request as NetTraitsRequest,
+    Referrer as NetTraitsRequestReferrer, Request as NetTraitsRequest, RequestBuilder,
     RequestMode as NetTraitsRequestMode, Window,
 };
 use net_traits::ReferrerPolicy as MsgReferrerPolicy;
@@ -38,7 +39,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::headers::{Guard, Headers};
 use crate::dom::promise::Promise;
 use crate::dom::readablestream::ReadableStream;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[dom_struct]
 pub struct Request {
@@ -59,15 +60,108 @@ impl Request {
         }
     }
 
-    fn new(global: &GlobalScope, proto: Option<HandleObject>, url: ServoUrl) -> DomRoot<Request> {
-        reflect_dom_object_with_proto(Box::new(Request::new_inherited(global, url)), global, proto)
-    }
-
-    // https://fetch.spec.whatwg.org/#dom-request
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    fn new(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        url: ServoUrl,
+        can_gc: CanGc,
+    ) -> DomRoot<Request> {
+        reflect_dom_object_with_proto(
+            Box::new(Request::new_inherited(global, url)),
+            global,
+            proto,
+            can_gc,
+        )
+    }
+
+    fn from_net_request(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        net_request: NetTraitsRequest,
+        can_gc: CanGc,
+    ) -> DomRoot<Request> {
+        let r = Request::new(global, proto, net_request.current_url(), can_gc);
+        *r.request.borrow_mut() = net_request;
+        r
+    }
+
+    fn clone_from(r: &Request, can_gc: CanGc) -> Fallible<DomRoot<Request>> {
+        let req = r.request.borrow();
+        let url = req.url();
+        let headers_guard = r.Headers(can_gc).get_guard();
+        let r_clone = Request::new(&r.global(), None, url, can_gc);
+        r_clone.request.borrow_mut().pipeline_id = req.pipeline_id;
+        {
+            let mut borrowed_r_request = r_clone.request.borrow_mut();
+            borrowed_r_request.origin = req.origin.clone();
+        }
+        *r_clone.request.borrow_mut() = req.clone();
+        r_clone
+            .Headers(can_gc)
+            .copy_from_headers(r.Headers(can_gc))?;
+        r_clone.Headers(can_gc).set_guard(headers_guard);
+        Ok(r_clone)
+    }
+
+    pub fn get_request(&self) -> NetTraitsRequest {
+        self.request.borrow().clone()
+    }
+}
+
+fn net_request_from_global(global: &GlobalScope, url: ServoUrl) -> NetTraitsRequest {
+    RequestBuilder::new(url, global.get_referrer())
+        .origin(global.get_url().origin())
+        .pipeline_id(Some(global.pipeline_id()))
+        .https_state(global.get_https_state())
+        .build()
+}
+
+// https://fetch.spec.whatwg.org/#concept-method-normalize
+fn normalize_method(m: &str) -> Result<HttpMethod, InvalidMethod> {
+    match_ignore_ascii_case! { m,
+        "delete" => return Ok(HttpMethod::DELETE),
+        "get" => return Ok(HttpMethod::GET),
+        "head" => return Ok(HttpMethod::HEAD),
+        "options" => return Ok(HttpMethod::OPTIONS),
+        "post" => return Ok(HttpMethod::POST),
+        "put" => return Ok(HttpMethod::PUT),
+        _ => (),
+    }
+    debug!("Method: {:?}", m);
+    HttpMethod::from_str(m)
+}
+
+// https://fetch.spec.whatwg.org/#concept-method
+fn is_method(m: &ByteString) -> bool {
+    m.as_str().is_some()
+}
+
+// https://fetch.spec.whatwg.org/#cors-safelisted-method
+fn is_cors_safelisted_method(m: &HttpMethod) -> bool {
+    m == HttpMethod::GET || m == HttpMethod::HEAD || m == HttpMethod::POST
+}
+
+// https://url.spec.whatwg.org/#include-credentials
+fn includes_credentials(input: &ServoUrl) -> bool {
+    !input.username().is_empty() || input.password().is_some()
+}
+
+// https://fetch.spec.whatwg.org/#concept-body-disturbed
+fn request_is_disturbed(input: &Request) -> bool {
+    input.is_disturbed()
+}
+
+// https://fetch.spec.whatwg.org/#concept-body-locked
+fn request_is_locked(input: &Request) -> bool {
+    input.is_locked()
+}
+
+impl RequestMethods for Request {
+    // https://fetch.spec.whatwg.org/#dom-request
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
         mut input: RequestInfo,
         init: RootedTraceableBox<RequestInit>,
     ) -> Fallible<DomRoot<Request>> {
@@ -283,7 +377,7 @@ impl Request {
         // Step 27 TODO: "If init["priority"] exists..."
 
         // Step 28
-        let r = Request::from_net_request(global, proto, request);
+        let r = Request::from_net_request(global, proto, request, can_gc);
 
         // Step 29 TODO: "Set this's signal to new AbortSignal object..."
         // Step 30 TODO: "If signal is not null..."
@@ -291,7 +385,8 @@ impl Request {
         // Step 31
         // "or_init" looks unclear here, but it always enters the block since r
         // hasn't had any other way to initialize its headers
-        r.headers.or_init(|| Headers::for_request(&r.global()));
+        r.headers
+            .or_init(|| Headers::for_request(&r.global(), can_gc));
 
         // Step 33 - but spec says this should only be when non-empty init?
         let headers_copy = init
@@ -326,7 +421,7 @@ impl Request {
                 ));
             }
             // Step 32.2
-            r.Headers().set_guard(Guard::RequestNoCors);
+            r.Headers(can_gc).set_guard(Guard::RequestNoCors);
         }
 
         // Step 33.5
@@ -337,15 +432,16 @@ impl Request {
                 // but an input with headers is given, set request's
                 // headers as the input's Headers.
                 if let RequestInfo::Request(ref input_request) = input {
-                    r.Headers().copy_from_headers(input_request.Headers())?;
+                    r.Headers(can_gc)
+                        .copy_from_headers(input_request.Headers(can_gc))?;
                 }
             },
-            Some(headers_copy) => r.Headers().fill(Some(headers_copy))?,
+            Some(headers_copy) => r.Headers(can_gc).fill(Some(headers_copy))?,
         }
 
         // Step 33.5 depending on how we got here
         // Copy the headers list onto the headers of net_traits::Request
-        r.request.borrow_mut().headers = r.Headers().get_headers_list();
+        r.request.borrow_mut().headers = r.Headers(can_gc).get_headers_list();
 
         // Step 34
         let mut input_body = if let RequestInfo::Request(ref mut input_request) = input {
@@ -387,12 +483,12 @@ impl Request {
             if let Some(contents) = extracted_body.content_type.take() {
                 let ct_header_name = b"Content-Type";
                 if !r
-                    .Headers()
+                    .Headers(can_gc)
                     .Has(ByteString::new(ct_header_name.to_vec()))
                     .unwrap()
                 {
                     let ct_header_val = contents.as_bytes();
-                    r.Headers().Append(
+                    r.Headers(can_gc).Append(
                         ByteString::new(ct_header_name.to_vec()),
                         ByteString::new(ct_header_val.to_vec()),
                     )?;
@@ -429,97 +525,7 @@ impl Request {
         // Step 42
         Ok(r)
     }
-}
 
-impl Request {
-    fn from_net_request(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        net_request: NetTraitsRequest,
-    ) -> DomRoot<Request> {
-        let r = Request::new(global, proto, net_request.current_url());
-        *r.request.borrow_mut() = net_request;
-        r
-    }
-
-    fn clone_from(r: &Request) -> Fallible<DomRoot<Request>> {
-        let req = r.request.borrow();
-        let url = req.url();
-        let headers_guard = r.Headers().get_guard();
-        let r_clone = Request::new(&r.global(), None, url);
-        r_clone.request.borrow_mut().pipeline_id = req.pipeline_id;
-        {
-            let mut borrowed_r_request = r_clone.request.borrow_mut();
-            borrowed_r_request.origin = req.origin.clone();
-        }
-        *r_clone.request.borrow_mut() = req.clone();
-        r_clone.Headers().copy_from_headers(r.Headers())?;
-        r_clone.Headers().set_guard(headers_guard);
-        Ok(r_clone)
-    }
-
-    pub fn get_request(&self) -> NetTraitsRequest {
-        self.request.borrow().clone()
-    }
-}
-
-fn net_request_from_global(global: &GlobalScope, url: ServoUrl) -> NetTraitsRequest {
-    let origin = Origin::Origin(global.get_url().origin());
-    let https_state = global.get_https_state();
-    let pipeline_id = global.pipeline_id();
-    let referrer = global.get_referrer();
-    NetTraitsRequest::new(url, Some(origin), referrer, Some(pipeline_id), https_state)
-}
-
-// https://fetch.spec.whatwg.org/#concept-method-normalize
-fn normalize_method(m: &str) -> Result<HttpMethod, InvalidMethod> {
-    match_ignore_ascii_case! { m,
-        "delete" => return Ok(HttpMethod::DELETE),
-        "get" => return Ok(HttpMethod::GET),
-        "head" => return Ok(HttpMethod::HEAD),
-        "options" => return Ok(HttpMethod::OPTIONS),
-        "post" => return Ok(HttpMethod::POST),
-        "put" => return Ok(HttpMethod::PUT),
-        _ => (),
-    }
-    debug!("Method: {:?}", m);
-    HttpMethod::from_str(m)
-}
-
-// https://fetch.spec.whatwg.org/#concept-method
-fn is_method(m: &ByteString) -> bool {
-    m.as_str().is_some()
-}
-
-// https://fetch.spec.whatwg.org/#forbidden-method
-fn is_forbidden_method(m: &ByteString) -> bool {
-    matches!(
-        m.to_lower().as_str(),
-        Some("connect") | Some("trace") | Some("track")
-    )
-}
-
-// https://fetch.spec.whatwg.org/#cors-safelisted-method
-fn is_cors_safelisted_method(m: &HttpMethod) -> bool {
-    m == HttpMethod::GET || m == HttpMethod::HEAD || m == HttpMethod::POST
-}
-
-// https://url.spec.whatwg.org/#include-credentials
-fn includes_credentials(input: &ServoUrl) -> bool {
-    !input.username().is_empty() || input.password().is_some()
-}
-
-// https://fetch.spec.whatwg.org/#concept-body-disturbed
-fn request_is_disturbed(input: &Request) -> bool {
-    input.is_disturbed()
-}
-
-// https://fetch.spec.whatwg.org/#concept-body-locked
-fn request_is_locked(input: &Request) -> bool {
-    input.is_locked()
-}
-
-impl RequestMethods for Request {
     // https://fetch.spec.whatwg.org/#dom-request-method
     fn Method(&self) -> ByteString {
         let r = self.request.borrow();
@@ -529,12 +535,13 @@ impl RequestMethods for Request {
     // https://fetch.spec.whatwg.org/#dom-request-url
     fn Url(&self) -> USVString {
         let r = self.request.borrow();
-        USVString(r.url_list.get(0).map_or("", |u| u.as_str()).into())
+        USVString(r.url_list.first().map_or("", |u| u.as_str()).into())
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-headers
-    fn Headers(&self) -> DomRoot<Headers> {
-        self.headers.or_init(|| Headers::new(&self.global()))
+    fn Headers(&self, can_gc: CanGc) -> DomRoot<Headers> {
+        self.headers
+            .or_init(|| Headers::new(&self.global(), can_gc))
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-destination
@@ -604,7 +611,7 @@ impl RequestMethods for Request {
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-clone
-    fn Clone(&self) -> Fallible<DomRoot<Request>> {
+    fn Clone(&self, can_gc: CanGc) -> Fallible<DomRoot<Request>> {
         // Step 1
         if request_is_locked(self) {
             return Err(Error::Type("Request is locked".to_string()));
@@ -614,32 +621,32 @@ impl RequestMethods for Request {
         }
 
         // Step 2
-        Request::clone_from(self)
+        Request::clone_from(self, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-text
-    fn Text(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::Text)
+    fn Text(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::Text, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-blob
-    fn Blob(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::Blob)
+    fn Blob(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::Blob, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-formdata
-    fn FormData(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::FormData)
+    fn FormData(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::FormData, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-json
-    fn Json(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::Json)
+    fn Json(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::Json, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-arraybuffer
-    fn ArrayBuffer(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::ArrayBuffer)
+    fn ArrayBuffer(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::ArrayBuffer, can_gc)
     }
 }
 
@@ -648,20 +655,20 @@ impl BodyMixin for Request {
         let body_stream = self.body_stream.get();
         body_stream
             .as_ref()
-            .map_or(false, |stream| stream.is_disturbed())
+            .is_some_and(|stream| stream.is_disturbed())
     }
 
     fn is_locked(&self) -> bool {
         let body_stream = self.body_stream.get();
-        body_stream.map_or(false, |stream| stream.is_locked())
+        body_stream.is_some_and(|stream| stream.is_locked())
     }
 
     fn body(&self) -> Option<DomRoot<ReadableStream>> {
         self.body_stream.get()
     }
 
-    fn get_mime_type(&self) -> Vec<u8> {
-        let headers = self.Headers();
+    fn get_mime_type(&self, can_gc: CanGc) -> Vec<u8> {
+        let headers = self.Headers(can_gc);
         headers.extract_mime_type()
     }
 }
@@ -720,8 +727,11 @@ impl From<RequestDestination> for NetTraitsRequestDestination {
             RequestDestination::Document => NetTraitsRequestDestination::Document,
             RequestDestination::Embed => NetTraitsRequestDestination::Embed,
             RequestDestination::Font => NetTraitsRequestDestination::Font,
+            RequestDestination::Frame => NetTraitsRequestDestination::Frame,
+            RequestDestination::Iframe => NetTraitsRequestDestination::IFrame,
             RequestDestination::Image => NetTraitsRequestDestination::Image,
             RequestDestination::Manifest => NetTraitsRequestDestination::Manifest,
+            RequestDestination::Json => NetTraitsRequestDestination::Json,
             RequestDestination::Object => NetTraitsRequestDestination::Object,
             RequestDestination::Report => NetTraitsRequestDestination::Report,
             RequestDestination::Script => NetTraitsRequestDestination::Script,
@@ -743,8 +753,11 @@ impl From<NetTraitsRequestDestination> for RequestDestination {
             NetTraitsRequestDestination::Document => RequestDestination::Document,
             NetTraitsRequestDestination::Embed => RequestDestination::Embed,
             NetTraitsRequestDestination::Font => RequestDestination::Font,
+            NetTraitsRequestDestination::Frame => RequestDestination::Frame,
+            NetTraitsRequestDestination::IFrame => RequestDestination::Iframe,
             NetTraitsRequestDestination::Image => RequestDestination::Image,
             NetTraitsRequestDestination::Manifest => RequestDestination::Manifest,
+            NetTraitsRequestDestination::Json => RequestDestination::Json,
             NetTraitsRequestDestination::Object => RequestDestination::Object,
             NetTraitsRequestDestination::Report => RequestDestination::Report,
             NetTraitsRequestDestination::Script => RequestDestination::Script,
@@ -759,6 +772,7 @@ impl From<NetTraitsRequestDestination> for RequestDestination {
             NetTraitsRequestDestination::Video => RequestDestination::Video,
             NetTraitsRequestDestination::Worker => RequestDestination::Worker,
             NetTraitsRequestDestination::Xslt => RequestDestination::Xslt,
+            NetTraitsRequestDestination::WebIdentity => RequestDestination::_empty,
         }
     }
 }
@@ -788,8 +802,6 @@ impl From<NetTraitsRequestMode> for RequestMode {
     }
 }
 
-// TODO
-// When whatwg/fetch PR #346 is merged, fix this.
 impl From<ReferrerPolicy> for MsgReferrerPolicy {
     fn from(policy: ReferrerPolicy) -> Self {
         match policy {

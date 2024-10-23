@@ -61,16 +61,15 @@ impl RadioNodeList {
             NodeListType::Radio(RadioList::new(form, RadioListMode::Images, name.clone())),
         )
     }
-
-    // https://dom.spec.whatwg.org/#dom-nodelist-length
-    // https://github.com/servo/servo/issues/5875
-    #[allow(non_snake_case)]
-    pub fn Length(&self) -> u32 {
-        self.node_list.Length()
-    }
 }
 
 impl RadioNodeListMethods for RadioNodeList {
+    // https://dom.spec.whatwg.org/#dom-nodelist-length
+    // https://github.com/servo/servo/issues/5875
+    fn Length(&self) -> u32 {
+        self.node_list.Length()
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-radionodelist-value
     fn Value(&self) -> DOMString {
         self.upcast::<NodeList>()
@@ -102,7 +101,7 @@ impl RadioNodeListMethods for RadioNodeList {
             // Step 1
             if let Some(input) = node.downcast::<HTMLInputElement>() {
                 match input.input_type() {
-                    InputType::Radio if value == DOMString::from("on") => {
+                    InputType::Radio if value == *"on" => {
                         // Step 2
                         let val = input.Value();
                         if val.is_empty() || val == value {

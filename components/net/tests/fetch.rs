@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
+use base::id::TEST_PIPELINE_ID;
 use crossbeam_channel::{unbounded, Sender};
 use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse};
 use headers::{
@@ -22,24 +23,25 @@ use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
 use mime::{self, Mime};
-use msg::constellation_msg::TEST_PIPELINE_ID;
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, CancellationListener, FetchContext};
 use net::filemanager_thread::FileManager;
 use net::hsts::HstsEntry;
+use net::protocols::ProtocolRegistry;
 use net::resource_thread::CoreResourceThreadPool;
 use net::test::HttpState;
 use net_traits::filemanager_thread::FileTokenCheck;
+use net_traits::http_status::HttpStatus;
 use net_traits::request::{
-    Destination, Origin, RedirectMode, Referrer, Request, RequestBuilder, RequestMode,
+    Destination, RedirectMode, Referrer, Request, RequestBuilder, RequestMode,
 };
-use net_traits::response::{CacheState, HttpsState, Response, ResponseBody, ResponseType};
+use net_traits::response::{CacheState, Response, ResponseBody, ResponseType};
 use net_traits::{
     FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy, ResourceFetchTiming,
     ResourceTimingType,
 };
 use servo_arc::Arc as ServoArc;
-use servo_url::{ImmutableOrigin, ServoUrl};
+use servo_url::ServoUrl;
 use tokio_test::block_on;
 use uuid::Uuid;
 
@@ -59,14 +61,9 @@ fn test_fetch_response_is_not_network_error() {
     };
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     let fetch_response = fetch(&mut request, None);
     let _ = server.close();
 
@@ -78,14 +75,9 @@ fn test_fetch_response_is_not_network_error() {
 #[test]
 fn test_fetch_on_bad_port_is_network_error() {
     let url = ServoUrl::parse("http://www.example.org:6667").unwrap();
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     let fetch_response = fetch(&mut request, None);
     assert!(fetch_response.is_network_error());
     let fetch_error = fetch_response.get_network_error().unwrap();
@@ -103,14 +95,9 @@ fn test_fetch_response_body_matches_const_message() {
     };
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     let fetch_response = fetch(&mut request, None);
     let _ = server.close();
 
@@ -128,14 +115,9 @@ fn test_fetch_response_body_matches_const_message() {
 #[test]
 fn test_fetch_aboutblank() {
     let url = ServoUrl::parse("about:blank").unwrap();
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
 
     let fetch_response = fetch(&mut request, None);
     // We should see an opaque-filtered response.
@@ -166,12 +148,12 @@ fn test_fetch_blob() {
     impl FetchTaskTarget for FetchResponseCollector {
         fn process_request_body(&mut self, _: &Request) {}
         fn process_request_eof(&mut self, _: &Request) {}
-        fn process_response(&mut self, _: &Response) {}
-        fn process_response_chunk(&mut self, chunk: Vec<u8>) {
+        fn process_response(&mut self, _: &Request, _: &Response) {}
+        fn process_response_chunk(&mut self, _: &Request, chunk: Vec<u8>) {
             self.buffer.extend_from_slice(chunk.as_slice());
         }
         /// Fired when the response is fully fetched
-        fn process_response_eof(&mut self, response: &Response) {
+        fn process_response_eof(&mut self, _: &Request, response: &Response) {
             assert_eq!(self.buffer, self.expected);
             let _ = self.sender.send(response.clone());
         }
@@ -198,13 +180,9 @@ fn test_fetch_blob() {
     );
     let url = ServoUrl::parse(&format!("blob:{}{}", origin.as_str(), id.simple())).unwrap();
 
-    let mut request = Request::new(
-        url,
-        Some(Origin::Origin(origin.origin())),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(origin.origin())
+        .build();
 
     let (sender, receiver) = unbounded();
 
@@ -244,14 +222,9 @@ fn test_file() {
         .unwrap();
     let url = ServoUrl::from_file_path(path.clone()).unwrap();
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
 
     let pool = CoreResourceThreadPool::new(1);
     let pool_handle = Arc::new(pool);
@@ -292,14 +265,9 @@ fn test_file() {
 #[test]
 fn test_fetch_ftp() {
     let url = ServoUrl::parse("ftp://not-supported").unwrap();
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     let fetch_response = fetch(&mut request, None);
     assert!(fetch_response.is_network_error());
 }
@@ -307,14 +275,9 @@ fn test_fetch_ftp() {
 #[test]
 fn test_fetch_bogus_scheme() {
     let url = ServoUrl::parse("bogus://whatever").unwrap();
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     let fetch_response = fetch(&mut request, None);
     assert!(fetch_response.is_network_error());
 }
@@ -358,15 +321,7 @@ fn test_cors_preflight_fetch() {
     let (server, url) = make_server(handler);
 
     let target_url = url.clone().join("a.html").unwrap();
-
-    let origin = Origin::Origin(ImmutableOrigin::new_opaque());
-    let mut request = Request::new(
-        url.clone(),
-        Some(origin),
-        Referrer::ReferrerUrl(target_url),
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url, Referrer::ReferrerUrl(target_url)).build();
     request.referrer_policy = Some(ReferrerPolicy::Origin);
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
@@ -416,14 +371,7 @@ fn test_cors_preflight_cache_fetch() {
     };
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(ImmutableOrigin::new_opaque());
-    let mut request = Request::new(
-        url.clone(),
-        Some(origin.clone()),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url, Referrer::NoReferrer).build();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
     let mut wrapped_request0 = request.clone();
@@ -483,14 +431,7 @@ fn test_cors_preflight_fetch_network_error() {
     };
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(ImmutableOrigin::new_opaque());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url, Referrer::NoReferrer).build();
     request.method = Method::from_bytes(b"CHICKEN").unwrap();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
@@ -517,14 +458,9 @@ fn test_fetch_response_is_basic_filtered() {
     };
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     let fetch_response = fetch(&mut request, None);
     let _ = server.close();
 
@@ -585,14 +521,7 @@ fn test_fetch_response_is_cors_filtered() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will stop it from defaulting to a basic filtered response
-    let origin = Origin::Origin(ImmutableOrigin::new_opaque());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url, Referrer::NoReferrer).build();
     request.mode = RequestMode::CorsMode;
     let fetch_response = fetch(&mut request, None);
     let _ = server.close();
@@ -624,14 +553,7 @@ fn test_fetch_response_is_opaque_filtered() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will fall through to an Opaque filtered response
-    let origin = Origin::Origin(ImmutableOrigin::new_opaque());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url, Referrer::NoReferrer).build();
     let fetch_response = fetch(&mut request, None);
     let _ = server.close();
 
@@ -641,7 +563,7 @@ fn test_fetch_response_is_opaque_filtered() {
     assert!(fetch_response.url().is_none());
     assert!(fetch_response.url_list.is_empty());
     // this also asserts that status message is "the empty byte sequence"
-    assert!(fetch_response.status.is_none());
+    assert!(fetch_response.status.is_error());
     assert_eq!(fetch_response.headers, HeaderMap::new());
     match *fetch_response.body.lock().unwrap() {
         ResponseBody::Empty => {},
@@ -677,14 +599,9 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
 
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     request.redirect_mode = RedirectMode::Manual;
     let fetch_response = fetch(&mut request, None);
     let _ = server.close();
@@ -693,7 +610,7 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
     assert_eq!(fetch_response.response_type, ResponseType::OpaqueRedirect);
 
     // this also asserts that status message is "the empty byte sequence"
-    assert!(fetch_response.status.is_none());
+    assert!(fetch_response.status.is_error());
     assert_eq!(fetch_response.headers, HeaderMap::new());
     match *fetch_response.body.lock().unwrap() {
         ResponseBody::Empty => {},
@@ -716,14 +633,9 @@ fn test_fetch_with_local_urls_only() {
     let (server, server_url) = make_server(handler);
 
     let do_fetch = |url: ServoUrl| {
-        let origin = Origin::Origin(url.origin());
-        let mut request = Request::new(
-            url,
-            Some(origin),
-            Referrer::NoReferrer,
-            None,
-            HttpsState::None,
-        );
+        let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+            .origin(url.origin())
+            .build();
 
         // Set the flag.
         request.local_urls_only = true;
@@ -769,6 +681,7 @@ fn test_fetch_with_hsts() {
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
         ))),
+        protocols: Arc::new(ProtocolRegistry::default()),
     };
 
     // The server certificate is self-signed, so we need to add an override
@@ -783,14 +696,9 @@ fn test_fetch_with_hsts() {
             HstsEntry::new("localhost".to_owned(), IncludeSubdomains::NotIncluded, None).unwrap(),
         );
     }
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     // Set the flag.
     request.local_urls_only = false;
     let response = fetch_with_context(&mut request, &mut context);
@@ -828,6 +736,7 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
         ))),
+        protocols: Arc::new(ProtocolRegistry::default()),
     };
 
     // The server certificate is self-signed, so we need to add an override
@@ -852,8 +761,7 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
     assert!(context
         .state
@@ -885,6 +793,7 @@ fn test_fetch_self_signed() {
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
         ))),
+        protocols: Arc::new(ProtocolRegistry::default()),
     };
 
     let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
@@ -918,7 +827,7 @@ fn test_fetch_self_signed() {
 
     let response = fetch_with_context(&mut request, &mut context);
 
-    assert!(response.status.unwrap().0.is_success());
+    assert!(response.status.code().is_success());
 
     let _ = server.close();
 }
@@ -931,14 +840,9 @@ fn test_fetch_with_sri_network_error() {
     };
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     // To calulate hash use :
     // echo -n "alert('Hello, Network Error');" | openssl dgst -sha384 -binary | openssl base64 -A
     request.integrity_metadata =
@@ -960,14 +864,9 @@ fn test_fetch_with_sri_sucess() {
     };
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     // To calulate hash use :
     // echo -n "alert('Hello, Network Error');" | openssl dgst -sha384 -binary | openssl base64 -A
     request.integrity_metadata =
@@ -1005,15 +904,10 @@ fn test_fetch_blocked_nosniff() {
 
         let (server, url) = make_server(handler);
 
-        let origin = Origin::Origin(url.origin());
-        let mut request = Request::new(
-            url,
-            Some(origin),
-            Referrer::NoReferrer,
-            None,
-            HttpsState::None,
-        );
-        request.destination = destination;
+        let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+            .origin(url.origin())
+            .destination(destination)
+            .build();
         let fetch_response = fetch(&mut request, None);
         let _ = server.close();
 
@@ -1055,14 +949,9 @@ fn setup_server_and_fetch(message: &'static [u8], redirect_cap: u32) -> Response
 
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     let fetch_response = fetch(&mut request, None);
     let _ = server.close();
     fetch_response
@@ -1148,15 +1037,10 @@ fn test_fetch_redirect_updates_method_runner(
 
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
-    request.method = method;
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .method(method)
+        .build();
 
     let _ = fetch(&mut request, None);
     let _ = server.close();
@@ -1236,15 +1120,9 @@ fn test_fetch_async_returns_complete_response() {
     };
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
-
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .build();
     let fetch_response = fetch(&mut request, None);
 
     let _ = server.close();
@@ -1260,15 +1138,7 @@ fn test_opaque_filtered_fetch_async_returns_complete_response() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will fall through to an Opaque filtered response
-    let origin = Origin::Origin(ImmutableOrigin::new_opaque());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
-
+    let mut request = RequestBuilder::new(url, Referrer::NoReferrer).build();
     let fetch_response = fetch(&mut request, None);
 
     let _ = server.close();
@@ -1300,16 +1170,10 @@ fn test_opaque_redirect_filtered_fetch_async_returns_complete_response() {
     };
 
     let (server, url) = make_server(handler);
-
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url,
-        Some(origin),
-        Referrer::NoReferrer,
-        None,
-        HttpsState::None,
-    );
-    request.redirect_mode = RedirectMode::Manual;
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .redirect_mode(RedirectMode::Manual)
+        .build();
 
     let fetch_response = fetch(&mut request, None);
 
@@ -1329,14 +1193,11 @@ fn test_fetch_with_devtools() {
 
     let (server, url) = make_server(handler);
 
-    let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(
-        url.clone(),
-        Some(origin),
-        Referrer::NoReferrer,
-        Some(TEST_PIPELINE_ID),
-        HttpsState::None,
-    );
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .redirect_mode(RedirectMode::Manual)
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .build();
 
     let (devtools_chan, devtools_port) = unbounded();
 
@@ -1364,14 +1225,28 @@ fn test_fetch_with_devtools() {
         HeaderValue::from_static("gzip, deflate, br"),
     );
 
+    // Append fetch metadata headers
+    headers.insert(
+        HeaderName::from_static("sec-fetch-dest"),
+        HeaderValue::from_static("empty"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-mode"),
+        HeaderValue::from_static("no-cors"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        HeaderValue::from_static("same-origin"),
+    );
+
     let httprequest = DevtoolsHttpRequest {
         url: url,
         method: Method::GET,
         headers: headers,
         body: Some(vec![]),
         pipeline_id: TEST_PIPELINE_ID,
-        startedDateTime: devhttprequest.startedDateTime,
-        timeStamp: devhttprequest.timeStamp,
+        started_date_time: devhttprequest.started_date_time,
+        time_stamp: devhttprequest.time_stamp,
         connect_time: devhttprequest.connect_time,
         send_time: devhttprequest.send_time,
         is_xhr: true,
@@ -1388,7 +1263,7 @@ fn test_fetch_with_devtools() {
 
     let httpresponse = DevtoolsHttpResponse {
         headers: Some(response_headers),
-        status: Some((200, b"OK".to_vec())),
+        status: HttpStatus::default(),
         body: None,
         pipeline_id: TEST_PIPELINE_ID,
     };

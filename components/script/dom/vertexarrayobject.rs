@@ -124,7 +124,7 @@ impl VertexArrayObject {
             constants::FLOAT => 4,
             constants::INT | constants::UNSIGNED_INT if is_webgl2 => 4,
             constants2::HALF_FLOAT if is_webgl2 => 2,
-            sparkle::gl::FIXED if is_webgl2 => 4,
+            glow::FIXED if is_webgl2 => 4,
             constants2::INT_2_10_10_10_REV | constants2::UNSIGNED_INT_2_10_10_10_REV
                 if is_webgl2 && size == 4 =>
             {
@@ -194,7 +194,7 @@ impl VertexArrayObject {
         if self
             .element_array_buffer
             .get()
-            .map_or(false, |b| buffer == &*b)
+            .is_some_and(|b| buffer == &*b)
         {
             buffer.decrement_attached_counter(Operation::Infallible);
             self.element_array_buffer.set(None);
@@ -239,7 +239,7 @@ impl VertexArrayObject {
                     }
                 } else if max_vertices
                     .checked_mul(attrib.divisor)
-                    .map_or(false, |v| v < instance_count)
+                    .is_some_and(|v| v < instance_count)
                 {
                     return Err(WebGLError::InvalidOperation);
                 }

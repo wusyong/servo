@@ -27,7 +27,7 @@ use crate::dom::bindings::utils::AsCCharPtrPtr;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::realms::{enter_realm, InRealm};
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 /// The exception handling used for a call.
 #[derive(Clone, Copy, PartialEq)]
@@ -61,15 +61,10 @@ pub struct CallbackObject {
     incumbent: Option<Dom<GlobalScope>>,
 }
 
-impl Default for CallbackObject {
-    #[allow(crown::unrooted_must_root)]
-    fn default() -> CallbackObject {
-        CallbackObject::new()
-    }
-}
-
 impl CallbackObject {
     #[allow(crown::unrooted_must_root)]
+    // These are used by the bindings and do not need `default()` functions.
+    #[allow(clippy::new_without_default)]
     fn new() -> CallbackObject {
         CallbackObject {
             callback: Heap::default(),
@@ -140,6 +135,8 @@ pub struct CallbackFunction {
 impl CallbackFunction {
     /// Create a new `CallbackFunction` for this object.
     #[allow(crown::unrooted_must_root)]
+    // These are used by the bindings and do not need `default()` functions.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> CallbackFunction {
         CallbackFunction {
             object: CallbackObject::new(),
@@ -167,6 +164,8 @@ pub struct CallbackInterface {
 
 impl CallbackInterface {
     /// Create a new CallbackInterface object for the given `JSObject`.
+    // These are used by the bindings and do not need `default()` functions.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> CallbackInterface {
         CallbackInterface {
             object: CallbackObject::new(),
@@ -272,7 +271,7 @@ impl Drop for CallSetup {
             LeaveRealm(*self.cx, self.old_realm);
             if self.handling == ExceptionHandling::Report {
                 let ar = enter_realm(&*self.exception_global);
-                report_pending_exception(*self.cx, true, InRealm::Entered(&ar));
+                report_pending_exception(*self.cx, true, InRealm::Entered(&ar), CanGc::note());
             }
             drop(self.incumbent_script.take());
             drop(self.entry_script.take().unwrap());

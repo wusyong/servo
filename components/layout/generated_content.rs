@@ -9,8 +9,8 @@
 //! as possible.
 
 use std::collections::{HashMap, LinkedList};
+use std::sync::LazyLock;
 
-use lazy_static::lazy_static;
 use script_layout_interface::wrapper_traits::PseudoElementType;
 use smallvec::SmallVec;
 use style::computed_values::list_style_type::T as ListStyleType;
@@ -20,7 +20,7 @@ use style::servo::restyle_damage::ServoRestyleDamage;
 use style::values::generics::counters::ContentItem;
 use style::values::specified::list::{QuotePair, Quotes};
 
-use crate::context::{with_thread_local_font_context, LayoutContext};
+use crate::context::LayoutContext;
 use crate::display_list::items::OpaqueNode;
 use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
 use crate::fragment::{
@@ -29,8 +29,8 @@ use crate::fragment::{
 use crate::text::TextRunScanner;
 use crate::traversal::InorderFlowTraversal;
 
-lazy_static! {
-    static ref INITIAL_QUOTES: style::ArcSlice<QuotePair> = style::ArcSlice::from_iter_leaked(
+static INITIAL_QUOTES: LazyLock<style::ArcSlice<QuotePair>> = LazyLock::new(|| {
+    style::ArcSlice::from_iter_leaked(
         vec![
             QuotePair {
                 opening: "\u{201c}".to_owned().into(),
@@ -41,9 +41,9 @@ lazy_static! {
                 closing: "\u{2019}".to_owned().into(),
             },
         ]
-        .into_iter()
-    );
-}
+        .into_iter(),
+    )
+});
 
 // Decimal styles per CSS-COUNTER-STYLES § 6.1:
 static DECIMAL: [char; 10] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
@@ -493,9 +493,7 @@ fn render_text(
     ));
     // FIXME(pcwalton): This should properly handle multiple marker fragments. This could happen
     // due to text run splitting.
-    let fragments = with_thread_local_font_context(layout_context, |font_context| {
-        TextRunScanner::new().scan_for_runs(font_context, fragments)
-    });
+    let fragments = TextRunScanner::new().scan_for_runs(&layout_context.font_context, fragments);
     if fragments.is_empty() {
         None
     } else {

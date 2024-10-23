@@ -13,6 +13,7 @@ use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 // http://dev.w3.org/fxtf/geometry/Overview.html#dompointreadonly
 #[dom_struct]
@@ -36,8 +37,15 @@ impl DOMPointReadOnly {
         }
     }
 
-    pub fn new(global: &GlobalScope, x: f64, y: f64, z: f64, w: f64) -> DomRoot<DOMPointReadOnly> {
-        Self::new_with_proto(global, None, x, y, z, w)
+    pub fn new(
+        global: &GlobalScope,
+        x: f64,
+        y: f64,
+        z: f64,
+        w: f64,
+        can_gc: CanGc,
+    ) -> DomRoot<DOMPointReadOnly> {
+        Self::new_with_proto(global, None, x, y, z, w, can_gc)
     }
 
     fn new_with_proto(
@@ -47,33 +55,39 @@ impl DOMPointReadOnly {
         y: f64,
         z: f64,
         w: f64,
+        can_gc: CanGc,
     ) -> DomRoot<DOMPointReadOnly> {
         reflect_dom_object_with_proto(
             Box::new(DOMPointReadOnly::new_inherited(x, y, z, w)),
             global,
             proto,
+            can_gc,
         )
-    }
-
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        x: f64,
-        y: f64,
-        z: f64,
-        w: f64,
-    ) -> Fallible<DomRoot<DOMPointReadOnly>> {
-        Ok(DOMPointReadOnly::new_with_proto(global, proto, x, y, z, w))
-    }
-
-    // https://drafts.fxtf.org/geometry/#dom-dompointreadonly-frompoint
-    pub fn FromPoint(global: &GlobalScope, init: &DOMPointInit) -> DomRoot<Self> {
-        Self::new(global, init.x, init.y, init.z, init.w)
     }
 }
 
 #[allow(non_snake_case)]
 impl DOMPointReadOnlyMethods for DOMPointReadOnly {
+    // https://drafts.fxtf.org/geometry/#dom-dompoint-dompoint
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        x: f64,
+        y: f64,
+        z: f64,
+        w: f64,
+    ) -> Fallible<DomRoot<DOMPointReadOnly>> {
+        Ok(DOMPointReadOnly::new_with_proto(
+            global, proto, x, y, z, w, can_gc,
+        ))
+    }
+
+    // https://drafts.fxtf.org/geometry/#dom-dompointreadonly-frompoint
+    fn FromPoint(global: &GlobalScope, init: &DOMPointInit, can_gc: CanGc) -> DomRoot<Self> {
+        Self::new(global, init.x, init.y, init.z, init.w, can_gc)
+    }
+
     // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-x
     fn X(&self) -> f64 {
         self.x.get()

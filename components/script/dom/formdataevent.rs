@@ -18,6 +18,7 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::formdata::FormData;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct FormDataEvent {
@@ -32,8 +33,11 @@ impl FormDataEvent {
         can_bubble: EventBubbles,
         cancelable: EventCancelable,
         form_data: &FormData,
+        can_gc: CanGc,
     ) -> DomRoot<FormDataEvent> {
-        Self::new_with_proto(global, None, type_, can_bubble, cancelable, form_data)
+        Self::new_with_proto(
+            global, None, type_, can_bubble, cancelable, form_data, can_gc,
+        )
     }
 
     fn new_with_proto(
@@ -43,6 +47,7 @@ impl FormDataEvent {
         can_bubble: EventBubbles,
         cancelable: EventCancelable,
         form_data: &FormData,
+        can_gc: CanGc,
     ) -> DomRoot<FormDataEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(FormDataEvent {
@@ -51,6 +56,7 @@ impl FormDataEvent {
             }),
             global,
             proto,
+            can_gc,
         );
 
         {
@@ -59,11 +65,14 @@ impl FormDataEvent {
         }
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl FormDataEventMethods for FormDataEvent {
+    // https://html.spec.whatwg.org/multipage/#formdataevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &FormDataEventBinding::FormDataEventInit,
     ) -> Fallible<DomRoot<FormDataEvent>> {
@@ -77,13 +86,12 @@ impl FormDataEvent {
             bubbles,
             cancelable,
             &init.formData.clone(),
+            can_gc,
         );
 
         Ok(event)
     }
-}
 
-impl FormDataEventMethods for FormDataEvent {
     // https://html.spec.whatwg.org/multipage/#dom-formdataevent-formdata
     fn FormData(&self) -> DomRoot<FormData> {
         DomRoot::from_ref(&*self.form_data)

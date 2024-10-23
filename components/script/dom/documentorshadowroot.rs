@@ -12,6 +12,7 @@ use servo_atoms::Atom;
 use style::invalidation::media_queries::{MediaListKey, ToMediaListKey};
 use style::media_queries::MediaList;
 use style::shared_lock::{SharedRwLock as StyleSharedRwLock, SharedRwLockReadGuard};
+use style::stylesheets::scope_rule::ImplicitScopeRoot;
 use style::stylesheets::{Stylesheet, StylesheetContents};
 
 use super::bindings::trace::HashMapTracedValues;
@@ -24,6 +25,7 @@ use crate::dom::element::Element;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::{self, Node, VecPreOrderInsertionHelper};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 use crate::stylesheet_set::StylesheetSetRef;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -65,6 +67,10 @@ impl ::style::stylesheets::StylesheetInDocument for StyleSheetInDocument {
     fn contents(&self) -> &StylesheetContents {
         self.sheet.contents()
     }
+
+    fn implicit_scope_root(&self) -> Option<ImplicitScopeRoot> {
+        None
+    }
 }
 
 // https://w3c.github.io/webcomponents/spec/shadow/#extensions-to-the-documentorshadowroot-mixin
@@ -85,14 +91,18 @@ impl DocumentOrShadowRoot {
         &self,
         client_point: &Point2D<f32>,
         query_type: NodesFromPointQueryType,
+        can_gc: CanGc,
     ) -> Vec<UntrustedNodeAddress> {
-        if !self.window.layout_reflow(QueryMsg::NodesFromPointQuery) {
+        if !self
+            .window
+            .layout_reflow(QueryMsg::NodesFromPointQuery, can_gc)
+        {
             return vec![];
         };
 
         self.window
-            .with_layout(|layout| layout.query_nodes_from_point(*client_point, query_type))
-            .unwrap_or_default()
+            .layout()
+            .query_nodes_from_point(*client_point, query_type)
     }
 
     #[allow(unsafe_code)]
@@ -103,6 +113,7 @@ impl DocumentOrShadowRoot {
         y: Finite<f64>,
         document_element: Option<DomRoot<Element>>,
         has_browsing_context: bool,
+        can_gc: CanGc,
     ) -> Option<DomRoot<Element>> {
         let x = *x as f32;
         let y = *y as f32;
@@ -118,7 +129,7 @@ impl DocumentOrShadowRoot {
         }
 
         match self
-            .nodes_from_point(point, NodesFromPointQueryType::Topmost)
+            .nodes_from_point(point, NodesFromPointQueryType::Topmost, can_gc)
             .first()
         {
             Some(address) => {
@@ -142,6 +153,7 @@ impl DocumentOrShadowRoot {
         y: Finite<f64>,
         document_element: Option<DomRoot<Element>>,
         has_browsing_context: bool,
+        can_gc: CanGc,
     ) -> Vec<DomRoot<Element>> {
         let x = *x as f32;
         let y = *y as f32;
@@ -158,7 +170,7 @@ impl DocumentOrShadowRoot {
         }
 
         // Step 1 and Step 3
-        let nodes = self.nodes_from_point(point, NodesFromPointQueryType::All);
+        let nodes = self.nodes_from_point(point, NodesFromPointQueryType::All, can_gc);
         let mut elements: Vec<DomRoot<Element>> = nodes
             .iter()
             .flat_map(|&untrusted_node_address| {

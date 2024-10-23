@@ -6,14 +6,16 @@
 //! Flow layout, also known as block-and-inline layout.
 
 use app_units::Au;
+use inline::InlineFormattingContext;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use servo_arc::Arc;
 use style::computed_values::clear::T as Clear;
 use style::computed_values::float::T as Float;
-use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
-use style::values::computed::{Length, LengthOrAuto, Size};
+use style::servo::selector_parser::PseudoElement;
+use style::values::computed::Size as StyleSize;
+use style::values::specified::align::AlignFlags;
 use style::values::specified::{Display, TextAlignKeyword};
 use style::Zero;
 
@@ -22,26 +24,27 @@ use crate::context::LayoutContext;
 use crate::flow::float::{
     ContainingBlockPositionInfo, FloatBox, PlacementAmongFloats, SequentialLayoutState,
 };
-use crate::flow::inline::InlineFormattingContext;
 use crate::formatting_contexts::{
-    Baselines, IndependentFormattingContext, IndependentLayout, NonReplacedFormattingContext,
+    Baselines, IndependentFormattingContext, IndependentLayout, IndependentLayoutResult,
+    NonReplacedFormattingContext,
 };
 use crate::fragment_tree::{
-    BaseFragmentInfo, BoxFragment, CollapsedBlockMargins, CollapsedMargin, Fragment,
+    BaseFragmentInfo, BoxFragment, CollapsedBlockMargins, CollapsedMargin, Fragment, FragmentFlags,
 };
-use crate::geom::{AuOrAuto, LogicalRect, LogicalSides, LogicalVec2};
+use crate::geom::{
+    AuOrAuto, LogicalRect, LogicalSides, LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSides,
+    Size, ToLogical, ToLogicalWithContainingBlock,
+};
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext, PositioningContextLength};
 use crate::replaced::ReplacedContent;
-use crate::sizing::{self, ContentSizes};
+use crate::sizing::{self, ContentSizes, InlineContentSizesResult};
 use crate::style_ext::{Clamp, ComputedValuesExt, PaddingBorderMargin};
-use crate::ContainingBlock;
+use crate::{ContainingBlock, IndefiniteContainingBlock};
 
 mod construct;
 pub mod float;
 pub mod inline;
-mod line;
 mod root;
-pub mod text_run;
 
 pub(crate) use construct::BlockContainerBuilder;
 pub use root::{BoxTree, CanvasBackground};
@@ -134,28 +137,27 @@ impl BlockLevelBox {
         }
 
         let min_size = style
-            .content_min_box_size(containing_block, &pbm)
-            .auto_is(Length::zero);
-        let max_size = style.content_max_box_size(containing_block, &pbm);
-        let prefered_size = style.content_box_size(containing_block, &pbm);
+            .content_min_box_size_deprecated(containing_block, &pbm)
+            .auto_is(Au::zero);
+        let max_size = style.content_max_box_size_deprecated(containing_block, &pbm);
+        let prefered_size = style.content_box_size_deprecated(containing_block, &pbm);
         let inline_size = prefered_size
             .inline
             .auto_is(|| {
                 let margin_inline_start = pbm.margin.inline_start.auto_is(Au::zero);
                 let margin_inline_end = pbm.margin.inline_end.auto_is(Au::zero);
-                (containing_block.inline_size -
+                containing_block.inline_size -
                     pbm.padding_border_sums.inline -
                     margin_inline_start -
-                    margin_inline_end)
-                    .into()
+                    margin_inline_end
             })
             .clamp_between_extremums(min_size.inline, max_size.inline);
         let block_size = prefered_size
             .block
-            .map(|size| Au::from(size.clamp_between_extremums(min_size.block, max_size.block)));
+            .map(|size| size.clamp_between_extremums(min_size.block, max_size.block));
 
         let containing_block_for_children = ContainingBlock {
-            inline_size: inline_size.into(),
+            inline_size,
             block_size,
             style,
         };
@@ -168,8 +170,8 @@ impl BlockLevelBox {
             return false;
         }
 
-        if !block_size_is_zero_or_auto(style.content_block_size(), containing_block) ||
-            !block_size_is_zero_or_auto(style.min_block_size(), containing_block) ||
+        if !block_size_is_zero_or_intrinsic(style.content_block_size(), containing_block) ||
+            !block_size_is_zero_or_intrinsic(style.min_block_size(), containing_block) ||
             pbm.padding_border_sums.block != Au::zero()
         {
             return false;
@@ -194,9 +196,9 @@ impl BlockLevelBox {
     }
 }
 
-struct FlowLayout {
+pub(crate) struct FlowLayout {
     pub fragments: Vec<Fragment>,
-    pub content_block_size: Length,
+    pub content_block_size: Au,
     pub collapsible_margins_in_children: CollapsedBlockMargins,
     /// The offset of the baselines in this layout in the content area, if there were some. This is
     /// used to propagate inflow baselines to the ancestors of `display: inline-block` elements
@@ -205,14 +207,16 @@ struct FlowLayout {
 }
 
 #[derive(Clone, Copy)]
-struct CollapsibleWithParentStartMargin(bool);
+pub(crate) struct CollapsibleWithParentStartMargin(bool);
 
 /// The contentes of a BlockContainer created to render a list marker
 /// for a list that has `list-style-position: outside`.
 #[derive(Debug, Serialize)]
 pub(crate) struct OutsideMarker {
     #[serde(skip_serializing)]
-    pub style: Arc<ComputedValues>,
+    pub marker_style: Arc<ComputedValues>,
+    #[serde(skip_serializing)]
+    pub list_item_style: Arc<ComputedValues>,
     pub block_container: BlockContainer,
 }
 
@@ -225,57 +229,79 @@ impl OutsideMarker {
         sequential_layout_state: Option<&mut SequentialLayoutState>,
         collapsible_with_parent_start_margin: Option<CollapsibleWithParentStartMargin>,
     ) -> Fragment {
-        let content_sizes = self
-            .block_container
-            .inline_content_sizes(layout_context, containing_block.style.writing_mode);
-        let containing_block = ContainingBlock {
-            inline_size: content_sizes.max_content,
+        let content_sizes = self.block_container.inline_content_sizes(
+            layout_context,
+            &IndefiniteContainingBlock::new_for_style(&self.marker_style),
+        );
+        let containing_block_for_children = ContainingBlock {
+            inline_size: content_sizes.sizes.max_content,
             block_size: AuOrAuto::auto(),
-            style: &self.style,
+            style: &self.marker_style,
         };
+
         let flow_layout = self.block_container.layout(
             layout_context,
             positioning_context,
-            &containing_block,
+            &containing_block_for_children,
             sequential_layout_state,
             collapsible_with_parent_start_margin.unwrap_or(CollapsibleWithParentStartMargin(false)),
         );
-        let max_inline_size = flow_layout.fragments.iter().fold(
-            Length::zero(),
-            |current_max, fragment| match fragment {
-                Fragment::Text(text) => current_max.max(text.rect.max_inline_position()),
-                Fragment::Image(image) => current_max.max(image.rect.max_inline_position()),
-                Fragment::Positioning(positioning) => {
-                    current_max.max(positioning.rect.max_inline_position())
-                },
-                Fragment::Box(_) |
-                Fragment::Float(_) |
-                Fragment::AbsoluteOrFixedPositioned(_) |
-                Fragment::IFrame(_) => {
-                    unreachable!("Found unexpected fragment type in outside list marker!");
-                },
-            },
-        );
 
+        let max_inline_size =
+            flow_layout
+                .fragments
+                .iter()
+                .fold(Au::zero(), |current_max, fragment| {
+                    current_max.max(
+                        match fragment {
+                            Fragment::Text(text) => text.rect,
+                            Fragment::Image(image) => image.rect,
+                            Fragment::Positioning(positioning) => positioning.rect,
+                            Fragment::Box(_) |
+                            Fragment::Float(_) |
+                            Fragment::AbsoluteOrFixedPositioned(_) |
+                            Fragment::IFrame(_) => {
+                                unreachable!(
+                                    "Found unexpected fragment type in outside list marker!"
+                                );
+                            },
+                        }
+                        .to_logical(&containing_block_for_children)
+                        .max_inline_position(),
+                    )
+                });
+
+        // Position the marker beyond the inline start of the border box list item. This needs to
+        // take into account the border and padding of the item.
+        //
+        // TODO: This is the wrong containing block, as it should be the containing block of the
+        // parent of this list item. What this means in practice is that the writing mode could be
+        // wrong and padding defined as a percentage will be resolved incorrectly.
+        let pbm_of_list_item = self.list_item_style.padding_border_margin(containing_block);
         let content_rect = LogicalRect {
             start_corner: LogicalVec2 {
-                inline: -max_inline_size,
+                inline: -max_inline_size -
+                    (pbm_of_list_item.border.inline_start +
+                        pbm_of_list_item.padding.inline_start),
                 block: Zero::zero(),
             },
             size: LogicalVec2 {
                 inline: max_inline_size,
-                block: Zero::zero(),
+                block: flow_layout.content_block_size,
             },
         };
 
+        let mut base_fragment_info = BaseFragmentInfo::anonymous();
+        base_fragment_info.flags |= FragmentFlags::IS_OUTSIDE_LIST_ITEM_MARKER;
+
         Fragment::Box(BoxFragment::new(
-            BaseFragmentInfo::anonymous(),
-            self.style.clone(),
+            base_fragment_info,
+            self.marker_style.clone(),
             flow_layout.fragments,
-            content_rect,
-            LogicalSides::zero(),
-            LogicalSides::zero(),
-            LogicalSides::zero(),
+            content_rect.to_physical(Some(containing_block)),
+            PhysicalSides::zero(),
+            PhysicalSides::zero(),
+            PhysicalSides::zero(),
             None,
             CollapsedBlockMargins::zero(),
         ))
@@ -317,7 +343,7 @@ impl BlockFormattingContext {
 
         IndependentLayout {
             fragments: flow_layout.fragments,
-            content_block_size: Au::from(flow_layout.content_block_size) +
+            content_block_size: flow_layout.content_block_size +
                 flow_layout.collapsible_margins_in_children.end.solve() +
                 clearance.unwrap_or_default(),
             content_inline_size_for_table: None,
@@ -334,44 +360,65 @@ impl BlockFormattingContext {
 fn calculate_inline_content_size_for_block_level_boxes(
     boxes: &[ArcRefCell<BlockLevelBox>],
     layout_context: &LayoutContext,
-    writing_mode: WritingMode,
-) -> ContentSizes {
+    containing_block: &IndefiniteContainingBlock,
+) -> InlineContentSizesResult {
     let get_box_info = |box_: &ArcRefCell<BlockLevelBox>| {
         match &mut *box_.borrow_mut() {
             BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(_) |
             BlockLevelBox::OutsideMarker { .. } => None,
             BlockLevelBox::OutOfFlowFloatBox(ref mut float_box) => {
-                let size = float_box
-                    .contents
-                    .outer_inline_content_sizes(layout_context, writing_mode)
-                    .max(ContentSizes::zero());
+                let inline_content_sizes_result = float_box.contents.outer_inline_content_sizes(
+                    layout_context,
+                    containing_block,
+                    &LogicalVec2::zero(),
+                    false, /* auto_block_size_stretches_to_containing_block */
+                );
                 let style_box = &float_box.contents.style().get_box();
-                Some((size, style_box.float, style_box.clear))
+                Some((
+                    inline_content_sizes_result,
+                    style_box.float,
+                    style_box.clear,
+                ))
             },
             BlockLevelBox::SameFormattingContextBlock {
                 style, contents, ..
             } => {
-                let size = sizing::outer_inline(style, writing_mode, || {
-                    contents.inline_content_sizes(layout_context, style.writing_mode)
-                })
-                .max(ContentSizes::zero());
+                let inline_content_sizes_result = sizing::outer_inline(
+                    style,
+                    containing_block,
+                    &LogicalVec2::zero(),
+                    false, /* auto_block_size_stretches_to_containing_block */
+                    |containing_block_for_children| {
+                        contents.inline_content_sizes(layout_context, containing_block_for_children)
+                    },
+                );
                 // A block in the same BFC can overlap floats, it's not moved next to them,
                 // so we shouldn't add its size to the size of the floats.
                 // Instead, we treat it like an independent block with 'clear: both'.
-                Some((size, Float::None, Clear::Both))
+                Some((inline_content_sizes_result, Float::None, Clear::Both))
             },
             BlockLevelBox::Independent(ref mut independent) => {
-                let size = independent
-                    .outer_inline_content_sizes(layout_context, writing_mode)
-                    .max(ContentSizes::zero());
-                Some((size, Float::None, independent.style().get_box().clear))
+                let inline_content_sizes_result = independent.outer_inline_content_sizes(
+                    layout_context,
+                    containing_block,
+                    &LogicalVec2::zero(),
+                    false, /* auto_block_size_stretches_to_containing_block */
+                );
+                Some((
+                    inline_content_sizes_result,
+                    Float::None,
+                    independent.style().get_box().clear,
+                ))
             },
         }
     };
 
     /// When iterating the block-level boxes to compute the inline content sizes,
     /// this struct contains the data accumulated up to the current box.
+    #[derive(Default)]
     struct AccumulatedData {
+        /// Whether the inline size depends on the block one.
+        depends_on_block_constraints: bool,
         /// The maximum size seen so far, not including trailing uncleared floats.
         max_size: ContentSizes,
         /// The size of the trailing uncleared floats with 'float: left'.
@@ -405,37 +452,44 @@ fn calculate_inline_content_size_for_block_level_boxes(
         }
     }
 
-    let accumulate = |mut data: AccumulatedData, (size, float, clear)| {
-        data.clear_floats(clear);
-        match float {
-            Float::Left => data.left_floats = data.left_floats.union(&size),
-            Float::Right => data.right_floats = data.right_floats.union(&size),
-            Float::None => {
-                data.max_size = data
-                    .max_size
-                    .max(data.left_floats.union(&data.right_floats).union(&size));
-                data.left_floats = ContentSizes::zero();
-                data.right_floats = ContentSizes::zero();
-            },
-        }
-        data
-    };
-    let zero = AccumulatedData {
-        max_size: ContentSizes::zero(),
-        left_floats: ContentSizes::zero(),
-        right_floats: ContentSizes::zero(),
-    };
+    let accumulate =
+        |mut data: AccumulatedData,
+         (inline_content_sizes_result, float, clear): (InlineContentSizesResult, _, _)| {
+            let size = inline_content_sizes_result.sizes.max(ContentSizes::zero());
+            let depends_on_block_constraints =
+                inline_content_sizes_result.depends_on_block_constraints;
+            data.depends_on_block_constraints |= depends_on_block_constraints;
+            data.clear_floats(clear);
+            match float {
+                Float::Left => data.left_floats = data.left_floats.union(&size),
+                Float::Right => data.right_floats = data.right_floats.union(&size),
+                Float::None => {
+                    data.max_size = data
+                        .max_size
+                        .max(data.left_floats.union(&data.right_floats).union(&size));
+                    data.left_floats = ContentSizes::zero();
+                    data.right_floats = ContentSizes::zero();
+                },
+            }
+            data
+        };
     let data = if layout_context.use_rayon {
         boxes
             .par_iter()
             .filter_map(get_box_info)
             .collect::<Vec<_>>()
             .into_iter()
-            .fold(zero, accumulate)
+            .fold(AccumulatedData::default(), accumulate)
     } else {
-        boxes.iter().filter_map(get_box_info).fold(zero, accumulate)
+        boxes
+            .iter()
+            .filter_map(get_box_info)
+            .fold(AccumulatedData::default(), accumulate)
     };
-    data.max_size_including_uncleared_floats()
+    InlineContentSizesResult {
+        depends_on_block_constraints: data.depends_on_block_constraints,
+        sizes: data.max_size_including_uncleared_floats(),
+    }
 }
 
 impl BlockContainer {
@@ -469,16 +523,16 @@ impl BlockContainer {
     pub(super) fn inline_content_sizes(
         &self,
         layout_context: &LayoutContext,
-        writing_mode: WritingMode,
-    ) -> ContentSizes {
+        containing_block_for_children: &IndefiniteContainingBlock,
+    ) -> InlineContentSizesResult {
         match &self {
             Self::BlockLevelBoxes(boxes) => calculate_inline_content_size_for_block_level_boxes(
                 boxes,
                 layout_context,
-                writing_mode,
+                containing_block_for_children,
             ),
             Self::InlineFormattingContext(context) => {
-                context.inline_content_sizes(layout_context, writing_mode)
+                context.inline_content_sizes(layout_context, containing_block_for_children)
             },
         }
     }
@@ -493,7 +547,7 @@ fn layout_block_level_children(
     collapsible_with_parent_start_margin: CollapsibleWithParentStartMargin,
 ) -> FlowLayout {
     let mut placement_state =
-        PlacementState::new(collapsible_with_parent_start_margin, containing_block.style);
+        PlacementState::new(collapsible_with_parent_start_margin, containing_block);
 
     let fragments = match sequential_layout_state {
         Some(ref mut sequential_layout_state) => layout_block_level_children_sequentially(
@@ -664,13 +718,20 @@ impl BlockLevelBox {
                 },
             },
             BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(box_) => {
+                // The static position of zero here is incorrect, however we do not know
+                // the correct positioning until later, in place_block_level_fragment, and
+                // this value will be adjusted there.
                 let hoisted_box = AbsolutelyPositionedBox::to_hoisted(
                     box_.clone(),
-                    // This is incorrect, however we do not know the
-                    // correct positioning until later, in place_block_level_fragment,
-                    // and this value will be adjusted there
-                    LogicalVec2::zero(),
-                    containing_block,
+                    // This is incorrect, however we do not know the correct positioning
+                    // until later, in PlacementState::place_fragment, and this value will be
+                    // adjusted there
+                    PhysicalRect::zero(),
+                    LogicalVec2 {
+                        inline: AlignFlags::START,
+                        block: AlignFlags::START,
+                    },
+                    containing_block.style.writing_mode,
                 );
                 let hoisted_fragment = hoisted_box.fragment.clone();
                 positioning_context.push(hoisted_box);
@@ -711,6 +772,7 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
     let ContainingBlockPaddingAndBorder {
         containing_block: containing_block_for_children,
         pbm,
+        box_size,
         min_box_size,
         max_box_size,
     } = solve_containing_block_padding_and_border_for_in_flow_box(containing_block, style);
@@ -809,7 +871,7 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
         sequential_layout_state.as_deref_mut(),
         CollapsibleWithParentStartMargin(start_margin_can_collapse_with_children),
     );
-    let mut content_block_size = flow_layout.content_block_size;
+    let mut content_block_size: Au = flow_layout.content_block_size;
 
     // Update margins.
     let mut block_margins_collapsed_with_children = CollapsedBlockMargins::from_margin(&margin);
@@ -830,8 +892,8 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
 
     let collapsed_through = collapsible_margins_in_children.collapsed_through &&
         pbm.padding_border_sums.block == Au::zero() &&
-        block_size_is_zero_or_auto(computed_block_size, containing_block) &&
-        block_size_is_zero_or_auto(style.min_block_size(), containing_block);
+        block_size_is_zero_or_intrinsic(computed_block_size, containing_block) &&
+        block_size_is_zero_or_intrinsic(style.min_block_size(), containing_block);
     block_margins_collapsed_with_children.collapsed_through = collapsed_through;
 
     let end_margin_can_collapse_with_children = collapsed_through ||
@@ -843,14 +905,13 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
             .end
             .adjoin_assign(&collapsible_margins_in_children.end);
     } else {
-        content_block_size += collapsible_margins_in_children.end.solve().into();
+        content_block_size += collapsible_margins_in_children.end.solve();
     }
 
-    let block_size = containing_block_for_children.block_size.auto_is(|| {
-        content_block_size
-            .clamp_between_extremums(min_box_size.block, max_box_size.block)
-            .into()
-    });
+    let block_size = box_size
+        .block
+        .auto_is(|| content_block_size)
+        .clamp_between_extremums(min_box_size.block, max_box_size.block);
 
     if let Some(ref mut sequential_layout_state) = sequential_layout_state {
         // Now that we're done laying out our children, we can restore the
@@ -868,7 +929,7 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
         // the block direction. In that case, the ceiling for floats is effectively raised
         // as long as no floats in the overflowing content lowered it.
         sequential_layout_state.advance_block_position(
-            block_size - content_block_size.into() + pbm.padding.block_end + pbm.border.block_end,
+            block_size - content_block_size + pbm.padding.block_end + pbm.border.block_end,
         );
 
         if !end_margin_can_collapse_with_children {
@@ -892,14 +953,15 @@ fn layout_in_flow_non_replaced_block_level_same_formatting_context(
         },
     };
 
+    let containing_block_writing_mode = containing_block.style.writing_mode;
     BoxFragment::new(
         base_fragment_info,
         style.clone(),
         flow_layout.fragments,
-        content_rect.into(),
-        pbm.padding,
-        pbm.border,
-        margin,
+        content_rect.to_physical(Some(containing_block)),
+        pbm.padding.to_physical(containing_block_writing_mode),
+        pbm.border.to_physical(containing_block_writing_mode),
+        margin.to_physical(containing_block_writing_mode),
         clearance,
         block_margins_collapsed_with_children,
     )
@@ -912,7 +974,7 @@ impl NonReplacedFormattingContext {
     ///
     /// - <https://drafts.csswg.org/css2/visudet.html#blockwidth>
     /// - <https://drafts.csswg.org/css2/visudet.html#normal-block>
-    fn layout_in_flow_block_level(
+    pub(crate) fn layout_in_flow_block_level(
         &self,
         layout_context: &LayoutContext,
         positioning_context: &mut PositioningContext,
@@ -931,6 +993,7 @@ impl NonReplacedFormattingContext {
         let ContainingBlockPaddingAndBorder {
             containing_block: containing_block_for_children,
             pbm,
+            box_size,
             min_box_size,
             max_box_size,
         } = solve_containing_block_padding_and_border_for_in_flow_box(
@@ -948,12 +1011,10 @@ impl NonReplacedFormattingContext {
         let (block_size, inline_size) = match layout.content_inline_size_for_table {
             Some(inline_size) => (layout.content_block_size, inline_size),
             None => (
-                containing_block_for_children.block_size.auto_is(|| {
-                    layout.content_block_size.clamp_between_extremums(
-                        min_box_size.block.into(),
-                        max_box_size.block.map(|t| t.into()),
-                    )
-                }),
+                box_size
+                    .block
+                    .auto_is(|| layout.content_block_size)
+                    .clamp_between_extremums(min_box_size.block, max_box_size.block),
                 containing_block_for_children.inline_size,
             ),
         };
@@ -977,15 +1038,15 @@ impl NonReplacedFormattingContext {
         };
 
         let block_margins_collapsed_with_children = CollapsedBlockMargins::from_margin(&margin);
-
+        let containing_block_writing_mode = containing_block.style.writing_mode;
         BoxFragment::new(
             self.base_fragment_info,
             self.style.clone(),
             layout.fragments,
-            content_rect.into(),
-            pbm.padding,
-            pbm.border,
-            margin,
+            content_rect.to_physical(Some(containing_block)),
+            pbm.padding.to_physical(containing_block_writing_mode),
+            pbm.border.to_physical(containing_block_writing_mode),
+            margin.to_physical(containing_block_writing_mode),
             None, /* clearance */
             block_margins_collapsed_with_children,
         )
@@ -1003,12 +1064,16 @@ impl NonReplacedFormattingContext {
         sequential_layout_state: &mut SequentialLayoutState,
     ) -> BoxFragment {
         let pbm = self.style.padding_border_margin(containing_block);
-        let box_size = self.style.content_box_size(containing_block, &pbm);
-        let max_box_size = self.style.content_max_box_size(containing_block, &pbm);
+        let box_size = self
+            .style
+            .content_box_size_deprecated(containing_block, &pbm);
+        let max_box_size = self
+            .style
+            .content_max_box_size_deprecated(containing_block, &pbm);
         let min_box_size = self
             .style
-            .content_min_box_size(containing_block, &pbm)
-            .auto_is(Length::zero);
+            .content_min_box_size_deprecated(containing_block, &pbm)
+            .auto_is(Au::zero);
         let block_size = box_size.block.map(|block_size| {
             block_size.clamp_between_extremums(min_box_size.block, max_box_size.block)
         });
@@ -1033,15 +1098,15 @@ impl NonReplacedFormattingContext {
         let clearance;
         let mut content_size;
         let mut layout;
-        if let LengthOrAuto::LengthPercentage(ref inline_size) = box_size.inline {
+        if let AuOrAuto::LengthPercentage(ref inline_size) = box_size.inline {
             let inline_size =
                 inline_size.clamp_between_extremums(min_box_size.inline, max_box_size.inline);
             layout = self.layout(
                 layout_context,
                 positioning_context,
                 &ContainingBlock {
-                    inline_size: inline_size.into(),
-                    block_size: block_size.map(|t| t.into()),
+                    inline_size,
+                    block_size,
                     style: &self.style,
                 },
                 containing_block,
@@ -1051,12 +1116,12 @@ impl NonReplacedFormattingContext {
                 content_size = LogicalVec2 {
                     block: layout.content_block_size,
                     inline: inline_size,
-                }
-                .into();
+                };
             } else {
                 content_size = LogicalVec2 {
                     block: block_size.auto_is(|| {
-                        Length::from(layout.content_block_size)
+                        layout
+                            .content_block_size
                             .clamp_between_extremums(min_box_size.block, max_box_size.block)
                     }),
                     inline: inline_size,
@@ -1072,7 +1137,7 @@ impl NonReplacedFormattingContext {
                 &collapsed_margin_block_start,
                 containing_block,
                 &pbm,
-                &content_size + &pbm.padding_border_sums.into(),
+                content_size + pbm.padding_border_sums,
                 &self.style,
             );
         } else {
@@ -1088,12 +1153,10 @@ impl NonReplacedFormattingContext {
             });
 
             // Create a PlacementAmongFloats using the minimum size in all dimensions as the object size.
-            let minimum_size_of_block = &LogicalVec2 {
+            let minimum_size_of_block = LogicalVec2 {
                 inline: min_box_size.inline,
                 block: block_size.auto_is(|| min_box_size.block),
-            }
-            .into() +
-                &pbm.padding_border_sums;
+            } + pbm.padding_border_sums;
             let mut placement = PlacementAmongFloats::new(
                 &sequential_layout_state.floats,
                 ceiling,
@@ -1105,9 +1168,9 @@ impl NonReplacedFormattingContext {
             loop {
                 // First try to place the block using the minimum size as the object size.
                 placement_rect = placement.place();
-                let proposed_inline_size =
-                    Length::from(placement_rect.size.inline - pbm.padding_border_sums.inline)
-                        .clamp_between_extremums(min_box_size.inline, max_box_size.inline);
+                let proposed_inline_size = (placement_rect.size.inline -
+                    pbm.padding_border_sums.inline)
+                    .clamp_between_extremums(min_box_size.inline, max_box_size.inline);
 
                 // Now lay out the block using the inline size we calculated from the placement.
                 // Later we'll check to see if the resulting block size is compatible with the
@@ -1117,8 +1180,8 @@ impl NonReplacedFormattingContext {
                     layout_context,
                     positioning_context,
                     &ContainingBlock {
-                        inline_size: proposed_inline_size.into(),
-                        block_size: block_size.map(|t| t.into()),
+                        inline_size: proposed_inline_size,
+                        block_size,
                         style: &self.style,
                     },
                     containing_block,
@@ -1141,12 +1204,12 @@ impl NonReplacedFormattingContext {
                     content_size = LogicalVec2 {
                         block: layout.content_block_size,
                         inline: inline_size,
-                    }
-                    .into();
+                    };
                 } else {
                     content_size = LogicalVec2 {
                         block: block_size.auto_is(|| {
-                            Length::from(layout.content_block_size)
+                            layout
+                                .content_block_size
                                 .clamp_between_extremums(min_box_size.block, max_box_size.block)
                         }),
                         inline: proposed_inline_size,
@@ -1157,7 +1220,7 @@ impl NonReplacedFormattingContext {
                 // size of auto. Try to fit it into our precalculated placement among the
                 // floats. If it fits, then we can stop trying layout candidates.
                 if placement.try_to_expand_for_auto_block_size(
-                    Au::from(content_size.block) + pbm.padding_border_sums.block,
+                    content_size.block + pbm.padding_border_sums.block,
                     &placement_rect.size,
                 ) {
                     break;
@@ -1189,8 +1252,8 @@ impl NonReplacedFormattingContext {
                 sequential_layout_state,
                 containing_block,
                 &pbm,
-                content_size.inline + pbm.padding_border_sums.inline.into(),
-                placement_rect.into(),
+                content_size.inline + pbm.padding_border_sums.inline,
+                placement_rect,
             );
         }
 
@@ -1211,9 +1274,7 @@ impl NonReplacedFormattingContext {
         // Margins can never collapse into independent formatting contexts.
         sequential_layout_state.collapse_margins();
         sequential_layout_state.advance_block_position(
-            pbm.padding_border_sums.block +
-                Au::from(content_size.block) +
-                clearance.unwrap_or_else(Au::zero),
+            pbm.padding_border_sums.block + content_size.block + clearance.unwrap_or_else(Au::zero),
         );
         sequential_layout_state.adjoin_assign(&CollapsedMargin::new(margin.block_end));
 
@@ -1226,18 +1287,19 @@ impl NonReplacedFormattingContext {
                     pbm.border.inline_start +
                     effective_margin_inline_start,
             },
-            size: content_size.into(),
+            size: content_size,
         };
         let block_margins_collapsed_with_children = CollapsedBlockMargins::from_margin(&margin);
 
+        let containing_block_writing_mode = containing_block.style.writing_mode;
         BoxFragment::new(
             self.base_fragment_info,
             self.style.clone(),
             layout.fragments,
-            content_rect.into(),
-            pbm.padding,
-            pbm.border,
-            margin,
+            content_rect.to_physical(Some(containing_block)),
+            pbm.padding.to_physical(containing_block_writing_mode),
+            pbm.border.to_physical(containing_block_writing_mode),
+            margin.to_physical(containing_block_writing_mode),
             clearance,
             block_margins_collapsed_with_children,
         )
@@ -1256,13 +1318,16 @@ fn layout_in_flow_replaced_block_level(
     mut sequential_layout_state: Option<&mut SequentialLayoutState>,
 ) -> BoxFragment {
     let pbm = style.padding_border_margin(containing_block);
-    let content_size = replaced.used_size_as_if_inline_element(containing_block, style, None, &pbm);
+    let content_size = replaced.used_size_as_if_inline_element(containing_block, style, &pbm);
 
     let margin_inline_start;
     let margin_inline_end;
     let effective_margin_inline_start;
     let (margin_block_start, margin_block_end) = solve_block_margins_for_in_flow_block_level(&pbm);
-    let fragments = replaced.make_fragments(style, content_size);
+
+    let containing_block_writing_mode = containing_block.style.writing_mode;
+    let physical_content_size = content_size.to_physical_size(containing_block_writing_mode);
+    let fragments = replaced.make_fragments(style, containing_block, physical_content_size);
 
     let clearance;
     if let Some(ref mut sequential_layout_state) = sequential_layout_state {
@@ -1277,7 +1342,7 @@ fn layout_in_flow_replaced_block_level(
         //  than defined by section 10.3.3. CSS 2 does not define when a UA may put said
         //  element next to the float or by how much said element may become narrower."
         let collapsed_margin_block_start = CollapsedMargin::new(margin_block_start);
-        let size = &content_size + &pbm.padding_border_sums.clone();
+        let size = content_size + pbm.padding_border_sums;
         (
             clearance,
             (margin_inline_start, margin_inline_end),
@@ -1287,7 +1352,7 @@ fn layout_in_flow_replaced_block_level(
             &collapsed_margin_block_start,
             containing_block,
             &pbm,
-            size.into(),
+            size,
             style,
         );
 
@@ -1328,21 +1393,22 @@ fn layout_in_flow_replaced_block_level(
             clearance.unwrap_or_else(Au::zero),
         inline: pbm.padding.inline_start + pbm.border.inline_start + effective_margin_inline_start,
     };
-
     let content_rect = LogicalRect {
         start_corner,
         size: content_size,
-    };
+    }
+    .to_physical(Some(containing_block));
+
     let block_margins_collapsed_with_children = CollapsedBlockMargins::from_margin(&margin);
 
     BoxFragment::new(
         base_fragment_info,
         style.clone(),
         fragments,
-        content_rect.into(),
-        pbm.padding,
-        pbm.border,
-        margin,
+        content_rect,
+        pbm.padding.to_physical(containing_block_writing_mode),
+        pbm.border.to_physical(containing_block_writing_mode),
+        margin.to_physical(containing_block_writing_mode),
         clearance,
         block_margins_collapsed_with_children,
     )
@@ -1351,13 +1417,14 @@ fn layout_in_flow_replaced_block_level(
 struct ContainingBlockPaddingAndBorder<'a> {
     containing_block: ContainingBlock<'a>,
     pbm: PaddingBorderMargin,
-    min_box_size: LogicalVec2<Length>,
-    max_box_size: LogicalVec2<Option<Length>>,
+    box_size: LogicalVec2<AuOrAuto>,
+    min_box_size: LogicalVec2<Au>,
+    max_box_size: LogicalVec2<Option<Au>>,
 }
 
 struct ResolvedMargins {
     /// Used value for the margin properties, as exposed in getComputedStyle().
-    margin: LogicalSides<Au>,
+    pub margin: LogicalSides<Au>,
 
     /// Distance between the border box and the containing block on the inline-start side.
     /// This is typically the same as the inline-start margin, but can be greater when
@@ -1365,7 +1432,7 @@ struct ResolvedMargins {
     /// The reason we aren't just adjusting the used margin-inline-start is that
     /// this shouldn't be observable via getComputedStyle().
     /// <https://drafts.csswg.org/css-align/#justify-self-property>
-    effective_margin_inline_start: Au,
+    pub effective_margin_inline_start: Au,
 }
 
 /// Given the style for an in-flow box and its containing block, determine the containing
@@ -1377,12 +1444,35 @@ fn solve_containing_block_padding_and_border_for_in_flow_box<'a>(
     containing_block: &ContainingBlock<'_>,
     style: &'a Arc<ComputedValues>,
 ) -> ContainingBlockPaddingAndBorder<'a> {
+    if matches!(style.pseudo(), Some(PseudoElement::ServoAnonymousBox)) {
+        // <https://drafts.csswg.org/css2/#anonymous-block-level>
+        // > Anonymous block boxes are ignored when resolving percentage values that would
+        // > refer to it: the closest non-anonymous ancestor box is used instead.
+        let containing_block_for_children = ContainingBlock {
+            inline_size: containing_block.inline_size,
+            block_size: containing_block.block_size,
+            style,
+        };
+        // <https://drafts.csswg.org/css2/#anonymous-block-level>
+        // > Non-inherited properties have their initial value.
+        return ContainingBlockPaddingAndBorder {
+            containing_block: containing_block_for_children,
+            pbm: PaddingBorderMargin::zero(),
+            box_size: LogicalVec2 {
+                inline: AuOrAuto::Auto,
+                block: AuOrAuto::Auto,
+            },
+            min_box_size: LogicalVec2::default(),
+            max_box_size: LogicalVec2::default(),
+        };
+    }
+
     let pbm = style.padding_border_margin(containing_block);
-    let box_size = style.content_box_size(containing_block, &pbm);
-    let max_box_size = style.content_max_box_size(containing_block, &pbm);
+    let box_size = style.content_box_size_deprecated(containing_block, &pbm);
+    let max_box_size = style.content_max_box_size_deprecated(containing_block, &pbm);
     let min_box_size = style
-        .content_min_box_size(containing_block, &pbm)
-        .auto_is(Length::zero);
+        .content_min_box_size_deprecated(containing_block, &pbm)
+        .auto_is(Au::zero);
 
     // https://drafts.csswg.org/css2/#the-width-property
     // https://drafts.csswg.org/css2/visudet.html#min-max-widths
@@ -1391,34 +1481,38 @@ fn solve_containing_block_padding_and_border_for_in_flow_box<'a>(
         .auto_is(|| {
             let margin_inline_start = pbm.margin.inline_start.auto_is(Au::zero);
             let margin_inline_end = pbm.margin.inline_end.auto_is(Au::zero);
-            (containing_block.inline_size -
+            containing_block.inline_size -
                 pbm.padding_border_sums.inline -
                 margin_inline_start -
-                margin_inline_end)
-                .into()
+                margin_inline_end
         })
         .clamp_between_extremums(min_box_size.inline, max_box_size.inline);
 
     // https://drafts.csswg.org/css2/#the-height-property
     // https://drafts.csswg.org/css2/visudet.html#min-max-heights
     let mut block_size = box_size.block;
-    if let LengthOrAuto::LengthPercentage(ref mut block_size) = block_size {
+    if let AuOrAuto::LengthPercentage(ref mut block_size) = block_size {
         *block_size = block_size.clamp_between_extremums(min_box_size.block, max_box_size.block);
     }
 
     let containing_block_for_children = ContainingBlock {
-        inline_size: inline_size.into(),
-        block_size: block_size.map(|t| t.into()),
+        inline_size,
+        block_size,
         style,
     };
     // https://drafts.csswg.org/css-writing-modes/#orthogonal-flows
     assert_eq!(
-        containing_block.style.writing_mode, containing_block_for_children.style.writing_mode,
-        "Mixed writing modes are not supported yet"
+        containing_block.style.writing_mode.is_horizontal(),
+        containing_block_for_children
+            .style
+            .writing_mode
+            .is_horizontal(),
+        "Vertical writing modes are not supported yet"
     );
     ContainingBlockPaddingAndBorder {
         containing_block: containing_block_for_children,
         pbm,
+        box_size,
         min_box_size,
         max_box_size,
     }
@@ -1466,13 +1560,9 @@ fn justify_self_alignment(containing_block: &ContainingBlock, free_space: Au) ->
     let style = containing_block.style;
     debug_assert!(free_space >= Au::zero());
     match style.clone_text_align() {
-        TextAlignKeyword::ServoCenter => free_space / 2,
-        TextAlignKeyword::ServoLeft if !style.writing_mode.line_left_is_inline_start() => {
-            free_space
-        },
-        TextAlignKeyword::ServoRight if style.writing_mode.line_left_is_inline_start() => {
-            free_space
-        },
+        TextAlignKeyword::MozCenter => free_space / 2,
+        TextAlignKeyword::MozLeft if !style.writing_mode.line_left_is_inline_start() => free_space,
+        TextAlignKeyword::MozRight if style.writing_mode.line_left_is_inline_start() => free_space,
         _ => Au::zero(),
     }
 }
@@ -1532,14 +1622,14 @@ fn solve_inline_margins_avoiding_floats(
     sequential_layout_state: &SequentialLayoutState,
     containing_block: &ContainingBlock,
     pbm: &PaddingBorderMargin,
-    inline_size: Length,
-    placement_rect: LogicalRect<Length>,
+    inline_size: Au,
+    placement_rect: LogicalRect<Au>,
 ) -> ((Au, Au), Au) {
-    let free_space = Au::from(placement_rect.size.inline - inline_size);
+    let free_space = placement_rect.size.inline - inline_size;
     debug_assert!(free_space >= Au::zero());
     let cb_info = &sequential_layout_state.floats.containing_block_info;
-    let start_adjustment = Au::from(placement_rect.start_corner.inline) - cb_info.inline_start;
-    let end_adjustment = cb_info.inline_end - placement_rect.max_inline_position().into();
+    let start_adjustment = placement_rect.start_corner.inline - cb_info.inline_start;
+    let end_adjustment = cb_info.inline_end - placement_rect.max_inline_position();
     let mut justification = Au::zero();
     let inline_margins = match (pbm.margin.inline_start, pbm.margin.inline_end) {
         (AuOrAuto::Auto, AuOrAuto::Auto) => {
@@ -1572,7 +1662,7 @@ fn solve_clearance_and_inline_margins_avoiding_floats(
     block_start_margin: &CollapsedMargin,
     containing_block: &ContainingBlock,
     pbm: &PaddingBorderMargin,
-    size: LogicalVec2<Length>,
+    size: LogicalVec2<Au>,
     style: &Arc<ComputedValues>,
 ) -> (Option<Au>, (Au, Au), Au) {
     let (clearance, placement_rect) = sequential_layout_state
@@ -1580,14 +1670,14 @@ fn solve_clearance_and_inline_margins_avoiding_floats(
             style.get_box().clear,
             block_start_margin,
             pbm,
-            size.into(),
+            size,
         );
     let (inline_margins, effective_margin_inline_start) = solve_inline_margins_avoiding_floats(
         sequential_layout_state,
         containing_block,
         pbm,
         size.inline,
-        placement_rect.into(),
+        placement_rect,
     );
     (clearance, inline_margins, effective_margin_inline_start)
 }
@@ -1596,7 +1686,7 @@ fn solve_clearance_and_inline_margins_avoiding_floats(
 ///
 /// In parallel mode, this placement is done after all child blocks are laid out. In
 /// sequential mode, this is done right after each block is laid out.
-struct PlacementState {
+struct PlacementState<'container> {
     next_in_flow_margin_collapses_with_parent_start_margin: bool,
     last_in_flow_margin_collapses_with_parent_end_margin: bool,
     start_margin: CollapsedMargin,
@@ -1604,15 +1694,25 @@ struct PlacementState {
     current_block_direction_position: Au,
     inflow_baselines: Baselines,
     is_inline_block_context: bool,
+
+    /// If this [`PlacementState`] is laying out a list item with an outside marker. Record the
+    /// block size of that marker, because the content block size of the list item needs to be at
+    /// least as tall as the marker size -- even though the marker doesn't advance the block
+    /// position of the placement.
+    marker_block_size: Option<Au>,
+
+    /// The [`ContainingBlock`] of the container into which this [`PlacementState`] is laying out
+    /// fragments. This is used to convert between physical and logical geometry.
+    containing_block: &'container ContainingBlock<'container>,
 }
 
-impl PlacementState {
+impl<'container> PlacementState<'container> {
     fn new(
         collapsible_with_parent_start_margin: CollapsibleWithParentStartMargin,
-        containing_block_style: &ComputedValues,
+        containing_block: &'container ContainingBlock<'container>,
     ) -> PlacementState {
         let is_inline_block_context =
-            containing_block_style.get_box().clone_display() == Display::InlineBlock;
+            containing_block.style.get_box().clone_display() == Display::InlineBlock;
         PlacementState {
             next_in_flow_margin_collapses_with_parent_start_margin:
                 collapsible_with_parent_start_margin.0,
@@ -1622,6 +1722,8 @@ impl PlacementState {
             current_block_direction_position: Au::zero(),
             inflow_baselines: Baselines::default(),
             is_inline_block_context,
+            marker_block_size: None,
+            containing_block,
         }
     }
 
@@ -1647,11 +1749,17 @@ impl PlacementState {
             return;
         }
 
-        let box_block_offset = box_fragment.content_rect.start_corner.block.into();
-        if let (None, Some(first)) = (self.inflow_baselines.first, box_fragment.baselines.first) {
+        let box_block_offset = box_fragment
+            .content_rect
+            .origin
+            .to_logical(self.containing_block)
+            .block;
+        let box_fragment_baselines =
+            box_fragment.baselines(self.containing_block.style.writing_mode);
+        if let (None, Some(first)) = (self.inflow_baselines.first, box_fragment_baselines.first) {
             self.inflow_baselines.first = Some(first + box_block_offset);
         }
-        if let Some(last) = box_fragment.baselines.last {
+        if let Some(last) = box_fragment_baselines.last {
             self.inflow_baselines.last = Some(last + box_block_offset);
         }
     }
@@ -1665,10 +1773,37 @@ impl PlacementState {
     ) {
         match fragment {
             Fragment::Box(fragment) => {
+                // If this child is a marker positioned outside of a list item, then record its
+                // size, but also ensure that it doesn't advance the block position of the placment.
+                // This ensures item content is placed next to the marker.
+                //
+                // This is a pretty big hack because it doesn't properly handle all interactions
+                // between the marker and the item. For instance the marker should be positioned at
+                // the baseline of list item content and the first line of the item content should
+                // be at least as tall as the marker -- not the entire list item itself.
+                let is_outside_marker = fragment
+                    .base
+                    .flags
+                    .contains(FragmentFlags::IS_OUTSIDE_LIST_ITEM_MARKER);
+                if is_outside_marker {
+                    assert!(self.marker_block_size.is_none());
+                    self.marker_block_size = Some(
+                        fragment
+                            .content_rect
+                            .size
+                            .to_logical(self.containing_block.style.writing_mode)
+                            .block,
+                    );
+                    return;
+                }
+
                 let fragment_block_margins = &fragment.block_margins_collapsed_with_children;
-                let mut fragment_block_size = fragment.padding.block_sum() +
-                    fragment.border.block_sum() +
-                    fragment.content_rect.size.block.into();
+                let mut fragment_block_size = fragment
+                    .border_rect()
+                    .size
+                    .to_logical(self.containing_block.style.writing_mode)
+                    .block;
+
                 // We use `last_in_flow_margin_collapses_with_parent_end_margin` to implement
                 // this quote from https://drafts.csswg.org/css2/#collapsing-margins
                 // > If the top and bottom margins of an element with clearance are adjoining,
@@ -1703,8 +1838,12 @@ impl PlacementState {
                     self.current_margin
                         .adjoin_assign(&fragment_block_margins.start);
                 }
-                fragment.content_rect.start_corner.block +=
-                    (self.current_margin.solve() + self.current_block_direction_position).into();
+
+                fragment.content_rect.origin += LogicalVec2 {
+                    inline: Au::zero(),
+                    block: self.current_margin.solve() + self.current_block_direction_position,
+                }
+                .to_physical_size(self.containing_block.style.writing_mode);
 
                 if fragment_block_margins.collapsed_through {
                     // `fragment_block_size` is typically zero when collapsing through,
@@ -1719,12 +1858,17 @@ impl PlacementState {
                 }
             },
             Fragment::AbsoluteOrFixedPositioned(fragment) => {
-                let offset = LogicalVec2 {
-                    block: (self.current_margin.solve() + self.current_block_direction_position)
-                        .into(),
-                    inline: Length::new(0.),
-                };
-                fragment.borrow_mut().adjust_offsets(offset);
+                // The alignment of absolutes in block flow layout is always "start", so the size of
+                // the static position rectangle does not matter.
+                fragment.borrow_mut().static_position_rect = LogicalRect {
+                    start_corner: LogicalVec2 {
+                        block: (self.current_margin.solve() +
+                            self.current_block_direction_position),
+                        inline: Au::zero(),
+                    },
+                    size: LogicalVec2::zero(),
+                }
+                .to_physical(Some(self.containing_block));
             },
             Fragment::Float(box_fragment) => {
                 let sequential_layout_state = sequential_layout_state
@@ -1733,6 +1877,7 @@ impl PlacementState {
                     self.current_block_direction_position + self.current_margin.solve();
                 sequential_layout_state.place_float_fragment(
                     box_fragment,
+                    self.containing_block,
                     self.start_margin,
                     block_offset_from_containing_block_top,
                 );
@@ -1742,15 +1887,28 @@ impl PlacementState {
         }
     }
 
-    fn finish(mut self) -> (Length, CollapsedBlockMargins, Baselines) {
+    fn finish(mut self) -> (Au, CollapsedBlockMargins, Baselines) {
         if !self.last_in_flow_margin_collapses_with_parent_end_margin {
             self.current_block_direction_position += self.current_margin.solve();
             self.current_margin = CollapsedMargin::zero();
         }
+        let (total_block_size, collapsed_through) = match self.marker_block_size {
+            Some(marker_block_size) => (
+                self.current_block_direction_position.max(marker_block_size),
+                // If this is a list item (even empty) with an outside marker, then it
+                // should not collapse through.
+                false,
+            ),
+            None => (
+                self.current_block_direction_position,
+                self.next_in_flow_margin_collapses_with_parent_start_margin,
+            ),
+        };
+
         (
-            self.current_block_direction_position.into(),
+            total_block_size,
             CollapsedBlockMargins {
-                collapsed_through: self.next_in_flow_margin_collapses_with_parent_start_margin,
+                collapsed_through,
                 start: self.start_margin,
                 end: self.current_margin,
             },
@@ -1759,13 +1917,185 @@ impl PlacementState {
     }
 }
 
-fn block_size_is_zero_or_auto(size: &Size, containing_block: &ContainingBlock) -> bool {
+fn block_size_is_zero_or_intrinsic(size: &StyleSize, containing_block: &ContainingBlock) -> bool {
     match size {
-        Size::Auto => true,
-        Size::LengthPercentage(ref lp) => {
+        StyleSize::Auto |
+        StyleSize::MinContent |
+        StyleSize::MaxContent |
+        StyleSize::FitContent |
+        StyleSize::Stretch => true,
+        StyleSize::LengthPercentage(ref lp) => {
             // TODO: Should this resolve definite percentages? Blink does it, Gecko and WebKit don't.
             lp.is_definitely_zero() ||
                 (lp.0.has_percentage() && containing_block.block_size.is_auto())
         },
+        StyleSize::AnchorSizeFunction(_) => unreachable!("anchor-size() should be disabled"),
+    }
+}
+
+impl IndependentFormattingContext {
+    pub(crate) fn layout_float_or_atomic_inline(
+        &mut self,
+        layout_context: &LayoutContext,
+        child_positioning_context: &mut PositioningContext,
+        containing_block: &ContainingBlock,
+    ) -> IndependentLayoutResult {
+        let style = self.style();
+        let container_writing_mode = containing_block.style.writing_mode;
+        let pbm = style.padding_border_margin(containing_block);
+        let margin = pbm.margin.auto_is(Au::zero);
+        let pbm_sums = pbm.padding + pbm.border + margin;
+
+        let (fragments, content_rect, baselines) = match self {
+            IndependentFormattingContext::Replaced(replaced) => {
+                // https://drafts.csswg.org/css2/visudet.html#float-replaced-width
+                // https://drafts.csswg.org/css2/visudet.html#inline-replaced-height
+                let content_size = replaced
+                    .contents
+                    .used_size_as_if_inline_element(containing_block, &replaced.style, &pbm)
+                    .to_physical_size(container_writing_mode);
+                let fragments = replaced.contents.make_fragments(
+                    &replaced.style,
+                    containing_block,
+                    content_size,
+                );
+
+                let content_rect = PhysicalRect::new(PhysicalPoint::zero(), content_size);
+                (fragments, content_rect, None)
+            },
+            IndependentFormattingContext::NonReplaced(non_replaced) => {
+                let style = non_replaced.style.clone();
+                let box_size = style.content_box_size(containing_block, &pbm);
+                let max_box_size = style.content_max_box_size(containing_block, &pbm);
+                let min_box_size = style.content_min_box_size(containing_block, &pbm);
+
+                let available_inline_size =
+                    (containing_block.inline_size - pbm_sums.inline_sum()).max(Au::zero());
+                let available_block_size = containing_block
+                    .block_size
+                    .non_auto()
+                    .map(|block_size| (block_size - pbm_sums.block_sum()).max(Au::zero()));
+                let tentative_block_size = box_size
+                    .block
+                    .maybe_resolve_extrinsic(available_block_size)
+                    .map(|size| {
+                        let min_block_size = min_box_size
+                            .block
+                            .maybe_resolve_extrinsic(available_block_size)
+                            .unwrap_or_default();
+                        let max_block_size = max_box_size
+                            .block
+                            .maybe_resolve_extrinsic(available_block_size);
+                        size.clamp_between_extremums(min_block_size, max_block_size)
+                    })
+                    .map_or(AuOrAuto::Auto, AuOrAuto::LengthPercentage);
+
+                let mut get_content_size = || {
+                    let containing_block_for_children =
+                        IndefiniteContainingBlock::new_for_style_and_block_size(
+                            &style,
+                            tentative_block_size,
+                        );
+                    non_replaced
+                        .inline_content_sizes(layout_context, &containing_block_for_children)
+                        .sizes
+                };
+
+                // https://drafts.csswg.org/css2/visudet.html#float-width
+                // https://drafts.csswg.org/css2/visudet.html#inlineblock-width
+                let tentative_inline_size = box_size.inline.resolve(
+                    Size::FitContent,
+                    available_inline_size,
+                    &mut get_content_size,
+                );
+
+                // https://drafts.csswg.org/css2/visudet.html#min-max-widths
+                // In this case “applying the rules above again” with a non-auto inline-size
+                // always results in that size.
+                let min_inline_size = min_box_size
+                    .inline
+                    .resolve_non_initial(available_inline_size, &mut get_content_size)
+                    .unwrap_or_default();
+                let max_inline_size = max_box_size
+                    .inline
+                    .resolve_non_initial(available_inline_size, &mut get_content_size);
+                let inline_size =
+                    tentative_inline_size.clamp_between_extremums(min_inline_size, max_inline_size);
+
+                let containing_block_for_children = ContainingBlock {
+                    inline_size,
+                    block_size: tentative_block_size,
+                    style: &style,
+                };
+                assert_eq!(
+                    container_writing_mode.is_horizontal(),
+                    style.writing_mode.is_horizontal(),
+                    "Mixed horizontal and vertical writing modes are not supported yet"
+                );
+
+                let independent_layout = non_replaced.layout(
+                    layout_context,
+                    child_positioning_context,
+                    &containing_block_for_children,
+                    containing_block,
+                );
+                let (inline_size, block_size) = match independent_layout
+                    .content_inline_size_for_table
+                {
+                    Some(inline) => (inline, independent_layout.content_block_size),
+                    None => {
+                        // https://drafts.csswg.org/css2/visudet.html#block-root-margin
+                        let stretch_size =
+                            available_block_size.unwrap_or(independent_layout.content_block_size);
+                        let mut get_content_size = || independent_layout.content_block_size.into();
+                        let min_block_size = min_box_size
+                            .block
+                            .resolve_non_initial(stretch_size, &mut get_content_size)
+                            .unwrap_or_default();
+                        let max_block_size = max_box_size
+                            .block
+                            .resolve_non_initial(stretch_size, &mut get_content_size);
+                        let block_size = tentative_block_size
+                            .auto_is(|| independent_layout.content_block_size)
+                            .clamp_between_extremums(min_block_size, max_block_size);
+                        (inline_size, block_size)
+                    },
+                };
+
+                let content_size = LogicalVec2 {
+                    block: block_size,
+                    inline: inline_size,
+                }
+                .to_physical_size(container_writing_mode);
+                let content_rect = PhysicalRect::new(PhysicalPoint::zero(), content_size);
+
+                (
+                    independent_layout.fragments,
+                    content_rect,
+                    Some(independent_layout.baselines),
+                )
+            },
+        };
+
+        let fragment = BoxFragment::new(
+            self.base_fragment_info(),
+            self.style().clone(),
+            fragments,
+            content_rect,
+            pbm.padding.to_physical(container_writing_mode),
+            pbm.border.to_physical(container_writing_mode),
+            margin.to_physical(container_writing_mode),
+            // Floats can have clearance, but it's handled internally by the float placement logic,
+            // so there's no need to store it explicitly in the fragment.
+            // And atomic inlines don't have clearance.
+            None, /* clearance */
+            CollapsedBlockMargins::zero(),
+        );
+
+        IndependentLayoutResult {
+            fragment,
+            baselines,
+            pbm_sums,
+        }
     }
 }

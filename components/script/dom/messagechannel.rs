@@ -10,6 +10,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageport::MessagePort;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct MessageChannel {
@@ -20,16 +21,11 @@ pub struct MessageChannel {
 
 impl MessageChannel {
     /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
+    fn new(
+        incumbent: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<MessageChannel> {
-        MessageChannel::new(global, proto)
-    }
-
-    /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel>
-    fn new(incumbent: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<MessageChannel> {
         // Step 1
         let port1 = MessagePort::new(incumbent);
 
@@ -47,6 +43,7 @@ impl MessageChannel {
             Box::new(MessageChannel::new_inherited(&port1, &port2)),
             incumbent,
             proto,
+            can_gc,
         )
     }
 
@@ -60,6 +57,15 @@ impl MessageChannel {
 }
 
 impl MessageChannelMethods for MessageChannel {
+    /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel>
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<MessageChannel> {
+        MessageChannel::new(global, proto, can_gc)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel-port1>
     fn Port1(&self) -> DomRoot<MessagePort> {
         DomRoot::from_ref(&*self.port1)

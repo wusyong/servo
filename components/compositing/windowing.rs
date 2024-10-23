@@ -7,20 +7,22 @@
 use std::fmt::{Debug, Error, Formatter};
 use std::time::Duration;
 
+use base::id::{PipelineId, TopLevelBrowsingContextId};
 use embedder_traits::{EmbedderProxy, EventLoopWaker};
 use euclid::Scale;
-use gfx::rendering_context::RenderingContext;
 use keyboard_types::KeyboardEvent;
 use libc::c_void;
-use msg::constellation_msg::{PipelineId, TopLevelBrowsingContextId, TraversalDirection};
+use net::protocols::ProtocolRegistry;
 use script_traits::{
-    GamepadEvent, MediaSessionActionType, MouseButton, TouchEventType, TouchId, WheelDelta,
+    GamepadEvent, MediaSessionActionType, MouseButton, TouchEventType, TouchId, TraversalDirection,
+    WheelDelta,
 };
 use servo_geometry::DeviceIndependentPixel;
 use servo_url::ServoUrl;
 use style_traits::DevicePixel;
 use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint, DeviceRect};
 use webrender_api::ScrollLocation;
+use webrender_traits::RenderingContext;
 
 #[derive(Clone)]
 pub enum MouseWindowEvent {
@@ -221,6 +223,17 @@ pub trait EmbedderMethods {
     fn get_user_agent_string(&self) -> Option<String> {
         None
     }
+
+    /// Returns the version string of this embedder.
+    fn get_version_string(&self) -> Option<String> {
+        None
+    }
+
+    /// Returns the protocol handlers implemented by that embedder.
+    /// They will be merged with the default internal ones.
+    fn get_protocol_handlers(&self) -> ProtocolRegistry {
+        ProtocolRegistry::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -228,11 +241,11 @@ pub struct EmbedderCoordinates {
     /// The pixel density of the display.
     pub hidpi_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     /// Size of the screen.
-    pub screen: DeviceIntSize,
+    pub screen_size: DeviceIntSize,
     /// Size of the available screen space (screen without toolbars and docks).
-    pub screen_avail: DeviceIntSize,
-    /// Size of the native window.
-    pub window: (DeviceIntSize, DeviceIntPoint),
+    pub available_screen_size: DeviceIntSize,
+    /// Position and size of the native window.
+    pub window_rect: DeviceIntRect,
     /// Size of the GL buffer in the window.
     pub framebuffer: DeviceIntSize,
     /// Coordinates of the document within the framebuffer.
@@ -249,7 +262,10 @@ impl EmbedderCoordinates {
     /// This should be used when drawing directly to the framebuffer with OpenGL commands.
     pub fn flip_rect(&self, rect: &DeviceIntRect) -> DeviceIntRect {
         let mut result = *rect;
-        result.min.y = self.framebuffer.height - result.min.y - result.size().height;
+        let min_y = self.framebuffer.height - result.max.y;
+        let max_y = self.framebuffer.height - result.min.y;
+        result.min.y = min_y;
+        result.max.y = max_y;
         result
     }
 
@@ -257,5 +273,67 @@ impl EmbedderCoordinates {
     /// This should be used when drawing directly to the framebuffer with OpenGL commands.
     pub fn get_flipped_viewport(&self) -> DeviceIntRect {
         self.flip_rect(&self.get_viewport())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use euclid::{Point2D, Scale, Size2D};
+    use webrender_api::units::DeviceIntRect;
+
+    use super::EmbedderCoordinates;
+
+    #[test]
+    fn test() {
+        let pos = Point2D::zero();
+        let viewport = Size2D::new(800, 600);
+        let screen = Size2D::new(1080, 720);
+        let coordinates = EmbedderCoordinates {
+            hidpi_factor: Scale::new(1.),
+            screen_size: screen,
+            available_screen_size: screen,
+            window_rect: DeviceIntRect::from_origin_and_size(pos, viewport),
+            framebuffer: viewport,
+            viewport: DeviceIntRect::from_origin_and_size(pos, viewport),
+        };
+
+        // Check if viewport conversion is correct.
+        let viewport = DeviceIntRect::new(Point2D::new(0, 0), Point2D::new(800, 600));
+        assert_eq!(coordinates.get_viewport(), viewport);
+        assert_eq!(coordinates.get_flipped_viewport(), viewport);
+
+        // Check rects with different y positions inside the viewport.
+        let rect1 = DeviceIntRect::new(Point2D::new(0, 0), Point2D::new(800, 400));
+        let rect2 = DeviceIntRect::new(Point2D::new(0, 100), Point2D::new(800, 600));
+        let rect3 = DeviceIntRect::new(Point2D::new(0, 200), Point2D::new(800, 500));
+        assert_eq!(
+            coordinates.flip_rect(&rect1),
+            DeviceIntRect::new(Point2D::new(0, 200), Point2D::new(800, 600))
+        );
+        assert_eq!(
+            coordinates.flip_rect(&rect2),
+            DeviceIntRect::new(Point2D::new(0, 0), Point2D::new(800, 500))
+        );
+        assert_eq!(
+            coordinates.flip_rect(&rect3),
+            DeviceIntRect::new(Point2D::new(0, 100), Point2D::new(800, 400))
+        );
+
+        // Check rects with different x positions.
+        let rect1 = DeviceIntRect::new(Point2D::new(0, 0), Point2D::new(700, 400));
+        let rect2 = DeviceIntRect::new(Point2D::new(100, 100), Point2D::new(800, 600));
+        let rect3 = DeviceIntRect::new(Point2D::new(300, 200), Point2D::new(600, 500));
+        assert_eq!(
+            coordinates.flip_rect(&rect1),
+            DeviceIntRect::new(Point2D::new(0, 200), Point2D::new(700, 600))
+        );
+        assert_eq!(
+            coordinates.flip_rect(&rect2),
+            DeviceIntRect::new(Point2D::new(100, 0), Point2D::new(800, 500))
+        );
+        assert_eq!(
+            coordinates.flip_rect(&rect3),
+            DeviceIntRect::new(Point2D::new(300, 100), Point2D::new(600, 400))
+        );
     }
 }

@@ -5,16 +5,24 @@
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
-use webgpu::{WebGPU, WebGPURequest, WebGPUShaderModule};
+use webgpu::{WebGPU, WebGPURequest, WebGPUResponse, WebGPUShaderModule};
 
-use super::bindings::error::Fallible;
+use super::gpu::AsyncWGPUListener;
+use super::gpucompilationinfo::GPUCompilationInfo;
 use super::promise::Promise;
+use super::types::GPUDevice;
 use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::WebGPUBinding::GPUShaderModuleMethods;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
+    GPUShaderModuleDescriptor, GPUShaderModuleMethods,
+};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::USVString;
+use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::gpu::response_async;
+use crate::realms::InRealm;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct GPUShaderModule {
@@ -25,15 +33,23 @@ pub struct GPUShaderModule {
     label: DomRefCell<USVString>,
     #[no_trace]
     shader_module: WebGPUShaderModule,
+    #[ignore_malloc_size_of = "promise"]
+    compilation_info_promise: Rc<Promise>,
 }
 
 impl GPUShaderModule {
-    fn new_inherited(channel: WebGPU, shader_module: WebGPUShaderModule, label: USVString) -> Self {
+    fn new_inherited(
+        channel: WebGPU,
+        shader_module: WebGPUShaderModule,
+        label: USVString,
+        promise: Rc<Promise>,
+    ) -> Self {
         Self {
             reflector_: Reflector::new(),
             channel,
             label: DomRefCell::new(label),
             shader_module,
+            compilation_info_promise: promise,
         }
     }
 
@@ -42,12 +58,14 @@ impl GPUShaderModule {
         channel: WebGPU,
         shader_module: WebGPUShaderModule,
         label: USVString,
+        promise: Rc<Promise>,
     ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(GPUShaderModule::new_inherited(
                 channel,
                 shader_module,
                 label,
+                promise,
             )),
             global,
         )
@@ -57,6 +75,37 @@ impl GPUShaderModule {
 impl GPUShaderModule {
     pub fn id(&self) -> WebGPUShaderModule {
         self.shader_module
+    }
+
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createshadermodule>
+    pub fn create(
+        device: &GPUDevice,
+        descriptor: RootedTraceableBox<GPUShaderModuleDescriptor>,
+        comp: InRealm,
+        can_gc: CanGc,
+    ) -> DomRoot<GPUShaderModule> {
+        let program_id = device.global().wgpu_id_hub().create_shader_module_id();
+        let promise = Promise::new_in_current_realm(comp, can_gc);
+        let shader_module = GPUShaderModule::new(
+            &device.global(),
+            device.channel().clone(),
+            WebGPUShaderModule(program_id),
+            descriptor.parent.label.clone(),
+            promise.clone(),
+        );
+        let sender = response_async(&promise, &*shader_module);
+        device
+            .channel()
+            .0
+            .send(WebGPURequest::CreateShaderModule {
+                device_id: device.id().0,
+                program_id,
+                program: descriptor.code.0.clone(),
+                label: None,
+                sender,
+            })
+            .expect("Failed to create WebGPU ShaderModule");
+        shader_module
     }
 }
 
@@ -72,8 +121,20 @@ impl GPUShaderModuleMethods for GPUShaderModule {
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpushadermodule-getcompilationinfo>
-    fn GetCompilationInfo(&self) -> Fallible<Rc<Promise>> {
-        todo!("Missing in wgpu: https://github.com/gfx-rs/wgpu/issues/2170")
+    fn GetCompilationInfo(&self) -> Rc<Promise> {
+        self.compilation_info_promise.clone()
+    }
+}
+
+impl AsyncWGPUListener for GPUShaderModule {
+    fn handle_response(&self, response: WebGPUResponse, promise: &Rc<Promise>, can_gc: CanGc) {
+        match response {
+            WebGPUResponse::CompilationInfo(info) => {
+                let info = GPUCompilationInfo::from(&self.global(), info, can_gc);
+                promise.resolve_native(&info);
+            },
+            _ => unreachable!("Wrong response received on AsyncWGPUListener for GPUShaderModule"),
+        }
     }
 }
 
@@ -82,7 +143,7 @@ impl Drop for GPUShaderModule {
         if let Err(e) = self
             .channel
             .0
-            .send((None, WebGPURequest::DropShaderModule(self.shader_module.0)))
+            .send(WebGPURequest::DropShaderModule(self.shader_module.0))
         {
             warn!(
                 "Failed to send DropShaderModule ({:?}) ({})",

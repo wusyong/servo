@@ -8,10 +8,10 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc as StdArc;
 
-use gfx_traits::ByteIndex;
+use base::id::{BrowsingContextId, PipelineId};
+use fonts_traits::ByteIndex;
 use html5ever::{local_name, namespace_url, ns};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image::base::{Image, ImageMetadata};
+use pixels::{Image, ImageMetadata};
 use range::Range;
 use script_layout_interface::wrapper_traits::{
     LayoutDataTrait, LayoutNode, PseudoElementType, ThreadSafeLayoutNode,
@@ -23,6 +23,7 @@ use script_layout_interface::{
 use servo_arc::Arc;
 use servo_url::ServoUrl;
 use style;
+use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::context::SharedStyleContext;
 use style::dom::{NodeInfo, TElement, TNode, TShadowRoot};
 use style::properties::ComputedValues;
@@ -75,6 +76,11 @@ impl<'dom> ServoLayoutNode<'dom> {
         ServoLayoutNode { node: n }
     }
 
+    /// Create a new [`ServoLayoutNode`] for this given [`TrustedNodeAddress`].
+    ///
+    /// # Safety
+    ///
+    /// The address pointed to by `address` should point to a valid node in memory.
     pub unsafe fn new(address: &TrustedNodeAddress) -> Self {
         ServoLayoutNode::from_layout_js(LayoutDom::from_trusted_node_address(*address))
     }
@@ -312,6 +318,11 @@ impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
             })
     }
 
+    fn as_html_element(&self) -> Option<ServoThreadSafeLayoutElement<'dom>> {
+        self.as_element()
+            .filter(|element| element.element.is_html_element())
+    }
+
     fn style_data(&self) -> Option<&'dom StyleData> {
         self.node.style_data()
     }
@@ -337,11 +348,10 @@ impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
             //
             // If you implement other values for this property, you will almost certainly
             // want to update this check.
-            !self
-                .style(context)
+            self.style(context)
                 .get_inherited_text()
-                .white_space
-                .preserve_newlines()
+                .white_space_collapse ==
+                WhiteSpaceCollapse::Collapse
         }
     }
 

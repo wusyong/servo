@@ -15,26 +15,25 @@ rand = [
     "quickcheck", # Only used in tests
     "servo_rand",
     "tungstenite",
+    "tracing-perfetto",
 ]
 
 [ignore]
 # Ignored packages with duplicated versions
 packages = [
     "bitflags",
+    "cfg_aliases",
     "cookie",
     "futures",
-    "libloading",
-    "nix",
+    "hermit-abi",
+    "miniz_oxide",
     "redox_syscall",
-    "syn",
-    "synstructure",
     "time",
     "wasi",
     "wayland-sys",
 
     # New versions of these dependencies is pulled in by GStreamer / GLib.
     "itertools",
-    "proc-macro-crate",
     "toml",
 
     # Duplicated by winit.
@@ -52,26 +51,37 @@ packages = [
     "foreign-types",
     "foreign-types-shared",
     "metal",
-    "raw-window-handle",
+    "windows-core",
 
-    # Duplicated by indexmap.
-    "hashbrown",
-
-    # Duplicated by style, cbindgen, clap, and GStreamer.
-    "indexmap",
+    # wgpu-hal depends on 0.5.0.
+    "ndk-sys",
 
     # quickcheck (required by layout_2020 for tests) is
     # stuck on 0.8.4 with no new releases.
     "env_logger",
 
-    # Stylo uses phf 0.11, while script and other dependencies use 0.10.
-    "phf",
+    # Required until a new version of string-cache is released.
     "phf_generator",
     "phf_shared",
 
-    # These can be removed once winit, font-kit, etc are upgraded
-    "core-graphics",
-    "core-text",
+    # petgraph uses old version
+    "fixedbitset",
+
+    # servo-media-audio uses old version
+    "petgraph",
+
+    # icu (from mozjs) uses old version
+    # tracing-subscriber (tokio-rs/tracing#3033) uses old version
+    # regex -> regex-automata 0.4.7
+    # icu_list -> regex-automata 0.2.0
+    # tracing-subscriber -> matchers -> regex-automata 0.1.0
+    "regex-automata",
+
+    # gilrs is on 0.10.0, but Servo is still on 0.9.4
+    "core-foundation",
+
+    # some non-servo crates still use 0.14
+    "glow",
 ]
 # Files that are ignored for all tidy and lint checks.
 files = [

@@ -4,10 +4,10 @@
 
 use std::cell::Cell;
 use std::convert::TryInto;
+use std::sync::LazyLock;
 
 use dom_struct::dom_struct;
 use js::jsval::JSVal;
-use lazy_static::lazy_static;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
@@ -29,12 +29,11 @@ use crate::dom::pluginarray::PluginArray;
 use crate::dom::serviceworkercontainer::ServiceWorkerContainer;
 use crate::dom::window::Window;
 use crate::dom::xrsystem::XRSystem;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 pub(super) fn hardware_concurrency() -> u64 {
-    lazy_static! {
-        static ref CPUS: u64 = num_cpus::get().try_into().unwrap_or(1);
-    }
+    static CPUS: LazyLock<u64> = LazyLock::new(|| num_cpus::get().try_into().unwrap_or(1));
+
     *CPUS
 }
 
@@ -86,14 +85,14 @@ impl Navigator {
         self.gamepads.borrow().get(index).and_then(|g| g.get())
     }
 
-    pub fn set_gamepad(&self, index: usize, gamepad: &Gamepad) {
+    pub fn set_gamepad(&self, index: usize, gamepad: &Gamepad, can_gc: CanGc) {
         if let Some(gamepad_to_set) = self.gamepads.borrow().get(index) {
             gamepad_to_set.set(Some(gamepad));
         }
         if self.has_gamepad_gesture.get() {
             gamepad.set_exposed(true);
             if self.global().as_window().Document().is_fully_active() {
-                gamepad.notify_event(GamepadEventType::Connected);
+                gamepad.notify_event(GamepadEventType::Connected, can_gc);
             }
         }
     }

@@ -28,6 +28,7 @@ use crate::dom::htmlmediaelement::HTMLMediaElement;
 use crate::dom::mediametadata::MediaMetadata;
 use crate::dom::window::Window;
 use crate::realms::{enter_realm, InRealm};
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct MediaSession {
@@ -67,7 +68,7 @@ impl MediaSession {
         self.media_instance.set(Some(media_instance));
     }
 
-    pub fn handle_action(&self, action: MediaSessionActionType) {
+    pub fn handle_action(&self, action: MediaSessionActionType, can_gc: CanGc) {
         debug!("Handle media session action {:?}", action);
 
         if let Some(handler) = self.action_handlers.borrow().get(&action) {
@@ -82,10 +83,10 @@ impl MediaSession {
             match action {
                 MediaSessionActionType::Play => {
                     let realm = enter_realm(self);
-                    media.Play(InRealm::Entered(&realm));
+                    media.Play(InRealm::Entered(&realm), can_gc);
                 },
                 MediaSessionActionType::Pause => {
-                    media.Pause();
+                    media.Pause(can_gc);
                 },
                 MediaSessionActionType::SeekBackward => {},
                 MediaSessionActionType::SeekForward => {},
@@ -125,14 +126,14 @@ impl MediaSession {
 
 impl MediaSessionMethods for MediaSession {
     /// <https://w3c.github.io/mediasession/#dom-mediasession-metadata>
-    fn GetMetadata(&self) -> Option<DomRoot<MediaMetadata>> {
+    fn GetMetadata(&self, can_gc: CanGc) -> Option<DomRoot<MediaMetadata>> {
         if let Some(ref metadata) = *self.metadata.borrow() {
             let mut init = MediaMetadataInit::empty();
             init.title = DOMString::from_string(metadata.title.clone());
             init.artist = DOMString::from_string(metadata.artist.clone());
             init.album = DOMString::from_string(metadata.album.clone());
             let global = self.global();
-            Some(MediaMetadata::new(global.as_window(), &init))
+            Some(MediaMetadata::new(global.as_window(), &init, can_gc))
         } else {
             None
         }

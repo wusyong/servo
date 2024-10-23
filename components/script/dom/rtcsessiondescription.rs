@@ -14,6 +14,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct RTCSessionDescription {
@@ -36,18 +37,23 @@ impl RTCSessionDescription {
         proto: Option<HandleObject>,
         ty: RTCSdpType,
         sdp: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<RTCSessionDescription> {
         reflect_dom_object_with_proto(
             Box::new(RTCSessionDescription::new_inherited(ty, sdp)),
             global,
             proto,
+            can_gc,
         )
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl RTCSessionDescriptionMethods for RTCSessionDescription {
+    /// <https://w3c.github.io/webrtc-pc/#dom-sessiondescription>
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         config: &RTCSessionDescriptionInit,
     ) -> Fallible<DomRoot<RTCSessionDescription>> {
         Ok(RTCSessionDescription::new(
@@ -55,11 +61,10 @@ impl RTCSessionDescription {
             proto,
             config.type_,
             config.sdp.clone(),
+            can_gc,
         ))
     }
-}
 
-impl RTCSessionDescriptionMethods for RTCSessionDescription {
     /// <https://w3c.github.io/webrtc-pc/#dom-rtcsessiondescription-type>
     fn Type(&self) -> RTCSdpType {
         self.ty

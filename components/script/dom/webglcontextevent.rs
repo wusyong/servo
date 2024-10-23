@@ -17,6 +17,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct WebGLContextEvent {
@@ -25,6 +26,34 @@ pub struct WebGLContextEvent {
 }
 
 impl WebGLContextEventMethods for WebGLContextEvent {
+    // https://registry.khronos.org/webgl/specs/latest/1.0/#5.15
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        type_: DOMString,
+        init: &WebGLContextEventInit,
+    ) -> Fallible<DomRoot<WebGLContextEvent>> {
+        let status_message = match init.statusMessage.as_ref() {
+            Some(message) => message.clone(),
+            None => DOMString::new(),
+        };
+
+        let bubbles = EventBubbles::from(init.parent.bubbles);
+
+        let cancelable = EventCancelable::from(init.parent.cancelable);
+
+        Ok(WebGLContextEvent::new_with_proto(
+            window,
+            proto,
+            Atom::from(type_),
+            bubbles,
+            cancelable,
+            status_message,
+            can_gc,
+        ))
+    }
+
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15
     fn StatusMessage(&self) -> DOMString {
         self.status_message.clone()
@@ -50,8 +79,17 @@ impl WebGLContextEvent {
         bubbles: EventBubbles,
         cancelable: EventCancelable,
         status_message: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<WebGLContextEvent> {
-        Self::new_with_proto(window, None, type_, bubbles, cancelable, status_message)
+        Self::new_with_proto(
+            window,
+            None,
+            type_,
+            bubbles,
+            cancelable,
+            status_message,
+            can_gc,
+        )
     }
 
     fn new_with_proto(
@@ -61,11 +99,13 @@ impl WebGLContextEvent {
         bubbles: EventBubbles,
         cancelable: EventCancelable,
         status_message: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<WebGLContextEvent> {
         let event = reflect_dom_object_with_proto(
             Box::new(WebGLContextEvent::new_inherited(status_message)),
             window,
             proto,
+            can_gc,
         );
 
         {
@@ -74,31 +114,5 @@ impl WebGLContextEvent {
         }
 
         event
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        type_: DOMString,
-        init: &WebGLContextEventInit,
-    ) -> Fallible<DomRoot<WebGLContextEvent>> {
-        let status_message = match init.statusMessage.as_ref() {
-            Some(message) => message.clone(),
-            None => DOMString::new(),
-        };
-
-        let bubbles = EventBubbles::from(init.parent.bubbles);
-
-        let cancelable = EventCancelable::from(init.parent.cancelable);
-
-        Ok(WebGLContextEvent::new_with_proto(
-            window,
-            proto,
-            Atom::from(type_),
-            bubbles,
-            cancelable,
-            status_message,
-        ))
     }
 }

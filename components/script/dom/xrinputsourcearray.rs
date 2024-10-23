@@ -15,6 +15,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::xrinputsource::XRInputSource;
 use crate::dom::xrinputsourceschangeevent::XRInputSourcesChangeEvent;
 use crate::dom::xrsession::XRSession;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct XRInputSourceArray {
@@ -34,8 +35,7 @@ impl XRInputSourceArray {
         reflect_dom_object(Box::new(XRInputSourceArray::new_inherited()), global)
     }
 
-    pub fn add_input_sources(&self, session: &XRSession, inputs: &[InputSource]) {
-        let mut input_sources = self.input_sources.borrow_mut();
+    pub fn add_input_sources(&self, session: &XRSession, inputs: &[InputSource], can_gc: CanGc) {
         let global = self.global();
 
         let mut added = vec![];
@@ -43,11 +43,15 @@ impl XRInputSourceArray {
             // This is quadratic, but won't be a problem for the only case
             // where we add multiple input sources (the initial input sources case)
             debug_assert!(
-                !input_sources.iter().any(|i| i.id() == info.id),
+                !self
+                    .input_sources
+                    .borrow()
+                    .iter()
+                    .any(|i| i.id() == info.id),
                 "Should never add a duplicate input id!"
             );
-            let input = XRInputSource::new(&global, session, info.clone());
-            input_sources.push(Dom::from_ref(&input));
+            let input = XRInputSource::new(&global, session, info.clone(), can_gc);
+            self.input_sources.borrow_mut().push(Dom::from_ref(&input));
             added.push(input);
         }
 
@@ -59,16 +63,15 @@ impl XRInputSourceArray {
             session,
             &added,
             &[],
+            can_gc,
         );
-        // Release the refcell guard
-        drop(input_sources);
         event.upcast::<Event>().fire(session.upcast());
     }
 
-    pub fn remove_input_source(&self, session: &XRSession, id: InputId) {
-        let mut input_sources = self.input_sources.borrow_mut();
+    pub fn remove_input_source(&self, session: &XRSession, id: InputId, can_gc: CanGc) {
         let global = self.global();
-        let removed = if let Some(i) = input_sources.iter().find(|i| i.id() == id) {
+        let removed = if let Some(i) = self.input_sources.borrow().iter().find(|i| i.id() == id) {
+            i.gamepad().update_connected(false, false, can_gc);
             [DomRoot::from_ref(&**i)]
         } else {
             return;
@@ -82,27 +85,32 @@ impl XRInputSourceArray {
             session,
             &[],
             &removed,
+            can_gc,
         );
-        input_sources.retain(|i| i.id() != id);
-        // release the refcell guard
-        drop(input_sources);
+        self.input_sources.borrow_mut().retain(|i| i.id() != id);
         event.upcast::<Event>().fire(session.upcast());
     }
 
-    pub fn add_remove_input_source(&self, session: &XRSession, id: InputId, info: InputSource) {
-        let mut input_sources = self.input_sources.borrow_mut();
+    pub fn add_remove_input_source(
+        &self,
+        session: &XRSession,
+        id: InputId,
+        info: InputSource,
+        can_gc: CanGc,
+    ) {
         let global = self.global();
         let root;
-        let removed = if let Some(i) = input_sources.iter().find(|i| i.id() == id) {
+        let removed = if let Some(i) = self.input_sources.borrow().iter().find(|i| i.id() == id) {
+            i.gamepad().update_connected(false, false, can_gc);
             root = [DomRoot::from_ref(&**i)];
             &root as &[_]
         } else {
             warn!("Could not find removed input source with id {:?}", id);
             &[]
         };
-        input_sources.retain(|i| i.id() != id);
-        let input = XRInputSource::new(&global, session, info);
-        input_sources.push(Dom::from_ref(&input));
+        self.input_sources.borrow_mut().retain(|i| i.id() != id);
+        let input = XRInputSource::new(&global, session, info, can_gc);
+        self.input_sources.borrow_mut().push(Dom::from_ref(&input));
 
         let added = [input];
 
@@ -114,9 +122,8 @@ impl XRInputSourceArray {
             session,
             &added,
             removed,
+            can_gc,
         );
-        // release the refcell guard
-        drop(input_sources);
         event.upcast::<Event>().fire(session.upcast());
     }
 

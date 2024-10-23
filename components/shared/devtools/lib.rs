@@ -8,17 +8,19 @@
 
 #![crate_name = "devtools_traits"]
 #![crate_type = "rlib"]
-#![allow(non_snake_case)]
 #![deny(unsafe_code)]
 
+use std::collections::HashMap;
 use std::net::TcpStream;
 use std::time::{Duration, SystemTime};
 
+use base::cross_process_instant::CrossProcessInstant;
+use base::id::{BrowsingContextId, PipelineId};
 use bitflags::bitflags;
 use http::{HeaderMap, Method};
 use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
+use net_traits::http_status::HttpStatus;
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
 use uuid::Uuid;
@@ -118,39 +120,32 @@ pub struct AttrInfo {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
-    pub uniqueId: String,
-    pub baseURI: String,
+    pub unique_id: String,
+    #[serde(rename = "baseURI")]
+    pub base_uri: String,
     pub parent: String,
-    pub nodeType: u16,
-    pub namespaceURI: String,
-    pub nodeName: String,
-    pub numChildren: usize,
-
-    pub name: String,
-    pub publicId: String,
-    pub systemId: String,
-
+    pub node_type: u16,
+    pub node_name: String,
+    pub node_value: Option<String>,
+    pub num_children: usize,
     pub attrs: Vec<AttrInfo>,
-
-    pub isDocumentElement: bool,
-
-    pub shortValue: String,
-    pub incompleteValue: bool,
+    pub is_top_level_document: bool,
 }
 
 pub struct StartedTimelineMarker {
     name: String,
-    start_time: PreciseTime,
+    start_time: CrossProcessInstant,
     start_stack: Option<Vec<()>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TimelineMarker {
     pub name: String,
-    pub start_time: PreciseTime,
+    pub start_time: CrossProcessInstant,
     pub start_stack: Option<Vec<()>>,
-    pub end_time: PreciseTime,
+    pub end_time: CrossProcessInstant,
     pub end_stack: Option<Vec<()>>,
 }
 
@@ -160,29 +155,38 @@ pub enum TimelineMarkerType {
     DOMEvent,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeStyle {
+    pub name: String,
+    pub value: String,
+    pub priority: String,
+}
+
 /// The properties of a DOM node as computed by layout.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ComputedNodeLayout {
     pub display: String,
     pub position: String,
-    pub zIndex: String,
-    pub boxSizing: String,
+    pub z_index: String,
+    pub box_sizing: String,
 
-    pub autoMargins: AutoMargins,
-    pub marginTop: String,
-    pub marginRight: String,
-    pub marginBottom: String,
-    pub marginLeft: String,
+    pub auto_margins: AutoMargins,
+    pub margin_top: String,
+    pub margin_right: String,
+    pub margin_bottom: String,
+    pub margin_left: String,
 
-    pub borderTopWidth: String,
-    pub borderRightWidth: String,
-    pub borderBottomWidth: String,
-    pub borderLeftWidth: String,
+    pub border_top_width: String,
+    pub border_right_width: String,
+    pub border_bottom_width: String,
+    pub border_left_width: String,
 
-    pub paddingTop: String,
-    pub paddingRight: String,
-    pub paddingBottom: String,
-    pub paddingLeft: String,
+    pub padding_top: String,
+    pub padding_right: String,
+    pub padding_bottom: String,
+    pub padding_left: String,
 
     pub width: f32,
     pub height: f32,
@@ -208,10 +212,27 @@ pub enum DevtoolScriptControlMsg {
     GetDocumentElement(PipelineId, IpcSender<Option<NodeInfo>>),
     /// Retrieve the details of the child nodes of the given node in the given pipeline.
     GetChildren(PipelineId, String, IpcSender<Option<Vec<NodeInfo>>>),
+    /// Retrieve the CSS style properties defined in the attribute tag for the given node.
+    GetAttributeStyle(PipelineId, String, IpcSender<Option<Vec<NodeStyle>>>),
+    /// Retrieve the CSS style properties defined in an stylesheet for the given selector.
+    GetStylesheetStyle(
+        PipelineId,
+        String,
+        String,
+        usize,
+        IpcSender<Option<Vec<NodeStyle>>>,
+    ),
+    /// Retrieves the CSS selectors for the given node. A selector is comprised of the text
+    /// of the selector and the id of the stylesheet that contains it.
+    GetSelectors(PipelineId, String, IpcSender<Option<Vec<(String, usize)>>>),
+    /// Retrieve the computed CSS style properties for the given node.
+    GetComputedStyle(PipelineId, String, IpcSender<Option<Vec<NodeStyle>>>),
     /// Retrieve the computed layout properties of the given node in the given pipeline.
     GetLayout(PipelineId, String, IpcSender<Option<ComputedNodeLayout>>),
     /// Update a given node's attributes with a list of modifications.
-    ModifyAttribute(PipelineId, String, Vec<Modification>),
+    ModifyAttribute(PipelineId, String, Vec<AttrModification>),
+    /// Update a given node's style rules with a list of modifications.
+    ModifyRule(PipelineId, String, Vec<RuleModification>),
     /// Request live console messages for a given pipeline (true if desired, false otherwise).
     WantsLiveNotifications(PipelineId, bool),
     /// Request live notifications for a given set of timeline events for a given pipeline.
@@ -227,12 +248,26 @@ pub enum DevtoolScriptControlMsg {
     RequestAnimationFrame(PipelineId, String),
     /// Direct the given pipeline to reload the current page.
     Reload(PipelineId),
+    /// Gets the list of all allowed CSS rules and possible values.
+    GetCssDatabase(IpcSender<HashMap<String, CssDatabaseProperty>>),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Modification {
-    pub attributeName: String,
-    pub newValue: Option<String>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttrModification {
+    pub attribute_name: String,
+    pub new_value: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleModification {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub index: u32,
+    pub name: String,
+    pub value: String,
+    pub priority: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -246,12 +281,13 @@ pub enum LogLevel {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConsoleMessage {
     pub message: String,
-    pub logLevel: LogLevel,
+    pub log_level: LogLevel,
     pub filename: String,
-    pub lineNumber: usize,
-    pub columnNumber: usize,
+    pub line_number: usize,
+    pub column_number: usize,
 }
 
 bitflags! {
@@ -263,16 +299,17 @@ bitflags! {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PageError {
     #[serde(rename = "_type")]
     pub type_: String,
-    pub errorMessage: String,
-    pub sourceName: String,
-    pub lineText: String,
-    pub lineNumber: u32,
-    pub columnNumber: u32,
+    pub error_message: String,
+    pub source_name: String,
+    pub line_text: String,
+    pub line_number: u32,
+    pub column_number: u32,
     pub category: String,
-    pub timeStamp: u64,
+    pub time_stamp: u64,
     pub error: bool,
     pub warning: bool,
     pub exception: bool,
@@ -280,23 +317,21 @@ pub struct PageError {
     pub private: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ConsoleAPI {
-    #[serde(rename = "_type")]
-    pub type_: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ConsoleLog {
     pub level: String,
     pub filename: String,
-    pub lineNumber: u32,
-    pub functionName: String,
-    pub timeStamp: u64,
-    pub private: bool,
+    pub line_number: u32,
+    pub column_number: u32,
+    pub time_stamp: u64,
     pub arguments: Vec<String>,
+    // pub stacktrace: Vec<...>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CachedConsoleMessage {
     PageError(PageError),
-    ConsoleAPI(ConsoleAPI),
+    ConsoleLog(ConsoleLog),
 }
 
 #[derive(Debug, PartialEq)]
@@ -306,17 +341,17 @@ pub struct HttpRequest {
     pub headers: HeaderMap,
     pub body: Option<Vec<u8>>,
     pub pipeline_id: PipelineId,
-    pub startedDateTime: SystemTime,
-    pub timeStamp: i64,
-    pub connect_time: u64,
-    pub send_time: u64,
+    pub started_date_time: SystemTime,
+    pub time_stamp: i64,
+    pub connect_time: Duration,
+    pub send_time: Duration,
     pub is_xhr: bool,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct HttpResponse {
     pub headers: Option<HeaderMap>,
-    pub status: Option<(u16, Vec<u8>)>,
+    pub status: HttpStatus,
     pub body: Option<Vec<u8>>,
     pub pipeline_id: PipelineId,
 }
@@ -331,7 +366,7 @@ impl TimelineMarker {
     pub fn start(name: String) -> StartedTimelineMarker {
         StartedTimelineMarker {
             name,
-            start_time: PreciseTime::now(),
+            start_time: CrossProcessInstant::now(),
             start_stack: None,
         }
     }
@@ -343,30 +378,19 @@ impl StartedTimelineMarker {
             name: self.name,
             start_time: self.start_time,
             start_stack: self.start_stack,
-            end_time: PreciseTime::now(),
+            end_time: CrossProcessInstant::now(),
             end_stack: None,
         }
     }
 }
-
-/// A replacement for `time::PreciseTime` that isn't opaque, so we can serialize it.
-///
-/// The reason why this doesn't go upstream is that `time` is slated to be part of Rust's standard
-/// library, which definitely can't have any dependencies on `serde`. But `serde` can't implement
-/// `Deserialize` and `Serialize` itself, because `time::PreciseTime` is opaque! A Catch-22. So I'm
-/// duplicating the definition here.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub struct PreciseTime(u64);
-
-impl PreciseTime {
-    pub fn now() -> PreciseTime {
-        PreciseTime(time::precise_time_ns())
-    }
-
-    pub fn to(&self, later: PreciseTime) -> Duration {
-        Duration::from_nanos(later.0 - self.0)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct WorkerId(pub Uuid);
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CssDatabaseProperty {
+    pub is_inherited: bool,
+    pub values: Vec<String>,
+    pub supports: Vec<String>,
+    pub subproperties: Vec<String>,
+}

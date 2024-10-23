@@ -5,57 +5,49 @@
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
 
-use super::bindings::error::Fallible;
-use crate::dom::bindings::codegen::Bindings::WebGPUBinding::GPUValidationErrorMethods;
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
+use super::types::GPUError;
+use crate::dom::bindings::codegen::Bindings::WebGPUBinding::GPUValidationError_Binding::GPUValidationErrorMethods;
+use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct GPUValidationError {
-    reflector_: Reflector,
-    message: DOMString,
+    gpu_error: GPUError,
 }
 
 impl GPUValidationError {
     fn new_inherited(message: DOMString) -> Self {
         Self {
-            reflector_: Reflector::new(),
-            message,
+            gpu_error: GPUError::new_inherited(message),
         }
     }
 
-    pub fn new(global: &GlobalScope, message: DOMString) -> DomRoot<Self> {
-        Self::new_with_proto(global, None, message)
-    }
-
-    fn new_with_proto(
+    pub fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         message: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<Self> {
         reflect_dom_object_with_proto(
-            Box::new(GPUValidationError::new_inherited(message)),
+            Box::new(Self::new_inherited(message)),
             global,
             proto,
+            can_gc,
         )
-    }
-
-    /// <https://gpuweb.github.io/gpuweb/#dom-gpuvalidationerror-gpuvalidationerror>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        message: DOMString,
-    ) -> Fallible<DomRoot<Self>> {
-        Ok(GPUValidationError::new_with_proto(global, proto, message))
     }
 }
 
 impl GPUValidationErrorMethods for GPUValidationError {
-    /// <https://gpuweb.github.io/gpuweb/#dom-gpuvalidationerror-message>
-    fn Message(&self) -> DOMString {
-        self.message.clone()
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpuvalidationerror-gpuvalidationerror>
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        message: DOMString,
+    ) -> DomRoot<Self> {
+        Self::new_with_proto(global, proto, message, can_gc)
     }
 }

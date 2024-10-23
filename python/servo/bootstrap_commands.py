@@ -40,12 +40,18 @@ class MachCommands(CommandBase):
     @CommandArgument('--force', '-f',
                      action='store_true',
                      help='Boostrap without confirmation')
-    def bootstrap(self, force=False):
+    @CommandArgument('--skip-platform',
+                     action='store_true',
+                     help='Skip platform bootstrapping.')
+    @CommandArgument('--skip-lints',
+                     action='store_true',
+                     help='Skip tool necessary for linting.')
+    def bootstrap(self, force=False, skip_platform=False, skip_lints=False):
         # Note: This entry point isn't actually invoked by ./mach bootstrap.
         # ./mach bootstrap calls mach_bootstrap.bootstrap_command_only so that
         # it can install dependencies without needing mach's dependencies
         try:
-            servo.platform.get().bootstrap(force)
+            servo.platform.get().bootstrap(force, skip_platform, skip_lints)
         except NotImplementedError as exception:
             print(exception)
             return 1
@@ -246,7 +252,7 @@ class MachCommands(CommandBase):
         git_db_dir = path.join(git_dir, "db")
         git_checkout_dir = path.join(git_dir, "checkouts")
         if os.path.isdir(git_db_dir):
-            git_db_list = filter(lambda f: not f.startswith('.'), os.listdir(git_db_dir))
+            git_db_list = list(filter(lambda f: not f.startswith('.'), os.listdir(git_db_dir)))
         else:
             git_db_list = []
         if os.path.isdir(git_checkout_dir):

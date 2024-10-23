@@ -2,10 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::time::SystemTime;
+
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
 use net_traits::filemanager_thread::SelectedFile;
 use script_traits::serializable::BlobImpl;
+use time_03::{Duration, OffsetDateTime};
 
 use crate::dom::bindings::codegen::Bindings::FileBinding;
 use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
@@ -18,28 +21,23 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::blob::{blob_parts_to_bytes, normalize_type_string, Blob};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct File {
     blob: Blob,
     name: DOMString,
-    modified: i64,
+    modified: SystemTime,
 }
 
 impl File {
     #[allow(crown::unrooted_must_root)]
-    fn new_inherited(blob_impl: &BlobImpl, name: DOMString, modified: Option<i64>) -> File {
+    fn new_inherited(blob_impl: &BlobImpl, name: DOMString, modified: Option<SystemTime>) -> File {
         File {
             blob: Blob::new_inherited(blob_impl),
             name,
             // https://w3c.github.io/FileAPI/#dfn-lastModified
-            modified: match modified {
-                Some(m) => m,
-                None => {
-                    let time = time::get_time();
-                    time.sec * 1000 + (time.nsec / 1000000) as i64
-                },
-            },
+            modified: modified.unwrap_or_else(SystemTime::now),
         }
     }
 
@@ -47,9 +45,10 @@ impl File {
         global: &GlobalScope,
         blob_impl: BlobImpl,
         name: DOMString,
-        modified: Option<i64>,
+        modified: Option<SystemTime>,
+        can_gc: CanGc,
     ) -> DomRoot<File> {
-        Self::new_with_proto(global, None, blob_impl, name, modified)
+        Self::new_with_proto(global, None, blob_impl, name, modified, can_gc)
     }
 
     #[allow(crown::unrooted_must_root)]
@@ -58,19 +57,25 @@ impl File {
         proto: Option<HandleObject>,
         blob_impl: BlobImpl,
         name: DOMString,
-        modified: Option<i64>,
+        modified: Option<SystemTime>,
+        can_gc: CanGc,
     ) -> DomRoot<File> {
         let file = reflect_dom_object_with_proto(
             Box::new(File::new_inherited(&blob_impl, name, modified)),
             global,
             proto,
+            can_gc,
         );
         global.track_file(&file, blob_impl);
         file
     }
 
     // Construct from selected file message from file manager thread
-    pub fn new_from_selected(window: &Window, selected: SelectedFile) -> DomRoot<File> {
+    pub fn new_from_selected(
+        window: &Window,
+        selected: SelectedFile,
+        can_gc: CanGc,
+    ) -> DomRoot<File> {
         let name = DOMString::from(
             selected
                 .filename
@@ -87,15 +92,23 @@ impl File {
                 normalize_type_string(&selected.type_string.to_string()),
             ),
             name,
-            Some(selected.modified as i64),
+            Some(selected.modified),
+            can_gc,
         )
     }
 
+    pub fn name(&self) -> &DOMString {
+        &self.name
+    }
+}
+
+impl FileMethods for File {
     // https://w3c.github.io/FileAPI/#file-constructor
     #[allow(non_snake_case)]
-    pub fn Constructor(
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         fileBits: Vec<ArrayBufferOrArrayBufferViewOrBlobOrString>,
         filename: DOMString,
         filePropertyBag: &FileBinding::FilePropertyBag,
@@ -106,8 +119,11 @@ impl File {
         };
 
         let blobPropertyBag = &filePropertyBag.parent;
+        let modified = filePropertyBag
+            .lastModified
+            .map(|modified| OffsetDateTime::UNIX_EPOCH + Duration::milliseconds(modified))
+            .map(Into::into);
 
-        let modified = filePropertyBag.lastModified;
         // NOTE: Following behaviour might be removed in future,
         // see https://github.com/w3c/FileAPI/issues/41
         let replaced_filename = DOMString::from_string(filename.replace('/', ":"));
@@ -118,15 +134,10 @@ impl File {
             BlobImpl::new_from_bytes(bytes, type_string),
             replaced_filename,
             modified,
+            can_gc,
         ))
     }
 
-    pub fn name(&self) -> &DOMString {
-        &self.name
-    }
-}
-
-impl FileMethods for File {
     // https://w3c.github.io/FileAPI/#dfn-name
     fn Name(&self) -> DOMString {
         self.name.clone()
@@ -134,6 +145,9 @@ impl FileMethods for File {
 
     // https://w3c.github.io/FileAPI/#dfn-lastModified
     fn LastModified(&self) -> i64 {
-        self.modified
+        // This is first converted to a `time::OffsetDateTime` because it might be from before the
+        // Unix epoch in which case we will need to return a negative duration to script.
+        (OffsetDateTime::from(self.modified) - OffsetDateTime::UNIX_EPOCH).whole_milliseconds()
+            as i64
     }
 }

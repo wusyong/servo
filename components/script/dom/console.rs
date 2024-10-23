@@ -14,6 +14,7 @@ use js::rust::wrappers::{
 };
 use js::rust::{describe_scripted_caller, HandleValue, IdVector};
 
+use crate::dom::bindings::codegen::Bindings::ConsoleBinding::consoleMethods;
 use crate::dom::bindings::conversions::jsstring_to_str;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::str::DOMString;
@@ -37,10 +38,10 @@ impl Console {
                 unsafe { describe_scripted_caller(*GlobalScope::get_cx()) }.unwrap_or_default();
             let console_message = ConsoleMessage {
                 message,
-                logLevel: level,
+                log_level: level,
                 filename: caller.filename,
-                lineNumber: caller.line as usize,
-                columnNumber: caller.col as usize,
+                line_number: caller.line as usize,
+                column_number: caller.col as usize,
             };
             let worker_id = global
                 .downcast::<WorkerGlobalScope>()
@@ -52,6 +53,11 @@ impl Console {
             );
             chan.send(devtools_message).unwrap();
         }
+    }
+
+    // Directly logs a DOMString, without processing the message
+    pub fn internal_warn(global: &GlobalScope, message: DOMString) {
+        console_message(global, message, LogLevel::Warn)
     }
 }
 
@@ -72,8 +78,13 @@ where
 #[allow(unsafe_code)]
 unsafe fn handle_value_to_string(cx: *mut jsapi::JSContext, value: HandleValue) -> DOMString {
     rooted!(in(cx) let mut js_string = std::ptr::null_mut::<jsapi::JSString>());
-    js_string.set(JS_ValueToSource(cx, value));
-    jsstring_to_str(cx, *js_string)
+    match std::ptr::NonNull::new(JS_ValueToSource(cx, value)) {
+        Some(js_str) => {
+            js_string.set(js_str.as_ptr());
+            jsstring_to_str(cx, js_str)
+        },
+        None => "<error converting value to string>".into(),
+    }
 }
 
 #[allow(unsafe_code)]
@@ -81,7 +92,7 @@ fn stringify_handle_value(message: HandleValue) -> DOMString {
     let cx = *GlobalScope::get_cx();
     unsafe {
         if message.is_string() {
-            return jsstring_to_str(cx, message.to_string());
+            return jsstring_to_str(cx, std::ptr::NonNull::new(message.to_string()).unwrap());
         }
         unsafe fn stringify_object_from_handle_value(
             cx: *mut jsapi::JSContext,
@@ -216,45 +227,40 @@ fn console_message(global: &GlobalScope, message: DOMString, level: LogLevel) {
     })
 }
 
-#[allow(non_snake_case)]
-impl Console {
+impl consoleMethods for Console {
     // https://developer.mozilla.org/en-US/docs/Web/API/Console/log
-    pub fn Log(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
+    fn Log(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         console_messages(global, messages, LogLevel::Log)
     }
 
     // https://developer.mozilla.org/en-US/docs/Web/API/Console/clear
-    pub fn Clear(global: &GlobalScope) {
+    fn Clear(global: &GlobalScope) {
         let message: Vec<HandleValue> = Vec::new();
         console_messages(global, message, LogLevel::Clear)
     }
 
     // https://developer.mozilla.org/en-US/docs/Web/API/Console
-    pub fn Debug(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
+    fn Debug(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         console_messages(global, messages, LogLevel::Debug)
     }
 
     // https://developer.mozilla.org/en-US/docs/Web/API/Console/info
-    pub fn Info(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
+    fn Info(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         console_messages(global, messages, LogLevel::Info)
     }
 
     // https://developer.mozilla.org/en-US/docs/Web/API/Console/warn
-    pub fn Warn(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
+    fn Warn(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         console_messages(global, messages, LogLevel::Warn)
-    }
-    // Directly logs a DOMString, without processing the message
-    pub fn internal_warn(global: &GlobalScope, message: DOMString) {
-        console_message(global, message, LogLevel::Warn)
     }
 
     // https://developer.mozilla.org/en-US/docs/Web/API/Console/error
-    pub fn Error(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
+    fn Error(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         console_messages(global, messages, LogLevel::Error)
     }
 
     // https://developer.mozilla.org/en-US/docs/Web/API/Console/assert
-    pub fn Assert(_cx: JSContext, global: &GlobalScope, condition: bool, message: HandleValue) {
+    fn Assert(_cx: JSContext, global: &GlobalScope, condition: bool, message: HandleValue) {
         if !condition {
             let message = if message.is_undefined() {
                 DOMString::from("no message")
@@ -266,46 +272,57 @@ impl Console {
         };
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console/time
-    pub fn Time(global: &GlobalScope, label: DOMString) {
+    // https://console.spec.whatwg.org/#time
+    fn Time(global: &GlobalScope, label: DOMString) {
         if let Ok(()) = global.time(label.clone()) {
-            let message = DOMString::from(format!("{}: timer started", label));
+            let message = DOMString::from(format!("{label}: timer started"));
             console_message(global, message, LogLevel::Log);
         }
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console/timeEnd
-    pub fn TimeEnd(global: &GlobalScope, label: DOMString) {
+    // https://console.spec.whatwg.org/#timelog
+    fn TimeLog(_cx: JSContext, global: &GlobalScope, label: DOMString, data: Vec<HandleValue>) {
+        if let Ok(delta) = global.time_log(&label) {
+            let message = DOMString::from(format!(
+                "{label}: {delta}ms {}",
+                stringify_handle_values(data)
+            ));
+            console_message(global, message, LogLevel::Log);
+        }
+    }
+
+    // https://console.spec.whatwg.org/#timeend
+    fn TimeEnd(global: &GlobalScope, label: DOMString) {
         if let Ok(delta) = global.time_end(&label) {
-            let message = DOMString::from(format!("{}: {}ms", label, delta));
+            let message = DOMString::from(format!("{label}: {delta}ms"));
             console_message(global, message, LogLevel::Log);
         }
     }
 
     // https://console.spec.whatwg.org/#group
-    pub fn Group(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
+    fn Group(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         global.push_console_group(stringify_handle_values(messages));
     }
 
     // https://console.spec.whatwg.org/#groupcollapsed
-    pub fn GroupCollapsed(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
+    fn GroupCollapsed(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         global.push_console_group(stringify_handle_values(messages));
     }
 
     // https://console.spec.whatwg.org/#groupend
-    pub fn GroupEnd(global: &GlobalScope) {
+    fn GroupEnd(global: &GlobalScope) {
         global.pop_console_group();
     }
 
     /// <https://console.spec.whatwg.org/#count>
-    pub fn Count(global: &GlobalScope, label: DOMString) {
+    fn Count(global: &GlobalScope, label: DOMString) {
         let count = global.increment_console_count(&label);
         let message = DOMString::from(format!("{label}: {count}"));
         console_message(global, message, LogLevel::Log);
     }
 
     /// <https://console.spec.whatwg.org/#countreset>
-    pub fn CountReset(global: &GlobalScope, label: DOMString) {
+    fn CountReset(global: &GlobalScope, label: DOMString) {
         if global.reset_console_count(&label).is_err() {
             Self::internal_warn(
                 global,

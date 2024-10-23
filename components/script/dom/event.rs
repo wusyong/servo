@@ -5,10 +5,10 @@
 use std::cell::Cell;
 use std::default::Default;
 
+use base::cross_process_instant::CrossProcessInstant;
 use devtools_traits::{TimelineMarker, TimelineMarkerType};
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
-use metrics::ToMs;
 use servo_atoms::Atom;
 
 use crate::dom::bindings::callback::ExceptionHandling;
@@ -16,7 +16,6 @@ use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::EventBinding;
 use crate::dom::bindings::codegen::Bindings::EventBinding::{EventConstants, EventMethods};
 use crate::dom::bindings::codegen::Bindings::PerformanceBinding::DOMHighResTimeStamp;
-use crate::dom::bindings::codegen::Bindings::PerformanceBinding::Performance_Binding::PerformanceMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
@@ -31,9 +30,9 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlinputelement::InputActivationState;
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::node::{Node, ShadowIncluding};
-use crate::dom::performance::reduce_timing_resolution;
 use crate::dom::virtualmethods::vtable_for;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 use crate::task::TaskOnce;
 
 #[dom_struct]
@@ -52,7 +51,8 @@ pub struct Event {
     trusted: Cell<bool>,
     dispatching: Cell<bool>,
     initialized: Cell<bool>,
-    precise_time_ns: u64,
+    #[no_trace]
+    time_stamp: CrossProcessInstant,
 }
 
 impl Event {
@@ -71,19 +71,20 @@ impl Event {
             trusted: Cell::new(false),
             dispatching: Cell::new(false),
             initialized: Cell::new(false),
-            precise_time_ns: time::precise_time_ns(),
+            time_stamp: CrossProcessInstant::now(),
         }
     }
 
-    pub fn new_uninitialized(global: &GlobalScope) -> DomRoot<Event> {
-        Self::new_uninitialized_with_proto(global, None)
+    pub fn new_uninitialized(global: &GlobalScope, can_gc: CanGc) -> DomRoot<Event> {
+        Self::new_uninitialized_with_proto(global, None, can_gc)
     }
 
     pub fn new_uninitialized_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<Event> {
-        reflect_dom_object_with_proto(Box::new(Event::new_inherited()), global, proto)
+        reflect_dom_object_with_proto(Box::new(Event::new_inherited()), global, proto, can_gc)
     }
 
     pub fn new(
@@ -91,8 +92,9 @@ impl Event {
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
+        can_gc: CanGc,
     ) -> DomRoot<Event> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable)
+        Self::new_with_proto(global, None, type_, bubbles, cancelable, can_gc)
     }
 
     fn new_with_proto(
@@ -101,28 +103,11 @@ impl Event {
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
+        can_gc: CanGc,
     ) -> DomRoot<Event> {
-        let event = Event::new_uninitialized_with_proto(global, proto);
+        let event = Event::new_uninitialized_with_proto(global, proto, can_gc);
         event.init_event(type_, bool::from(bubbles), bool::from(cancelable));
         event
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        type_: DOMString,
-        init: &EventBinding::EventInit,
-    ) -> Fallible<DomRoot<Event>> {
-        let bubbles = EventBubbles::from(init.bubbles);
-        let cancelable = EventCancelable::from(init.cancelable);
-        Ok(Event::new_with_proto(
-            global,
-            proto,
-            Atom::from(type_),
-            bubbles,
-            cancelable,
-        ))
     }
 
     pub fn init_event(&self, type_: Atom, bubbles: bool, cancelable: bool) {
@@ -183,6 +168,7 @@ impl Event {
         &self,
         target: &EventTarget,
         legacy_target_override: bool,
+        can_gc: CanGc,
         // TODO legacy_did_output_listeners_throw_flag for indexeddb
     ) -> EventStatus {
         // Step 1.
@@ -285,6 +271,7 @@ impl Event {
                 object,
                 self,
                 Some(ListenerPhase::Capturing),
+                can_gc,
             );
         }
 
@@ -304,6 +291,7 @@ impl Event {
                     object,
                     self,
                     Some(ListenerPhase::Bubbling),
+                    can_gc,
                 );
             }
         }
@@ -348,7 +336,7 @@ impl Event {
             if self.DefaultPrevented() {
                 activation_target.legacy_canceled_activation_behavior(pre_activation_result);
             } else {
-                activation_target.activation_behavior(self, target);
+                activation_target.activation_behavior(self, target, can_gc);
             }
         }
 
@@ -395,11 +383,31 @@ impl Event {
     /// <https://html.spec.whatwg.org/multipage/#fire-a-simple-event>
     pub fn fire(&self, target: &EventTarget) -> EventStatus {
         self.set_trusted(true);
-        target.dispatch_event(self)
+        target.dispatch_event(self, CanGc::note())
     }
 }
 
 impl EventMethods for Event {
+    /// <https://dom.spec.whatwg.org/#dom-event-event>
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        type_: DOMString,
+        init: &EventBinding::EventInit,
+    ) -> Fallible<DomRoot<Event>> {
+        let bubbles = EventBubbles::from(init.bubbles);
+        let cancelable = EventCancelable::from(init.cancelable);
+        Ok(Event::new_with_proto(
+            global,
+            proto,
+            Atom::from(type_),
+            bubbles,
+            cancelable,
+            can_gc,
+        ))
+    }
+
     /// <https://dom.spec.whatwg.org/#dom-event-eventphase>
     fn EventPhase(&self) -> u16 {
         self.phase.get() as u16
@@ -493,10 +501,9 @@ impl EventMethods for Event {
 
     /// <https://dom.spec.whatwg.org/#dom-event-timestamp>
     fn TimeStamp(&self) -> DOMHighResTimeStamp {
-        reduce_timing_resolution(
-            (self.precise_time_ns - (*self.global().performance().TimeOrigin()).round() as u64)
-                .to_ms(),
-        )
+        self.global()
+            .performance()
+            .to_dom_high_res_time_stamp(self.time_stamp)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-initevent>
@@ -611,7 +618,7 @@ impl TaskOnce for EventTask {
         let target = self.target.root();
         let bubbles = self.bubbles;
         let cancelable = self.cancelable;
-        target.fire_event_with_params(self.name, bubbles, cancelable);
+        target.fire_event_with_params(self.name, bubbles, cancelable, CanGc::note());
     }
 }
 
@@ -634,6 +641,7 @@ fn invoke(
     object: &EventTarget,
     event: &Event,
     phase: Option<ListenerPhase>,
+    can_gc: CanGc,
     // TODO legacy_output_did_listeners_throw for indexeddb
 ) {
     // Step 1: Until shadow DOM puts the event path in the
@@ -652,7 +660,7 @@ fn invoke(
     event.current_target.set(Some(object));
 
     // Step 6
-    let listeners = object.get_listeners_for(&event.type_(), phase);
+    let listeners = object.get_listeners_for(&event.type_(), phase, can_gc);
 
     // Step 7.
     let found = inner_invoke(timeline_window, object, event, &listeners);

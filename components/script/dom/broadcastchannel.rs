@@ -17,7 +17,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::structuredclone;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[dom_struct]
 pub struct BroadcastChannel {
@@ -29,25 +29,17 @@ pub struct BroadcastChannel {
 }
 
 impl BroadcastChannel {
-    /// <https://html.spec.whatwg.org/multipage/#broadcastchannel>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        name: DOMString,
-    ) -> DomRoot<BroadcastChannel> {
-        BroadcastChannel::new(global, proto, name)
-    }
-
     fn new(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         name: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<BroadcastChannel> {
         let channel = reflect_dom_object_with_proto(
             Box::new(BroadcastChannel::new_inherited(name)),
             global,
             proto,
+            can_gc,
         );
         global.track_broadcast_channel(&channel);
         channel
@@ -75,6 +67,16 @@ impl BroadcastChannel {
 }
 
 impl BroadcastChannelMethods for BroadcastChannel {
+    /// <https://html.spec.whatwg.org/multipage/#broadcastchannel>
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        name: DOMString,
+    ) -> DomRoot<BroadcastChannel> {
+        BroadcastChannel::new(global, proto, name, can_gc)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-postmessage>
     fn PostMessage(&self, cx: SafeJSContext, message: HandleValue) -> ErrorResult {
         // Step 3, if closed.

@@ -30,9 +30,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use app_units::{Au, MAX_AU};
+use base::print_tree::PrintTree;
 use bitflags::bitflags;
 use euclid::default::{Point2D, Rect, SideOffsets2D, Size2D};
-use gfx_traits::print_tree::PrintTree;
 use log::{debug, trace};
 use serde::{Serialize, Serializer};
 use servo_geometry::MaxRect;
@@ -46,7 +46,7 @@ use style::context::SharedStyleContext;
 use style::logical_geometry::{LogicalMargin, LogicalPoint, LogicalRect, LogicalSize, WritingMode};
 use style::properties::ComputedValues;
 use style::servo::restyle_damage::ServoRestyleDamage;
-use style::values::computed::{LengthPercentageOrAuto, MaxSize, Size};
+use style::values::computed::{Margin, MaxSize, Size};
 
 use crate::context::LayoutContext;
 use crate::display_list::items::DisplayListSection;
@@ -419,24 +419,24 @@ impl CandidateBSizeIterator {
         // If that is not determined yet by the time we need to resolve
         // `min-height` and `max-height`, percentage values are ignored.
 
-        let block_size = match fragment.style.content_block_size() {
-            Size::Auto => MaybeAuto::Auto,
-            Size::LengthPercentage(ref lp) => {
-                MaybeAuto::from_option(lp.maybe_to_used_value(block_container_block_size))
-            },
-        };
+        let block_size = MaybeAuto::from_option(
+            fragment
+                .style
+                .content_block_size()
+                .maybe_to_used_value(block_container_block_size),
+        );
 
-        let max_block_size = match fragment.style.max_block_size() {
-            MaxSize::None => None,
-            MaxSize::LengthPercentage(ref lp) => lp.maybe_to_used_value(block_container_block_size),
-        };
+        let max_block_size = fragment
+            .style
+            .max_block_size()
+            .maybe_to_used_value(block_container_block_size);
 
-        let min_block_size = match fragment.style.min_block_size() {
-            Size::Auto => MaybeAuto::Auto,
-            Size::LengthPercentage(ref lp) => {
-                MaybeAuto::from_option(lp.maybe_to_used_value(block_container_block_size))
-            },
-        }
+        let min_block_size = MaybeAuto::from_option(
+            fragment
+                .style
+                .min_block_size()
+                .maybe_to_used_value(block_container_block_size),
+        )
         .specified_or_zero();
 
         // If the style includes `box-sizing: border-box`, subtract the border and padding.
@@ -519,7 +519,7 @@ fn translate_including_floats(cur_b: &mut Au, delta: Au, floats: &mut Floats) {
 /// This is a traversal of an Absolute Flow tree.
 /// - Relatively positioned flows and the Root flow start new Absolute flow trees.
 /// - The kids of a flow in this tree will be the flows for which it is the
-/// absolute Containing Block.
+///   absolute Containing Block.
 /// - Thus, leaf nodes and inner non-root nodes are all Absolute Flows.
 ///
 /// A Flow tree can have several Absolute Flow trees (depending on the number
@@ -1402,13 +1402,14 @@ impl BlockFlow {
         let content_block_size = self.fragment.style().content_block_size();
 
         match content_block_size {
-            Size::Auto => {
+            Size::LengthPercentage(ref lp) => lp.maybe_to_used_value(containing_block_size),
+            _ => {
                 let container_size = containing_block_size?;
                 let (block_start, block_end) = {
                     let position = self.fragment.style().logical_position();
                     (
-                        MaybeAuto::from_style(position.block_start, container_size),
-                        MaybeAuto::from_style(position.block_end, container_size),
+                        MaybeAuto::from_inset(position.block_start, container_size),
+                        MaybeAuto::from_inset(position.block_end, container_size),
                     )
                 };
 
@@ -1421,11 +1422,11 @@ impl BlockFlow {
                         // calculated during assign-inline-size.
                         let margin = self.fragment.style().logical_margin();
                         let margin_block_start = match margin.block_start {
-                            LengthPercentageOrAuto::Auto => MaybeAuto::Auto,
+                            Margin::Auto => MaybeAuto::Auto,
                             _ => MaybeAuto::Specified(self.fragment.margin.block_start),
                         };
                         let margin_block_end = match margin.block_end {
-                            LengthPercentageOrAuto::Auto => MaybeAuto::Auto,
+                            Margin::Auto => MaybeAuto::Auto,
                             _ => MaybeAuto::Specified(self.fragment.margin.block_end),
                         };
 
@@ -1437,7 +1438,6 @@ impl BlockFlow {
                     (_, _) => None,
                 }
             },
-            Size::LengthPercentage(ref lp) => lp.maybe_to_used_value(containing_block_size),
         }
     }
 
@@ -1456,11 +1456,11 @@ impl BlockFlow {
             // calculated during assign-inline-size.
             let margin = self.fragment.style().logical_margin();
             let margin_block_start = match margin.block_start {
-                LengthPercentageOrAuto::Auto => MaybeAuto::Auto,
+                Margin::Auto => MaybeAuto::Auto,
                 _ => MaybeAuto::Specified(self.fragment.margin.block_start),
             };
             let margin_block_end = match margin.block_end {
-                LengthPercentageOrAuto::Auto => MaybeAuto::Auto,
+                Margin::Auto => MaybeAuto::Auto,
                 _ => MaybeAuto::Specified(self.fragment.margin.block_end),
             };
 
@@ -1469,8 +1469,8 @@ impl BlockFlow {
             {
                 let position = self.fragment.style().logical_position();
                 block_start =
-                    MaybeAuto::from_style(position.block_start, containing_block_block_size);
-                block_end = MaybeAuto::from_style(position.block_end, containing_block_block_size);
+                    MaybeAuto::from_inset(position.block_start, containing_block_block_size);
+                block_end = MaybeAuto::from_inset(position.block_end, containing_block_block_size);
             }
 
             let available_block_size =
@@ -2117,10 +2117,10 @@ impl BlockFlow {
         let offsets = self.fragment.style().logical_position();
         let as_margins = LogicalMargin::new(
             writing_mode,
-            MaybeAuto::from_style(offsets.block_start, containing_block_size.inline),
-            MaybeAuto::from_style(offsets.inline_end, containing_block_size.inline),
-            MaybeAuto::from_style(offsets.block_end, containing_block_size.inline),
-            MaybeAuto::from_style(offsets.inline_start, containing_block_size.inline),
+            MaybeAuto::from_inset(offsets.block_start, containing_block_size.inline),
+            MaybeAuto::from_inset(offsets.inline_end, containing_block_size.inline),
+            MaybeAuto::from_inset(offsets.block_end, containing_block_size.inline),
+            MaybeAuto::from_inset(offsets.inline_start, containing_block_size.inline),
         );
         as_margins.to_physical(writing_mode)
     }
@@ -2167,10 +2167,13 @@ impl Flow for BlockFlow {
         // If this block has a fixed width, just use that for the minimum and preferred width,
         // rather than bubbling up children inline width.
         // FIXME(emilio): This should probably be writing-mode-aware.
-        let consult_children = match self.fragment.style().get_position().width {
-            Size::Auto => true,
-            Size::LengthPercentage(ref lp) => lp.maybe_to_used_value(None).is_none(),
-        };
+        let consult_children = self
+            .fragment
+            .style()
+            .get_position()
+            .width
+            .maybe_to_used_value(None)
+            .is_none();
         self.bubble_inline_sizes_for_block(consult_children);
         self.fragment
             .restyle_damage
@@ -2675,7 +2678,6 @@ pub struct ISizeConstraintInput {
     pub inline_end_margin: MaybeAuto,
     pub inline_start: MaybeAuto,
     pub inline_end: MaybeAuto,
-    pub text_align: TextAlign,
     pub available_inline_size: Au,
 }
 
@@ -2686,7 +2688,6 @@ impl ISizeConstraintInput {
         inline_end_margin: MaybeAuto,
         inline_start: MaybeAuto,
         inline_end: MaybeAuto,
-        text_align: TextAlign,
         available_inline_size: Au,
     ) -> ISizeConstraintInput {
         ISizeConstraintInput {
@@ -2695,7 +2696,6 @@ impl ISizeConstraintInput {
             inline_end_margin,
             inline_start,
             inline_end,
-            text_align,
             available_inline_size,
         }
     }
@@ -2789,11 +2789,10 @@ pub trait ISizeAndMarginsComputer {
             containing_block_inline_size - block.fragment.border_padding.inline_start_end();
         ISizeConstraintInput::new(
             computed_inline_size,
-            MaybeAuto::from_style(margin.inline_start, containing_block_inline_size),
-            MaybeAuto::from_style(margin.inline_end, containing_block_inline_size),
-            MaybeAuto::from_style(position.inline_start, containing_block_inline_size),
-            MaybeAuto::from_style(position.inline_end, containing_block_inline_size),
-            style.get_inherited_text().text_align,
+            MaybeAuto::from_margin(margin.inline_start, containing_block_inline_size),
+            MaybeAuto::from_margin(margin.inline_end, containing_block_inline_size),
+            MaybeAuto::from_inset(position.inline_start, containing_block_inline_size),
+            MaybeAuto::from_inset(position.inline_end, containing_block_inline_size),
             available_inline_size,
         )
     }
@@ -3007,15 +3006,15 @@ pub trait ISizeAndMarginsComputer {
                 ) => {
                     // servo_left, servo_right, and servo_center are used to implement
                     // the "align descendants" rule in HTML5 § 14.2.
-                    if block_align == TextAlign::ServoCenter {
+                    if block_align == TextAlign::MozCenter {
                         // Ignore any existing margins, and make the inline-start and
                         // inline-end margins equal.
                         let margin = (available_inline_size - inline_size).scale_by(0.5);
                         (margin, inline_size, margin)
                     } else {
                         let ignore_end_margin = match block_align {
-                            TextAlign::ServoLeft => block_mode.is_bidi_ltr(),
-                            TextAlign::ServoRight => !block_mode.is_bidi_ltr(),
+                            TextAlign::MozLeft => block_mode.is_bidi_ltr(),
+                            TextAlign::MozRight => !block_mode.is_bidi_ltr(),
                             _ => parent_has_same_direction,
                         };
                         if ignore_end_margin {

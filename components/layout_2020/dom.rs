@@ -6,9 +6,9 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use atomic_refcell::{AtomicRef, AtomicRefCell, AtomicRefMut};
+use base::id::{BrowsingContextId, PipelineId};
 use html5ever::{local_name, namespace_url, ns};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image::base::Image as NetImage;
+use pixels::Image;
 use script_layout_interface::wrapper_traits::{
     LayoutDataTrait, LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
@@ -22,7 +22,8 @@ use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom_traversal::WhichPseudoElement;
 use crate::flexbox::FlexLevelBox;
-use crate::flow::inline::InlineLevelBox;
+use crate::flow::inline::inline_box::InlineBox;
+use crate::flow::inline::InlineItem;
 use crate::flow::BlockLevelBox;
 use crate::geom::PhysicalSize;
 use crate::replaced::{CanvasInfo, CanvasSource};
@@ -39,7 +40,9 @@ pub struct InnerDOMLayoutData {
 pub(super) enum LayoutBox {
     DisplayContents,
     BlockLevel(ArcRefCell<BlockLevelBox>),
-    InlineLevel(ArcRefCell<InlineLevelBox>),
+    #[allow(dead_code)]
+    InlineBox(ArcRefCell<InlineBox>),
+    InlineLevel(ArcRefCell<InlineItem>),
     FlexLevel(ArcRefCell<FlexLevelBox>),
 }
 
@@ -96,7 +99,7 @@ impl Drop for BoxSlot<'_> {
 pub(crate) trait NodeExt<'dom>: 'dom + LayoutNode<'dom> {
     /// Returns the image if it’s loaded, and its size in image pixels
     /// adjusted for `image_density`.
-    fn as_image(self) -> Option<(Option<Arc<NetImage>>, PhysicalSize<f64>)>;
+    fn as_image(self) -> Option<(Option<Arc<Image>>, PhysicalSize<f64>)>;
     fn as_canvas(self) -> Option<(CanvasInfo, PhysicalSize<f64>)>;
     fn as_iframe(self) -> Option<(PipelineId, BrowsingContextId)>;
     fn as_video(self) -> Option<(webrender_api::ImageKey, PhysicalSize<f64>)>;
@@ -117,7 +120,7 @@ impl<'dom, LayoutNodeType> NodeExt<'dom> for LayoutNodeType
 where
     LayoutNodeType: 'dom + LayoutNode<'dom>,
 {
-    fn as_image(self) -> Option<(Option<Arc<NetImage>>, PhysicalSize<f64>)> {
+    fn as_image(self) -> Option<(Option<Arc<Image>>, PhysicalSize<f64>)> {
         let node = self.to_threadsafe();
         let (resource, metadata) = node.image_data()?;
         let (width, height) = resource
@@ -146,9 +149,10 @@ where
         let source = match canvas_data.source {
             HTMLCanvasDataSource::WebGL(texture_id) => CanvasSource::WebGL(texture_id),
             HTMLCanvasDataSource::Image(ipc_sender) => {
-                CanvasSource::Image(ipc_sender.map(|renderer| Arc::new(Mutex::new(renderer))))
+                CanvasSource::Image(Arc::new(Mutex::new(ipc_sender)))
             },
             HTMLCanvasDataSource::WebGPU(image_key) => CanvasSource::WebGPU(image_key),
+            HTMLCanvasDataSource::Empty => CanvasSource::Empty,
         };
         Some((
             CanvasInfo {
@@ -173,13 +177,11 @@ where
         if self.type_id() != ScriptLayoutNodeType::Element(LayoutElementType::HTMLObjectElement) {
             return None;
         }
-        let Some(element) = self.to_threadsafe().as_element() else {
-            return None;
-        };
 
         // TODO: This is the what the legacy layout system does, but really if Servo
         // supports any `<object>` that's an image, it should support those with URLs
         // and `type` attributes with image mime types.
+        let element = self.to_threadsafe().as_element()?;
         if element.get_attr(&ns!(), &local_name!("type")).is_some() {
             return None;
         }

@@ -5,11 +5,11 @@
 use std::cell::RefCell;
 use std::mem;
 
-use euclid::default::Rect;
+use app_units::Au;
+use base::print_tree::PrintTree;
+use euclid::default::{Point2D, Rect, Size2D};
 use euclid::SideOffsets2D;
-use gfx_traits::print_tree::PrintTree;
 use log::warn;
-use script_traits::compositor::{ScrollSensitivity, ScrollTreeNodeId, ScrollableNodeInfo};
 use servo_arc::Arc as ServoArc;
 use servo_config::opts::DebugOptions;
 use style::computed_values::float::T as ComputedFloat;
@@ -17,6 +17,7 @@ use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::overflow_x::T as ComputedOverflow;
 use style::computed_values::position::T as ComputedPosition;
 use style::properties::ComputedValues;
+use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::{ClipRectOrAuto, Length};
 use style::values::generics::box_::Perspective;
 use style::values::generics::transform;
@@ -24,17 +25,19 @@ use style::values::specified::box_::DisplayOutside;
 use style::Zero;
 use webrender_api as wr;
 use webrender_api::units::{LayoutPoint, LayoutRect, LayoutTransform, LayoutVector2D};
+use webrender_traits::display_list::{ScrollSensitivity, ScrollTreeNodeId, ScrollableNodeInfo};
 use wr::units::{LayoutPixel, LayoutSize};
 use wr::{ClipChainId, SpatialTreeItemKey, StickyOffsetBounds};
 
+use super::clip_path::build_clip_path_clip_chain_if_necessary;
 use super::DisplayList;
 use crate::cell::ArcRefCell;
 use crate::display_list::conversions::{FilterToWebRender, ToWebRender};
-use crate::display_list::DisplayListBuilder;
+use crate::display_list::{BuilderForBoxFragment, DisplayListBuilder};
 use crate::fragment_tree::{
     BoxFragment, ContainingBlockManager, Fragment, FragmentFlags, FragmentTree, PositioningFragment,
 };
-use crate::geom::{PhysicalRect, PhysicalSides};
+use crate::geom::{AuOrAuto, PhysicalRect, PhysicalSides};
 use crate::style_ext::ComputedValuesExt;
 
 #[derive(Clone)]
@@ -53,12 +56,12 @@ pub(crate) struct ContainingBlock {
     clip_chain_id: wr::ClipChainId,
 
     /// The physical rect of this containing block.
-    rect: PhysicalRect<Length>,
+    rect: PhysicalRect<Au>,
 }
 
 impl ContainingBlock {
     pub(crate) fn new(
-        rect: PhysicalRect<Length>,
+        rect: PhysicalRect<Au>,
         scroll_node_id: ScrollTreeNodeId,
         scroll_frame_size: Option<LayoutSize>,
         clip_chain_id: wr::ClipChainId,
@@ -71,7 +74,7 @@ impl ContainingBlock {
         }
     }
 
-    pub(crate) fn new_replacing_rect(&self, rect: &PhysicalRect<Length>) -> Self {
+    pub(crate) fn new_replacing_rect(&self, rect: &PhysicalRect<Au>) -> Self {
         ContainingBlock {
             rect: *rect,
             ..*self
@@ -226,6 +229,7 @@ impl DisplayList {
             horizontal_offset_bounds,
             LayoutVector2D::zero(), /* previously_applied_offset */
             spatial_tree_item_key,
+            None, /* transform */
         );
         self.compositor_info.scroll_tree.add_scroll_tree_node(
             Some(parent_scroll_node_id),
@@ -246,7 +250,7 @@ pub(crate) enum StackingContextContent {
         reference_frame_scroll_node_id: ScrollTreeNodeId,
         clip_chain_id: wr::ClipChainId,
         section: StackingContextSection,
-        containing_block: PhysicalRect<Length>,
+        containing_block: PhysicalRect<Au>,
         fragment: ArcRefCell<Fragment>,
     },
 
@@ -313,8 +317,11 @@ pub struct StackingContext {
     /// The clip chain id of this stacking context if it has one. Used for filter clipping.
     clip_chain_id: Option<wr::ClipChainId>,
 
-    /// The fragment that established this stacking context.
+    /// The style of the fragment that established this stacking context.
     initializing_fragment_style: Option<ServoArc<ComputedValues>>,
+
+    /// The [`FragmentFlags`] of the [`Fragment`] that established this stacking context.
+    initializing_fragment_flags: FragmentFlags,
 
     /// The type of this stacking context. Used for collecting and sorting.
     context_type: StackingContextType,
@@ -374,6 +381,7 @@ impl StackingContext {
         spatial_id: wr::SpatialId,
         clip_chain_id: wr::ClipChainId,
         initializing_fragment_style: ServoArc<ComputedValues>,
+        initializing_fragment_flags: FragmentFlags,
         context_type: StackingContextType,
     ) -> Self {
         // WebRender has two different ways of expressing "no clip." ClipChainId::INVALID should be
@@ -388,6 +396,7 @@ impl StackingContext {
             spatial_id,
             clip_chain_id,
             initializing_fragment_style: Some(initializing_fragment_style),
+            initializing_fragment_flags,
             context_type,
             contents: vec![],
             real_stacking_contexts_and_positioned_stacking_containers: vec![],
@@ -402,6 +411,7 @@ impl StackingContext {
             spatial_id: wr::SpaceAndClipInfo::root_scroll(wr.pipeline_id).spatial_id,
             clip_chain_id: None,
             initializing_fragment_style: None,
+            initializing_fragment_flags: FragmentFlags::empty(),
             context_type: StackingContextType::RealStackingContext,
             contents: vec![],
             real_stacking_contexts_and_positioned_stacking_containers: vec![],
@@ -431,7 +441,9 @@ impl StackingContext {
     fn z_index(&self) -> i32 {
         self.initializing_fragment_style
             .as_ref()
-            .map_or(0, |style| style.effective_z_index())
+            .map_or(0, |style| {
+                style.effective_z_index(self.initializing_fragment_flags)
+            })
     }
 
     pub(crate) fn sort(&mut self) {
@@ -478,7 +490,8 @@ impl StackingContext {
         if effects.filter.0.is_empty() &&
             effects.opacity == 1.0 &&
             effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
-            !style.has_transform_or_perspective(FragmentFlags::empty())
+            !style.has_transform_or_perspective(FragmentFlags::empty()) &&
+            style.clone_clip_path() == ClipPath::None
         {
             return false;
         }
@@ -528,7 +541,7 @@ impl StackingContext {
         &self,
         builder: &mut DisplayListBuilder,
         fragment_tree: &crate::FragmentTree,
-        containing_block_rect: &PhysicalRect<Length>,
+        containing_block_rect: &PhysicalRect<Au>,
     ) {
         let style = if let Some(style) = &fragment_tree.canvas_background.style {
             style
@@ -644,8 +657,7 @@ impl StackingContext {
             }
         }
 
-        let mut fragment_builder =
-            super::BuilderForBoxFragment::new(box_fragment, containing_block);
+        let mut fragment_builder = BuilderForBoxFragment::new(box_fragment, containing_block);
         let painter = super::background::BackgroundPainter {
             style,
             painting_area_override: Some(painting_area),
@@ -666,7 +678,7 @@ impl StackingContext {
 
         // Steps 1 and 2: Borders and background for the root
         let mut contents = self.contents.iter().enumerate().peekable();
-        while contents.peek().map_or(false, |(_, child)| {
+        while contents.peek().is_some_and(|(_, child)| {
             child.section() == StackingContextSection::OwnBackgroundsAndBorders
         }) {
             let (i, child) = contents.next().unwrap();
@@ -682,7 +694,7 @@ impl StackingContext {
             .peekable();
         while real_stacking_contexts_and_positioned_stacking_containers
             .peek()
-            .map_or(false, |(_, child)| child.z_index() < 0)
+            .is_some_and(|(_, child)| child.z_index() < 0)
         {
             let (i, child) = real_stacking_contexts_and_positioned_stacking_containers
                 .next()
@@ -695,7 +707,7 @@ impl StackingContext {
         }
 
         // Step 4: Block backgrounds and borders
-        while contents.peek().map_or(false, |(_, child)| {
+        while contents.peek().is_some_and(|(_, child)| {
             child.section() == StackingContextSection::DescendantBackgroundsAndBorders
         }) {
             let (i, child) = contents.next().unwrap();
@@ -710,9 +722,10 @@ impl StackingContext {
         }
 
         // Steps 6 and 7: Fragments and inline stacking containers
-        while contents.peek().map_or(false, |(_, child)| {
-            child.section() == StackingContextSection::Foreground
-        }) {
+        while contents
+            .peek()
+            .is_some_and(|(_, child)| child.section() == StackingContextSection::Foreground)
+        {
             let (i, child) = contents.next().unwrap();
             self.debug_push_print_item(DebugPrintField::Contents, i);
             child.build_display_list(builder, &self.atomic_inline_stacking_containers);
@@ -729,9 +742,10 @@ impl StackingContext {
         }
 
         // Step 10: Outline
-        while contents.peek().map_or(false, |(_, child)| {
-            child.section() == StackingContextSection::Outline
-        }) {
+        while contents
+            .peek()
+            .is_some_and(|(_, child)| child.section() == StackingContextSection::Outline)
+        {
             let (i, child) = contents.next().unwrap();
             self.debug_push_print_item(DebugPrintField::Contents, i);
             child.build_display_list(builder, &self.atomic_inline_stacking_containers);
@@ -896,7 +910,7 @@ impl Fragment {
 }
 
 struct ReferenceFrameData {
-    origin: crate::geom::PhysicalPoint<Length>,
+    origin: crate::geom::PhysicalPoint<Au>,
     transform: LayoutTransform,
     kind: wr::ReferenceFrameKind,
 }
@@ -1049,10 +1063,23 @@ impl BoxFragment {
             );
         }
 
+        // `clip-path` needs to be applied before filters and creates a stacking context, so it can be
+        // applied directly to the stacking context itself.
+        // before
+        let stacking_context_clip_chain_id = build_clip_path_clip_chain_if_necessary(
+            self.style.clone_clip_path(),
+            display_list,
+            &containing_block.scroll_node_id,
+            &containing_block.clip_chain_id,
+            BuilderForBoxFragment::new(self, &containing_block.rect),
+        )
+        .unwrap_or(containing_block.clip_chain_id);
+
         let mut child_stacking_context = parent_stacking_context.create_descendant(
             containing_block.scroll_node_id.spatial_id,
-            containing_block.clip_chain_id,
+            stacking_context_clip_chain_id,
             self.style.clone(),
+            self.base.flags,
             context_type,
         );
         self.build_stacking_context_tree_for_children(
@@ -1107,6 +1134,16 @@ impl BoxFragment {
             &new_scroll_node_id,
             &new_clip_chain_id,
             &containing_block.rect,
+        ) {
+            new_clip_chain_id = clip_chain_id;
+        }
+
+        if let Some(clip_chain_id) = build_clip_path_clip_chain_if_necessary(
+            self.style.clone_clip_path(),
+            display_list,
+            &new_scroll_node_id,
+            &new_clip_chain_id,
+            BuilderForBoxFragment::new(self, &containing_block.rect),
         ) {
             new_clip_chain_id = clip_chain_id;
         }
@@ -1167,11 +1204,9 @@ impl BoxFragment {
 
         let padding_rect = self
             .padding_rect()
-            .to_physical(self.style.writing_mode, &containing_block.rect)
             .translate(containing_block.rect.origin.to_vector());
         let content_rect = self
             .content_rect
-            .to_physical(self.style.writing_mode, &containing_block.rect)
             .translate(containing_block.rect.origin.to_vector());
 
         let for_absolute_descendants = ContainingBlock::new(
@@ -1220,7 +1255,7 @@ impl BoxFragment {
         display_list: &mut DisplayList,
         parent_scroll_node_id: &ScrollTreeNodeId,
         parent_clip_chain_id: &wr::ClipChainId,
-        containing_block_rect: &PhysicalRect<Length>,
+        containing_block_rect: &PhysicalRect<Au>,
     ) -> Option<wr::ClipChainId> {
         let position = self.style.get_box().position;
         // https://drafts.csswg.org/css2/#clipping
@@ -1235,9 +1270,7 @@ impl BoxFragment {
             _ => return None,
         };
 
-        let border_rect = self
-            .border_rect()
-            .to_physical(self.style.writing_mode, containing_block_rect);
+        let border_rect = self.border_rect();
         let clip_rect = clip_rect
             .for_border_rect(border_rect)
             .translate(containing_block_rect.origin.to_vector())
@@ -1254,10 +1287,9 @@ impl BoxFragment {
         display_list: &mut DisplayList,
         parent_scroll_node_id: &ScrollTreeNodeId,
         parent_clip_id: &wr::ClipChainId,
-        containing_block_rect: &PhysicalRect<Length>,
+        containing_block_rect: &PhysicalRect<Au>,
     ) -> Option<(ScrollTreeNodeId, wr::ClipChainId, LayoutSize)> {
-        let overflow_x = self.style.get_box().overflow_x;
-        let overflow_y = self.style.get_box().overflow_y;
+        let overflow = self.style.effective_overflow();
         if !self.style.establishes_scroll_container() {
             return None;
         }
@@ -1287,7 +1319,7 @@ impl BoxFragment {
         );
 
         let sensitivity =
-            if ComputedOverflow::Hidden == overflow_x && ComputedOverflow::Hidden == overflow_y {
+            if ComputedOverflow::Hidden == overflow.x && ComputedOverflow::Hidden == overflow.y {
                 ScrollSensitivity::Script
             } else {
                 ScrollSensitivity::ScriptAndInputEvents
@@ -1295,7 +1327,6 @@ impl BoxFragment {
 
         let padding_rect = self
             .padding_rect()
-            .to_physical(self.style.writing_mode, containing_block_rect)
             .translate(containing_block_rect.origin.to_vector())
             .to_webrender();
 
@@ -1303,8 +1334,7 @@ impl BoxFragment {
             parent_scroll_node_id,
             parent_clip_id,
             external_id,
-            self.scrollable_overflow(containing_block_rect)
-                .to_webrender(),
+            self.scrollable_overflow().to_webrender(),
             padding_rect,
             sensitivity,
         );
@@ -1316,7 +1346,7 @@ impl BoxFragment {
         &mut self,
         display_list: &mut DisplayList,
         parent_scroll_node_id: &ScrollTreeNodeId,
-        containing_block_rect: &PhysicalRect<Length>,
+        containing_block_rect: &PhysicalRect<Au>,
         scroll_frame_size: &Option<LayoutSize>,
     ) -> Option<ScrollTreeNodeId> {
         if self.style.get_box().position != ComputedPosition::Sticky {
@@ -1334,20 +1364,14 @@ impl BoxFragment {
         // Percentages sticky positions offsets are resovled against the size of the
         // nearest scroll frame instead of the containing block like for other types
         // of positioning.
-        let position = self.style.get_position();
-        let offsets = PhysicalSides::new(
-            position
-                .top
-                .map(|v| v.resolve(Length::new(scroll_frame_size_for_resolve.height))),
-            position
-                .right
-                .map(|v| v.resolve(Length::new(scroll_frame_size_for_resolve.width))),
-            position
-                .bottom
-                .map(|v| v.resolve(Length::new(scroll_frame_size_for_resolve.height))),
-            position
-                .left
-                .map(|v| v.resolve(Length::new(scroll_frame_size_for_resolve.width))),
+        let scroll_frame_height = Au::from_f32_px(scroll_frame_size_for_resolve.height);
+        let scroll_frame_width = Au::from_f32_px(scroll_frame_size_for_resolve.width);
+        let offsets = self.style.physical_box_offsets();
+        let offsets = PhysicalSides::<AuOrAuto>::new(
+            offsets.top.map(|v| v.to_used_value(scroll_frame_height)),
+            offsets.right.map(|v| v.to_used_value(scroll_frame_width)),
+            offsets.bottom.map(|v| v.to_used_value(scroll_frame_height)),
+            offsets.left.map(|v| v.to_used_value(scroll_frame_width)),
         );
         self.resolved_sticky_insets = Some(offsets);
 
@@ -1365,7 +1389,6 @@ impl BoxFragment {
 
         let frame_rect = self
             .border_rect()
-            .to_physical(self.style.writing_mode, containing_block_rect)
             .translate(containing_block_rect.origin.to_vector())
             .to_webrender();
 
@@ -1385,10 +1408,10 @@ impl BoxFragment {
         );
 
         let margins = SideOffsets2D::new(
-            offsets.top.non_auto().map(|v| v.px()),
-            offsets.right.non_auto().map(|v| v.px()),
-            offsets.bottom.non_auto().map(|v| v.px()),
-            offsets.left.non_auto().map(|v| v.px()),
+            offsets.top.non_auto().map(|v| v.to_f32_px()),
+            offsets.right.non_auto().map(|v| v.to_f32_px()),
+            offsets.bottom.non_auto().map(|v| v.to_f32_px()),
+            offsets.left.non_auto().map(|v| v.to_f32_px()),
         );
 
         let sticky_node_id = display_list.define_sticky_frame(
@@ -1405,15 +1428,13 @@ impl BoxFragment {
     /// Optionally returns the data for building a reference frame, without yet building it.
     fn reference_frame_data_if_necessary(
         &self,
-        containing_block_rect: &PhysicalRect<Length>,
+        containing_block_rect: &PhysicalRect<Au>,
     ) -> Option<ReferenceFrameData> {
         if !self.style.has_transform_or_perspective(self.base.flags) {
             return None;
         }
 
-        let relative_border_rect = self
-            .border_rect()
-            .to_physical(self.style.writing_mode, containing_block_rect);
+        let relative_border_rect = self.border_rect();
         let border_rect = relative_border_rect.translate(containing_block_rect.origin.to_vector());
         let untyped_border_rect = border_rect.to_untyped();
 
@@ -1451,22 +1472,24 @@ impl BoxFragment {
     }
 
     /// Returns true if the given style contains a transform that is not invertible.
-    fn has_non_invertible_transform_or_zero_scale(&self, containing_block: &Rect<Length>) -> bool {
+    fn has_non_invertible_transform_or_zero_scale(&self, containing_block: &Rect<Au>) -> bool {
         let list = &self.style.get_box().transform;
-        match list.to_transform_3d_matrix(Some(containing_block)) {
+        match list.to_transform_3d_matrix(Some(&au_rect_to_length_rect(containing_block))) {
             Ok(t) => !t.0.is_invertible() || t.0.m11 == 0. || t.0.m22 == 0.,
             Err(_) => false,
         }
     }
 
     /// Returns the 4D matrix representing this fragment's transform.
-    pub fn calculate_transform_matrix(
-        &self,
-        border_rect: &Rect<Length>,
-    ) -> Option<LayoutTransform> {
+    pub fn calculate_transform_matrix(&self, border_rect: &Rect<Au>) -> Option<LayoutTransform> {
         let list = &self.style.get_box().transform;
-        let transform =
-            LayoutTransform::from_untyped(&list.to_transform_3d_matrix(Some(border_rect)).ok()?.0);
+
+        let transform = LayoutTransform::from_untyped(
+            &list
+                .to_transform_3d_matrix(Some(&au_rect_to_length_rect(border_rect)))
+                .ok()?
+                .0,
+        );
         // WebRender will end up dividing by the scale value of this transform, so we
         // want to ensure we don't feed it a divisor of 0.
         assert_ne!(transform.m11, 0.);
@@ -1475,12 +1498,12 @@ impl BoxFragment {
         let transform_origin = &self.style.get_box().transform_origin;
         let transform_origin_x = transform_origin
             .horizontal
-            .percentage_relative_to(border_rect.size.width)
-            .px();
+            .to_used_value(border_rect.size.width)
+            .to_f32_px();
         let transform_origin_y = transform_origin
             .vertical
-            .percentage_relative_to(border_rect.size.height)
-            .px();
+            .to_used_value(border_rect.size.height)
+            .to_f32_px();
         let transform_origin_z = transform_origin.depth.px();
 
         let pre_transform = LayoutTransform::translation(
@@ -1498,21 +1521,18 @@ impl BoxFragment {
     }
 
     /// Returns the 4D matrix representing this fragment's perspective.
-    pub fn calculate_perspective_matrix(
-        &self,
-        border_rect: &Rect<Length>,
-    ) -> Option<LayoutTransform> {
+    pub fn calculate_perspective_matrix(&self, border_rect: &Rect<Au>) -> Option<LayoutTransform> {
         match self.style.get_box().perspective {
             Perspective::Length(length) => {
                 let perspective_origin = &self.style.get_box().perspective_origin;
                 let perspective_origin = LayoutPoint::new(
                     perspective_origin
                         .horizontal
-                        .percentage_relative_to(border_rect.size.width)
+                        .percentage_relative_to(border_rect.size.width.into())
                         .px(),
                     perspective_origin
                         .vertical
-                        .percentage_relative_to(border_rect.size.height)
+                        .percentage_relative_to(border_rect.size.height.into())
                         .px(),
                 );
 
@@ -1546,7 +1566,6 @@ impl PositioningFragment {
     ) {
         let rect = self
             .rect
-            .to_physical(self.writing_mode, &containing_block.rect)
             .translate(containing_block.rect.origin.to_vector());
         let new_containing_block = containing_block.new_replacing_rect(&rect);
         let new_containing_block_info =
@@ -1562,4 +1581,11 @@ impl PositioningFragment {
             );
         }
     }
+}
+
+pub fn au_rect_to_length_rect(rect: &Rect<Au>) -> Rect<Length> {
+    Rect::new(
+        Point2D::new(rect.origin.x.into(), rect.origin.y.into()),
+        Size2D::new(rect.size.width.into(), rect.size.height.into()),
+    )
 }

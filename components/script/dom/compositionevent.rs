@@ -15,6 +15,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::uievent::UIEvent;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct CompositionEvent {
@@ -34,6 +35,7 @@ impl CompositionEvent {
         reflect_dom_object(Box::new(CompositionEvent::new_inherited()), window)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         window: &Window,
         type_: DOMString,
@@ -42,9 +44,10 @@ impl CompositionEvent {
         view: Option<&Window>,
         detail: i32,
         data: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<CompositionEvent> {
         Self::new_with_proto(
-            window, None, type_, can_bubble, cancelable, view, detail, data,
+            window, None, type_, can_bubble, cancelable, view, detail, data, can_gc,
         )
     }
 
@@ -58,6 +61,7 @@ impl CompositionEvent {
         view: Option<&Window>,
         detail: i32,
         data: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<CompositionEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(CompositionEvent {
@@ -66,16 +70,24 @@ impl CompositionEvent {
             }),
             window,
             proto,
+            can_gc,
         );
         ev.uievent
             .InitUIEvent(type_, can_bubble, cancelable, view, detail);
         ev
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+}
+
+impl CompositionEventMethods for CompositionEvent {
+    // https://w3c.github.io/uievents/#dom-compositionevent-compositionevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &CompositionEventBinding::CompositionEventInit,
     ) -> Fallible<DomRoot<CompositionEvent>> {
@@ -88,16 +100,11 @@ impl CompositionEvent {
             init.parent.view.as_deref(),
             init.parent.detail,
             init.data.clone(),
+            can_gc,
         );
         Ok(event)
     }
 
-    pub fn data(&self) -> &str {
-        &self.data
-    }
-}
-
-impl CompositionEventMethods for CompositionEvent {
     // https://w3c.github.io/uievents/#dom-compositionevent-data
     fn Data(&self) -> DOMString {
         self.data.clone()

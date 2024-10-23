@@ -21,6 +21,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::texttrack::TextTrack;
 use crate::dom::videotrack::VideoTrack;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[crown::unrooted_must_root_lint::must_root]
 #[derive(JSTraceable, MallocSizeOf)]
@@ -36,9 +37,8 @@ pub struct TrackEvent {
     track: Option<MediaTrack>,
 }
 
-#[allow(non_snake_case)]
 impl TrackEvent {
-    #[allow(crown::unrooted_must_root)]
+    #[allow(crown::unrooted_must_root, non_snake_case)]
     fn new_inherited(track: &Option<VideoTrackOrAudioTrackOrTextTrack>) -> TrackEvent {
         let media_track = match track {
             Some(VideoTrackOrAudioTrackOrTextTrack::VideoTrack(VideoTrack)) => {
@@ -65,8 +65,9 @@ impl TrackEvent {
         bubbles: bool,
         cancelable: bool,
         track: &Option<VideoTrackOrAudioTrackOrTextTrack>,
+        can_gc: CanGc,
     ) -> DomRoot<TrackEvent> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable, track)
+        Self::new_with_proto(global, None, type_, bubbles, cancelable, track, can_gc)
     }
 
     fn new_with_proto(
@@ -76,11 +77,13 @@ impl TrackEvent {
         bubbles: bool,
         cancelable: bool,
         track: &Option<VideoTrackOrAudioTrackOrTextTrack>,
+        can_gc: CanGc,
     ) -> DomRoot<TrackEvent> {
         let te = reflect_dom_object_with_proto(
             Box::new(TrackEvent::new_inherited(track)),
             global,
             proto,
+            can_gc,
         );
         {
             let event = te.upcast::<Event>();
@@ -88,10 +91,14 @@ impl TrackEvent {
         }
         te
     }
+}
 
-    pub fn Constructor(
+impl TrackEventMethods for TrackEvent {
+    // https://html.spec.whatwg.org/multipage/#trackevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &TrackEventBinding::TrackEventInit,
     ) -> Fallible<DomRoot<TrackEvent>> {
@@ -102,13 +109,12 @@ impl TrackEvent {
             init.parent.bubbles,
             init.parent.cancelable,
             &init.track,
+            can_gc,
         ))
     }
-}
 
-#[allow(non_snake_case)]
-impl TrackEventMethods for TrackEvent {
     // https://html.spec.whatwg.org/multipage/#dom-trackevent-track
+    #[allow(non_snake_case)]
     fn GetTrack(&self) -> Option<VideoTrackOrAudioTrackOrTextTrack> {
         match &self.track {
             Some(MediaTrack::Video(VideoTrack)) => Some(

@@ -94,13 +94,21 @@ use std::sync::{Arc, Mutex};
 use std::{process, thread};
 
 use background_hang_monitor::HangMonitorRegister;
+use background_hang_monitor_api::{
+    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangMonitorAlert,
+};
+use base::id::{
+    BroadcastChannelRouterId, BrowsingContextGroupId, BrowsingContextId, HistoryStateId,
+    MessagePortId, MessagePortRouterId, PipelineId, PipelineNamespace, PipelineNamespaceId,
+    PipelineNamespaceRequest, TopLevelBrowsingContextId, WebViewId,
+};
+use base::Epoch;
 use bluetooth_traits::BluetoothRequest;
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
 use canvas_traits::webgl::WebGLThreads;
 use canvas_traits::ConstellationCanvasMsg;
 use compositing_traits::{
-    CompositorMsg, CompositorProxy, ConstellationMsg as FromCompositorMsg,
-    ForwardedToCompositorMsg, SendableFrameTree,
+    CompositorMsg, CompositorProxy, ConstellationMsg as FromCompositorMsg, SendableFrameTree,
 };
 use crossbeam_channel::{after, never, select, unbounded, Receiver, Sender};
 use devtools_traits::{
@@ -112,8 +120,7 @@ use embedder_traits::{
 };
 use euclid::default::Size2D as UntypedSize2D;
 use euclid::Size2D;
-use gfx::font_cache_thread::FontCacheThread;
-use gfx_traits::Epoch;
+use fonts::SystemFontServiceProxy;
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
 use ipc_channel::Error as IpcError;
@@ -121,12 +128,6 @@ use keyboard_types::webdriver::Event as WebDriverInputEvent;
 use keyboard_types::KeyboardEvent;
 use log::{debug, error, info, trace, warn};
 use media::{GLPlayerThreads, WindowGLContext};
-use msg::constellation_msg::{
-    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, BroadcastChannelRouterId,
-    BrowsingContextGroupId, BrowsingContextId, HangMonitorAlert, HistoryStateId, MessagePortId,
-    MessagePortRouterId, PipelineId, PipelineNamespace, PipelineNamespaceId,
-    PipelineNamespaceRequest, TopLevelBrowsingContextId, TraversalDirection, WebViewId,
-};
 use net_traits::pub_domains::reg_host;
 use net_traits::request::{Referrer, RequestBuilder};
 use net_traits::storage_thread::{StorageThreadMsg, StorageType};
@@ -142,15 +143,16 @@ use script_traits::{
     LoadData, LoadOrigin, LogEntry, MediaSessionActionType, MessagePortMsg, MouseEventType,
     PortMessageTask, SWManagerMsg, SWManagerSenders, ScriptMsg as FromScriptMsg,
     ScriptToConstellationChan, ServiceWorkerManagerFactory, ServiceWorkerMsg,
-    StructuredSerializedData, TimerSchedulerMsg, UpdatePipelineIdReason, WebDriverCommandMsg,
-    WindowSizeData, WindowSizeType,
+    StructuredSerializedData, TimerSchedulerMsg, TraversalDirection, UpdatePipelineIdReason,
+    WebDriverCommandMsg, WindowSizeData, WindowSizeType,
 };
 use serde::{Deserialize, Serialize};
 use servo_config::{opts, pref};
 use servo_rand::{random, Rng, ServoRng, SliceRandom};
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use style_traits::CSSPixel;
-use webgpu::{self, WebGPU, WebGPURequest};
+use webgpu::swapchain::WGPUImageMap;
+use webgpu::{self, WebGPU, WebGPURequest, WebGPUResponse};
 use webrender::{RenderApi, RenderApiSender};
 use webrender_api::DocumentId;
 use webrender_traits::WebrenderExternalImageRegistry;
@@ -216,7 +218,7 @@ struct WebrenderWGPU {
     webrender_external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
 
     /// WebGPU data that supplied to Webrender for rendering
-    wgpu_image_map: Arc<Mutex<HashMap<u64, webgpu::PresentationData>>>,
+    wgpu_image_map: WGPUImageMap,
 }
 
 /// Servo supports multiple top-level browsing contexts or “webviews”, so `Constellation` needs to
@@ -342,7 +344,7 @@ pub struct Constellation<STF, SWF> {
 
     /// A channel for the constellation to send messages to the font
     /// cache thread.
-    font_cache_thread: FontCacheThread,
+    system_font_service: Arc<SystemFontServiceProxy>,
 
     /// A channel for the constellation to send messages to the
     /// devtools thread.
@@ -387,14 +389,6 @@ pub struct Constellation<STF, SWF> {
 
     /// Webrender related objects required by WebGPU threads
     webrender_wgpu: WebrenderWGPU,
-
-    /// A channel for content processes to send messages that will
-    /// be relayed to the WebRender thread.
-    webrender_api_ipc_sender: script_traits::WebrenderIpcSender,
-
-    /// A channel for content process image caches to send messages
-    /// that will be relayed to the WebRender thread.
-    webrender_image_api_sender: net_traits::WebrenderIpcSender,
 
     /// A map of message-port Id to info.
     message_ports: HashMap<MessagePortId, MessagePortInfo>,
@@ -502,7 +496,7 @@ pub struct InitialConstellationState {
     /// A channel through which messages can be sent to the embedder.
     pub embedder_proxy: EmbedderProxy,
 
-    /// A channel through which messages can be sent to the compositor.
+    /// A channel through which messages can be sent to the compositor in-process.
     pub compositor_proxy: CompositorProxy,
 
     /// A channel to the developer tools, if applicable.
@@ -511,8 +505,8 @@ pub struct InitialConstellationState {
     /// A channel to the bluetooth thread.
     pub bluetooth_thread: IpcSender<BluetoothRequest>,
 
-    /// A channel to the font cache thread.
-    pub font_cache_thread: FontCacheThread,
+    /// A proxy to the `SystemFontService` which manages the list of system fonts.
+    pub system_font_service: Arc<SystemFontServiceProxy>,
 
     /// A channel to the resource thread.
     pub public_resource_threads: ResourceThreads,
@@ -549,7 +543,7 @@ pub struct InitialConstellationState {
     /// User agent string to report in network requests.
     pub user_agent: Cow<'static, str>,
 
-    pub wgpu_image_map: Arc<Mutex<HashMap<u64, webgpu::PresentationData>>>,
+    pub wgpu_image_map: WGPUImageMap,
 }
 
 /// Data needed for webdriver
@@ -583,7 +577,7 @@ enum ReadyToSave {
 /// A normal exit waits for the compositor to update its state before
 /// exiting, and delegates layout exit to script. A forced exit does
 /// not notify the compositor, and exits layout without involving script.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ExitPipelineMode {
     Normal,
     Force,
@@ -600,9 +594,11 @@ where
     T: for<'de> Deserialize<'de> + Serialize + Send + 'static,
 {
     let (crossbeam_sender, crossbeam_receiver) = unbounded();
-    ROUTER.add_route(
-        ipc_receiver.to_opaque(),
-        Box::new(move |message| drop(crossbeam_sender.send(message.to::<T>()))),
+    ROUTER.add_typed_route(
+        ipc_receiver,
+        Box::new(move |message| {
+            let _ = crossbeam_sender.send(message);
+        }),
     );
     crossbeam_receiver
 }
@@ -614,6 +610,10 @@ where
 {
     /// Create a new constellation thread.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(state, layout_factory), fields(servo_profiling = true))
+    )]
     pub fn start(
         state: InitialConstellationState,
         layout_factory: Arc<dyn LayoutFactory>,
@@ -700,35 +700,6 @@ where
                 // Zero is reserved for the embedder.
                 PipelineNamespace::install(PipelineNamespaceId(1));
 
-                let (webrender_ipc_sender, webrender_ipc_receiver) =
-                    ipc::channel().expect("ipc channel failure");
-                let (webrender_image_ipc_sender, webrender_image_ipc_receiver) =
-                    ipc::channel().expect("ipc channel failure");
-
-                let compositor_proxy = state.compositor_proxy.clone();
-                ROUTER.add_route(
-                    webrender_ipc_receiver.to_opaque(),
-                    Box::new(move |message| {
-                        compositor_proxy.send(CompositorMsg::Forwarded(
-                            ForwardedToCompositorMsg::Layout(
-                                message.to().expect("conversion failure"),
-                            ),
-                        ));
-                    }),
-                );
-
-                let compositor_proxy = state.compositor_proxy.clone();
-                ROUTER.add_route(
-                    webrender_image_ipc_receiver.to_opaque(),
-                    Box::new(move |message| {
-                        compositor_proxy.send(CompositorMsg::Forwarded(
-                            ForwardedToCompositorMsg::Net(
-                                message.to().expect("conversion failure"),
-                            ),
-                        ));
-                    }),
-                );
-
                 let webrender_wgpu = WebrenderWGPU {
                     webrender_api: state.webrender_api_sender.create_api(),
                     webrender_external_images: state.webrender_external_images,
@@ -757,7 +728,7 @@ where
                     bluetooth_ipc_sender: state.bluetooth_thread,
                     public_resource_threads: state.public_resource_threads,
                     private_resource_threads: state.private_resource_threads,
-                    font_cache_thread: state.font_cache_thread,
+                    system_font_service: state.system_font_service,
                     sw_managers: Default::default(),
                     swmanager_receiver,
                     swmanager_ipc_sender,
@@ -783,12 +754,6 @@ where
                     scheduler_receiver,
                     document_states: HashMap::new(),
                     webrender_document: state.webrender_document,
-                    webrender_api_ipc_sender: script_traits::WebrenderIpcSender::new(
-                        webrender_ipc_sender,
-                    ),
-                    webrender_image_api_sender: net_traits::WebrenderIpcSender::new(
-                        webrender_image_ipc_sender,
-                    ),
                     webrender_wgpu,
                     shutting_down: false,
                     handled_warnings: VecDeque::new(),
@@ -883,7 +848,7 @@ where
             .event_loops
             .get(host)
             .ok_or("Trying to get an event-loop from an unknown browsing context group")
-            .map(|event_loop| event_loop.clone())
+            .cloned()
     }
 
     fn set_event_loop(
@@ -1041,7 +1006,7 @@ where
             devtools_sender: self.devtools_sender.clone(),
             bluetooth_thread: self.bluetooth_ipc_sender.clone(),
             swmanager_thread: self.swmanager_ipc_sender.clone(),
-            font_cache_thread: self.font_cache_thread.clone(),
+            system_font_service: self.system_font_service.clone(),
             resource_threads,
             time_profiler_chan: self.time_profiler_chan.clone(),
             mem_profiler_chan: self.mem_profiler_chan.clone(),
@@ -1052,8 +1017,6 @@ where
             event_loop,
             load_data,
             prev_throttled: throttled,
-            webrender_api_sender: self.webrender_api_ipc_sender.clone(),
-            webrender_image_api_sender: self.webrender_image_api_sender.clone(),
             webrender_document: self.webrender_document,
             webgl_chan: self
                 .webgl_threads
@@ -1061,7 +1024,6 @@ where
                 .map(|threads| threads.pipeline()),
             webxr_registry: self.webxr_registry.clone(),
             player_context: self.player_context.clone(),
-            event_loop_waker: None,
             user_agent: self.user_agent.clone(),
         });
 
@@ -1195,6 +1157,10 @@ where
     }
 
     /// Handles loading pages, navigation, and granting access to the compositor
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_request(&mut self) {
         #[derive(Debug)]
         enum Request {
@@ -1291,11 +1257,19 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_request_for_pipeline_namespace(&mut self, request: PipelineNamespaceRequest) {
         let PipelineNamespaceRequest(sender) = request;
         let _ = sender.send(self.next_pipeline_namespace_id());
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_request_from_background_hang_monitor(&self, message: HangMonitorAlert) {
         match message {
             HangMonitorAlert::Profile(bytes) => self
@@ -1309,6 +1283,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_request_from_network_listener(&mut self, message: (PipelineId, FetchResponseMsg)) {
         let (id, message_) = message;
         let result = match self.pipelines.get(&id) {
@@ -1334,6 +1312,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_request_from_compositor(&mut self, message: FromCompositorMsg) {
         trace_msg_from_compositor!(message, "{message:?}");
         match message {
@@ -1546,6 +1528,14 @@ where
                 self.set_webview_throttled(webview_id, throttled);
             },
             FromCompositorMsg::ReadyToPresent(webview_ids) => {
+                #[cfg(feature = "tracing")]
+                let span = tracing::span!(
+                    tracing::Level::TRACE,
+                    "FromCompositorMsg::ReadyToPresent",
+                    servo_profiling = true
+                );
+                #[cfg(feature = "tracing")]
+                let _enter = span.enter();
                 self.embedder_proxy
                     .send((None, EmbedderMsg::ReadyToPresent(webview_ids)));
             },
@@ -1555,6 +1545,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_request_from_script(&mut self, message: (PipelineId, FromScriptMsg)) {
         let (source_pipeline_id, content) = message;
         trace_script_msg!(content, "{source_pipeline_id}: {content:?}");
@@ -1739,18 +1733,6 @@ where
 
                 response_sender.send(true).unwrap_or_default();
             },
-            FromScriptMsg::GetClientWindow(response_sender) => {
-                self.compositor_proxy
-                    .send(CompositorMsg::GetClientWindow(response_sender));
-            },
-            FromScriptMsg::GetScreenSize(response_sender) => {
-                self.compositor_proxy
-                    .send(CompositorMsg::GetScreenSize(response_sender));
-            },
-            FromScriptMsg::GetScreenAvailSize(response_sender) => {
-                self.compositor_proxy
-                    .send(CompositorMsg::GetScreenAvailSize(response_sender));
-            },
             FromScriptMsg::LogEntry(thread_name, entry) => {
                 self.handle_log_entry(Some(source_top_ctx_id), thread_name, entry);
             },
@@ -1884,6 +1866,10 @@ where
     }
 
     /// Broadcast a message via routers in various event-loops.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_schedule_broadcast(
         &self,
         pipeline_id: PipelineId,
@@ -1927,6 +1913,10 @@ where
     }
 
     /// Remove a channel-name for a given broadcast router.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_remove_broadcast_channel_name_in_router(
         &mut self,
         pipeline_id: PipelineId,
@@ -1962,6 +1952,10 @@ where
     }
 
     /// Note a new channel-name relevant to a given broadcast router.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_new_broadcast_channel_name_in_router(
         &mut self,
         pipeline_id: PipelineId,
@@ -1983,6 +1977,10 @@ where
     }
 
     /// Remove a broadcast router.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_remove_broadcast_channel_router(
         &mut self,
         pipeline_id: PipelineId,
@@ -2001,6 +1999,10 @@ where
     }
 
     /// Add a new broadcast router.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_new_broadcast_channel_router(
         &mut self,
         pipeline_id: PipelineId,
@@ -2023,6 +2025,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_wgpu_request(
         &mut self,
         source_pipeline_id: PipelineId,
@@ -2069,22 +2075,24 @@ where
             Entry::Occupied(o) => Some(o.get().clone()),
         };
         match request {
-            FromScriptMsg::RequestAdapter(response_sender, options, ids) => match webgpu_chan {
-                None => {
-                    if let Err(e) = response_sender.send(None) {
-                        warn!("Failed to send request adapter message: {}", e)
-                    }
-                },
-                Some(webgpu_chan) => {
-                    let adapter_request = WebGPURequest::RequestAdapter {
-                        sender: response_sender,
-                        options,
-                        ids,
-                    };
-                    if webgpu_chan.0.send((None, adapter_request)).is_err() {
-                        warn!("Failed to send request adapter message on WebGPU channel");
-                    }
-                },
+            FromScriptMsg::RequestAdapter(response_sender, options, adapter_id) => {
+                match webgpu_chan {
+                    None => {
+                        if let Err(e) = response_sender.send(WebGPUResponse::None) {
+                            warn!("Failed to send request adapter message: {}", e)
+                        }
+                    },
+                    Some(webgpu_chan) => {
+                        let adapter_request = WebGPURequest::RequestAdapter {
+                            sender: response_sender,
+                            options,
+                            adapter_id,
+                        };
+                        if webgpu_chan.0.send(adapter_request).is_err() {
+                            warn!("Failed to send request adapter message on WebGPU channel");
+                        }
+                    },
+                }
             },
             FromScriptMsg::GetWebGPUChan(response_sender) => {
                 if response_sender.send(webgpu_chan).is_err() {
@@ -2098,6 +2106,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_request_from_layout(&mut self, message: FromLayoutMsg) {
         trace_layout_msg!(message, "{message:?}");
         match message {
@@ -2112,6 +2124,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_message_port_transfer_completed(
         &mut self,
         router_id: Option<MessagePortRouterId>,
@@ -2250,6 +2266,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_complete_message_port_transfer(
         &mut self,
         router_id: MessagePortRouterId,
@@ -2330,6 +2350,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_reroute_messageport(&mut self, port_id: MessagePortId, task: PortMessageTask) {
         let info = match self.message_ports.get_mut(&port_id) {
             Some(info) => info,
@@ -2361,6 +2385,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_messageport_shipped(&mut self, port_id: MessagePortId) {
         if let Some(info) = self.message_ports.get_mut(&port_id) {
             match info.state {
@@ -2415,6 +2443,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_remove_messageport(&mut self, port_id: MessagePortId) {
         let entangled = match self.message_ports.remove(&port_id) {
             Some(info) => info.entangled_with,
@@ -2462,6 +2494,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_entangle_messageports(&mut self, port1: MessagePortId, port2: MessagePortId) {
         if let Some(info) = self.message_ports.get_mut(&port1) {
             info.entangled_with = Some(port2);
@@ -2487,6 +2523,10 @@ where
     ///
     /// The Job Queue is essentially the channel to a SW manager,
     /// which are scoped per origin.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_schedule_serviceworker_job(&mut self, pipeline_id: PipelineId, job: Job) {
         let origin = job.scope_url.origin();
 
@@ -2526,6 +2566,10 @@ where
         let _ = sw_manager.send(ServiceWorkerMsg::ScheduleJob(job));
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_broadcast_storage_event(
         &self,
         pipeline_id: PipelineId,
@@ -2556,6 +2600,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_exit(&mut self) {
         debug!("Handling exit.");
 
@@ -2636,6 +2684,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_shutdown(&mut self) {
         debug!("Handling shutdown.");
 
@@ -2646,6 +2698,7 @@ where
             ipc::channel().expect("Failed to create IPC channel!");
         let (storage_ipc_sender, storage_ipc_receiver) =
             ipc::channel().expect("Failed to create IPC channel!");
+        let mut webgl_threads_receiver = None;
 
         debug!("Exiting core resource threads.");
         if let Err(e) = self
@@ -2712,9 +2765,12 @@ where
         }
 
         if let Some(webgl_threads) = self.webgl_threads.as_ref() {
+            let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
+            webgl_threads_receiver = Some(receiver);
             debug!("Exiting WebGL thread.");
-            if let Err(e) = webgl_threads.exit() {
-                warn!("Exit WebGL Thread failed ({})", e);
+
+            if let Err(e) = webgl_threads.exit(sender) {
+                warn!("Exit WebGL Thread failed ({e})");
             }
         }
 
@@ -2725,8 +2781,8 @@ where
             }
         }
 
-        debug!("Exiting font cache thread.");
-        self.font_cache_thread.exit();
+        debug!("Exiting the system font service thread.");
+        self.system_font_service.exit();
 
         // Receive exit signals from threads.
         if let Err(e) = core_ipc_receiver.recv() {
@@ -2734,6 +2790,14 @@ where
         }
         if let Err(e) = storage_ipc_receiver.recv() {
             warn!("Exit storage thread failed ({:?})", e);
+        }
+        if self.webgl_threads.is_some() {
+            if let Err(e) = webgl_threads_receiver
+                .expect("webgl_threads_receiver to be Some")
+                .recv()
+            {
+                warn!("Exit WebGL thread failed ({:?})", e);
+            }
         }
 
         debug!("Asking compositor to complete shutdown.");
@@ -2748,6 +2812,10 @@ where
         self.pipelines.remove(&pipeline_id);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_send_error(&mut self, pipeline_id: PipelineId, err: IpcError) {
         // Treat send error the same as receiving a panic message
         error!("{}: Send error ({})", pipeline_id, err);
@@ -2759,6 +2827,10 @@ where
         self.handle_panic(top_level_browsing_context_id, reason, None);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_panic(
         &mut self,
         top_level_browsing_context_id: Option<TopLevelBrowsingContextId>,
@@ -2856,6 +2928,10 @@ where
         });
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_log_entry(
         &mut self,
         top_level_browsing_context_id: Option<TopLevelBrowsingContextId>,
@@ -2935,6 +3011,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_new_top_level_browsing_context(
         &mut self,
         url: ServoUrl,
@@ -3001,6 +3081,10 @@ where
         });
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_close_top_level_browsing_context(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -3047,6 +3131,10 @@ where
         debug!("{top_level_browsing_context_id}: Closed");
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_iframe_size_msg(&mut self, iframe_sizes: Vec<IFrameSizeMsg>) {
         for IFrameSizeMsg {
             browsing_context_id,
@@ -3063,6 +3151,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_subframe_loaded(&mut self, pipeline_id: PipelineId) {
         let browsing_context_id = match self.pipelines.get(&pipeline_id) {
             Some(pipeline) => pipeline.browsing_context_id,
@@ -3103,6 +3195,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_navigate_request(
         &self,
         id: PipelineId,
@@ -3123,6 +3219,10 @@ where
     // iframe via script. This will result in a new pipeline being spawned and
     // a child being added to the parent browsing context. This message is never
     // the result of a page navigation.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_script_loaded_url_in_iframe_msg(&mut self, load_info: IFrameLoadInfoWithData) {
         let IFrameLoadInfo {
             parent_pipeline_id,
@@ -3229,6 +3329,10 @@ where
         });
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_script_new_iframe(&mut self, load_info: IFrameLoadInfoWithData) {
         let IFrameLoadInfo {
             parent_pipeline_id,
@@ -3289,6 +3393,10 @@ where
         });
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_script_new_auxiliary(&mut self, load_info: AuxiliaryBrowsingContextLoadInfo) {
         let AuxiliaryBrowsingContextLoadInfo {
             load_data,
@@ -3374,16 +3482,28 @@ where
         });
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_pending_paint_metric(&self, pipeline_id: PipelineId, epoch: Epoch) {
         self.compositor_proxy
             .send(CompositorMsg::PendingPaintMetric(pipeline_id, epoch))
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_set_cursor_msg(&mut self, cursor: Cursor) {
         self.embedder_proxy
             .send((None, EmbedderMsg::SetCursor(cursor)))
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_change_running_animations_state(
         &mut self,
         pipeline_id: PipelineId,
@@ -3401,6 +3521,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_tick_animation(&mut self, pipeline_id: PipelineId, tick_type: AnimationTickType) {
         let pipeline = match self.pipelines.get(&pipeline_id) {
             Some(pipeline) => pipeline,
@@ -3416,6 +3540,10 @@ where
     /// Schedule a navigation(via load_url).
     /// 1: Ask the embedder for permission.
     /// 2: Store the details of the navigation, pending approval from the embedder.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn schedule_navigation(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -3442,6 +3570,10 @@ where
         self.embedder_proxy.send(msg);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn load_url(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -3570,6 +3702,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_abort_load_url_msg(&mut self, new_pipeline_id: PipelineId) {
         let pending_index = self
             .pending_changes
@@ -3587,6 +3723,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_load_complete_msg(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -3635,6 +3775,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_navigated_to_fragment(
         &mut self,
         pipeline_id: PipelineId,
@@ -3666,6 +3810,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_traverse_history_msg(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -3807,6 +3955,10 @@ where
         self.update_webview_in_compositor(top_level_browsing_context_id);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn update_browsing_context(
         &mut self,
         browsing_context_id: BrowsingContextId,
@@ -3931,6 +4083,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn update_pipeline(
         &mut self,
         pipeline_id: PipelineId,
@@ -3957,6 +4113,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_joint_session_history_length(
         &self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -3970,6 +4130,10 @@ where
         let _ = response_sender.send(length as u32);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_push_history_state_msg(
         &mut self,
         pipeline_id: PipelineId,
@@ -4009,6 +4173,10 @@ where
         self.notify_history_changed(top_level_browsing_context_id);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_replace_history_state_msg(
         &mut self,
         pipeline_id: PipelineId,
@@ -4033,6 +4201,10 @@ where
         session_history.replace_history_state(pipeline_id, history_state_id, url);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_ime_dismissed(&mut self) {
         // Send to the focused browsing contexts' current pipeline.
         let focused_browsing_context_id = self
@@ -4063,6 +4235,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_key_msg(&mut self, event: KeyboardEvent) {
         // Send to the focused browsing contexts' current pipeline.  If it
         // doesn't exist, fall back to sending to the compositor.
@@ -4101,6 +4277,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_reload_msg(&mut self, top_level_browsing_context_id: TopLevelBrowsingContextId) {
         let browsing_context_id = BrowsingContextId::from(top_level_browsing_context_id);
         let pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
@@ -4119,6 +4299,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_post_message_msg(
         &mut self,
         browsing_context_id: BrowsingContextId,
@@ -4157,6 +4341,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_get_pipeline(
         &mut self,
         browsing_context_id: BrowsingContextId,
@@ -4178,6 +4366,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_get_browsing_context(
         &mut self,
         pipeline_id: PipelineId,
@@ -4192,6 +4384,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_focus_msg(&mut self, pipeline_id: PipelineId) {
         let (browsing_context_id, top_level_browsing_context_id) =
             match self.pipelines.get(&pipeline_id) {
@@ -4226,6 +4422,10 @@ where
         self.focus_parent_pipeline(browsing_context_id);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn focus_parent_pipeline(&mut self, browsing_context_id: BrowsingContextId) {
         let parent_pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
             Some(ctx) => ctx.parent_pipeline_id,
@@ -4256,6 +4456,10 @@ where
         self.focus_parent_pipeline(parent_browsing_context_id);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_remove_iframe_msg(
         &mut self,
         browsing_context_id: BrowsingContextId,
@@ -4268,6 +4472,10 @@ where
         result
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_set_throttled_complete(&mut self, pipeline_id: PipelineId, throttled: bool) {
         let browsing_context_id = match self.pipelines.get(&pipeline_id) {
             Some(pipeline) => pipeline.browsing_context_id,
@@ -4302,6 +4510,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_create_canvas_paint_thread_msg(
         &mut self,
         size: UntypedSize2D<u64>,
@@ -4325,6 +4537,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_webdriver_msg(&mut self, msg: WebDriverCommandMsg) {
         // Find the script channel for the given parent pipeline,
         // and pass the event to that script thread.
@@ -4455,6 +4671,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn set_webview_throttled(&mut self, webview_id: WebViewId, throttled: bool) {
         let browsing_context_id = BrowsingContextId::from(webview_id);
         let pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
@@ -4469,6 +4689,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn notify_history_changed(&self, top_level_browsing_context_id: TopLevelBrowsingContextId) {
         // Send a flat projection of the history to embedder.
         // The final vector is a concatenation of the LoadData of the past
@@ -4585,6 +4809,10 @@ where
         self.embedder_proxy.send(msg);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn load_url_for_webdriver(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -4612,6 +4840,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn change_session_history(&mut self, change: SessionHistoryChange) {
         debug!(
             "{}: Setting to {}",
@@ -4766,6 +4998,10 @@ where
         self.update_webview_in_compositor(change.top_level_browsing_context_id);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn focused_browsing_context_is_descendant_of(
         &self,
         browsing_context_id: BrowsingContextId,
@@ -4774,13 +5010,17 @@ where
             .webviews
             .focused_webview()
             .map(|(_, webview)| webview.focused_browsing_context_id);
-        focused_browsing_context_id.map_or(false, |focus_ctx_id| {
+        focused_browsing_context_id.is_some_and(|focus_ctx_id| {
             focus_ctx_id == browsing_context_id ||
                 self.fully_active_descendant_browsing_contexts_iter(browsing_context_id)
                     .any(|nested_ctx| nested_ctx.id == focus_ctx_id)
         })
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn trim_history(&mut self, top_level_browsing_context_id: TopLevelBrowsingContextId) {
         let pipelines_to_evict = {
             let session_history = self.get_joint_session_history(top_level_browsing_context_id);
@@ -4840,6 +5080,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_activate_document_msg(&mut self, pipeline_id: PipelineId) {
         debug!("{}: Document ready to activate", pipeline_id);
 
@@ -4885,6 +5129,10 @@ where
     }
 
     /// Called when the window is resized.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_window_size_msg(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -4907,6 +5155,10 @@ where
     }
 
     /// Called when the window exits from fullscreen mode
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_exit_fullscreen_msg(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -4920,6 +5172,10 @@ where
     /// to check if the output image is "stable" and can be written as a screenshot
     /// for reftests.
     /// Since this function is only used in reftests, we do not harden it against panic.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_is_ready_to_save_image(
         &mut self,
         pipeline_states: HashMap<PipelineId, Epoch>,
@@ -5003,6 +5259,10 @@ where
     }
 
     /// Get the current activity of a pipeline.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn get_activity(&self, pipeline_id: PipelineId) -> DocumentActivity {
         let mut ancestor_id = pipeline_id;
         loop {
@@ -5029,6 +5289,10 @@ where
     }
 
     /// Set the current activity of a pipeline.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn set_activity(&self, pipeline_id: PipelineId, activity: DocumentActivity) {
         debug!("{}: Setting activity to {:?}", pipeline_id, activity);
         if let Some(pipeline) = self.pipelines.get(&pipeline_id) {
@@ -5047,12 +5311,20 @@ where
     }
 
     /// Update the current activity of a pipeline.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn update_activity(&self, pipeline_id: PipelineId) {
         self.set_activity(pipeline_id, self.get_activity(pipeline_id));
     }
 
     /// Handle updating the size of a browsing context.
     /// This notifies every pipeline in the context of the new size.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn resize_browsing_context(
         &mut self,
         new_size: WindowSizeData,
@@ -5109,6 +5381,10 @@ where
     }
 
     // Handle switching from fullscreen mode
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn switch_fullscreen_mode(&mut self, browsing_context_id: BrowsingContextId) {
         if let Some(browsing_context) = self.browsing_contexts.get(&browsing_context_id) {
             let pipeline_id = browsing_context.pipeline_id;
@@ -5128,6 +5404,10 @@ where
     }
 
     // Close and return the browsing context with the given id (and its children), if it exists.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn close_browsing_context(
         &mut self,
         browsing_context_id: BrowsingContextId,
@@ -5167,6 +5447,10 @@ where
     }
 
     // Close the children of a browsing context
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn close_browsing_context_children(
         &mut self,
         browsing_context_id: BrowsingContextId,
@@ -5197,6 +5481,10 @@ where
     }
 
     // Discard the pipeline for a given document, udpdate the joint session history.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_discard_document(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
@@ -5228,6 +5516,10 @@ where
     }
 
     // Send a message to script requesting the document associated with this pipeline runs the 'unload' algorithm.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn unload_document(&self, pipeline_id: PipelineId) {
         if let Some(pipeline) = self.pipelines.get(&pipeline_id) {
             let msg = ConstellationControlMsg::UnloadDocument(pipeline_id);
@@ -5236,6 +5528,10 @@ where
     }
 
     // Close all pipelines at and beneath a given browsing context
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn close_pipeline(
         &mut self,
         pipeline_id: PipelineId,
@@ -5299,6 +5595,10 @@ where
     }
 
     // Randomly close a pipeline -if --random-pipeline-closure-probability is set
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn maybe_close_random_pipeline(&mut self) {
         match self.random_pipeline_closure {
             Some((ref mut rng, probability)) => {
@@ -5336,6 +5636,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn get_joint_session_history(
         &mut self,
         top_level_id: TopLevelBrowsingContextId,
@@ -5347,6 +5651,10 @@ where
     }
 
     // Convert a browsing context to a sendable form to pass to the compositor
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn browsing_context_to_sendable(
         &self,
         browsing_context_id: BrowsingContextId,
@@ -5376,6 +5684,10 @@ where
     }
 
     /// Send the frame tree for the given webview to the compositor.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn update_webview_in_compositor(&mut self, webview_id: WebViewId) {
         // Note that this function can panic, due to ipc-channel creation failure.
         // avoiding this panic would require a mechanism for dealing
@@ -5388,6 +5700,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_media_session_action_msg(&mut self, action: MediaSessionActionType) {
         if let Some(media_session_pipeline_id) = self.active_media_session {
             let result = match self.pipelines.get(&media_session_pipeline_id) {
@@ -5414,6 +5730,10 @@ where
     }
 
     /// Handle GamepadEvents from the embedder and forward them to the script thread
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true))
+    )]
     fn handle_gamepad_msg(&mut self, event: GamepadEvent) {
         // Send to the focused browsing contexts' current pipeline.
         let focused_browsing_context_id = self

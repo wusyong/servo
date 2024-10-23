@@ -430,7 +430,7 @@ impl WebGLFramebuffer {
         self.size.set(fb_size);
 
         if has_c || has_z || has_zs || has_s {
-            if self.size.get().map_or(false, |(w, h)| w != 0 && h != 0) {
+            if self.size.get().is_some_and(|(w, h)| w != 0 && h != 0) {
                 self.status.set(constants::FRAMEBUFFER_COMPLETE);
             } else {
                 self.status
@@ -961,7 +961,7 @@ impl WebGLFramebuffer {
             return Err(WebGLError::InvalidOperation);
         }
 
-        *self.color_draw_buffers.borrow_mut() = buffers.clone();
+        self.color_draw_buffers.borrow_mut().clone_from(&buffers);
         context.send_command(WebGLCommand::DrawBuffers(buffers));
         Ok(())
     }

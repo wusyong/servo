@@ -5,12 +5,12 @@
   buildAndroid ? false
 }:
 with import (builtins.fetchTarball {
-  url = "https://github.com/NixOS/nixpkgs/archive/46ae0210ce163b3cba6c7da08840c1d63de9c701.tar.gz";
+  url = "https://github.com/NixOS/nixpkgs/archive/d04953086551086b44b6f3c6b7eeb26294f207da.tar.gz";
 }) {
   overlays = [
     (import (builtins.fetchTarball {
       # Bumped the channel in rust-toolchain.toml? Bump this commit too!
-      url = "https://github.com/oxalica/rust-overlay/archive/a0df72e106322b67e9c6e591fe870380bd0da0d5.tar.gz";
+      url = "https://github.com/oxalica/rust-overlay/archive/65e3dc0fe079fe8df087cd38f1fe6836a0373aad.tar.gz";
     }))
   ];
   config = {
@@ -35,7 +35,7 @@ let
     llvmPackages = llvmPackages_14;
     stdenv = llvmPackages.stdenv;
 
-    buildToolsVersion = "33.0.2";
+    buildToolsVersion = "34.0.0";
     androidComposition = androidenv.composeAndroidPackages {
       buildToolsVersions = [ buildToolsVersion ];
       includeEmulator = true;
@@ -45,7 +45,7 @@ let
       systemImageTypes = [ "google_apis" ];
       abiVersions = [ "x86" "armeabi-v7a" ];
       includeNDK = true;
-      ndkVersion = "25.2.9519653";
+      ndkVersion = "26.2.11394342";
       useGoogleAPIs = false;
       useGoogleTVAddOns = false;
       includeExtras = [
@@ -60,7 +60,7 @@ let
     GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${ANDROID_SDK_ROOT}/build-tools/${buildToolsVersion}/aapt2";
   };
 in
-stdenv.mkDerivation (androidEnvironment // rec {
+stdenv.mkDerivation (androidEnvironment // {
   name = "servo-env";
 
   buildInputs = [
@@ -77,6 +77,7 @@ stdenv.mkDerivation (androidEnvironment // rec {
 
     rustup
     taplo
+    cargo-deny
     llvmPackages.bintools # provides lld
 
     udev # Needed by libudev-sys for GamePad API.
@@ -111,7 +112,7 @@ stdenv.mkDerivation (androidEnvironment // rec {
         '';
         dontInstall = true;
       });
-    in (rustPlatform.buildRustPackage rec {
+    in (rustPlatform.buildRustPackage {
       name = "crown";
       src = ../support/crown;
       doCheck = false;
@@ -145,7 +146,7 @@ stdenv.mkDerivation (androidEnvironment // rec {
     androidSdk
   ]);
 
-  LIBCLANG_PATH = llvmPackages.clang-unwrapped.lib + "/lib/";
+  LIBCLANG_PATH = lib.makeLibraryPath [ llvmPackages.clang-unwrapped.lib ];
 
   # Allow cargo to download crates
   SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
@@ -157,7 +158,7 @@ stdenv.mkDerivation (androidEnvironment // rec {
   # Provide libraries that aren’t linked against but somehow required
   LD_LIBRARY_PATH = lib.makeLibraryPath [
     # Fixes missing library errors
-    zlib xorg.libXcursor xorg.libXrandr xorg.libXi libxkbcommon
+    xorg.libXcursor xorg.libXrandr xorg.libXi libxkbcommon
 
     # [WARN  script::dom::gpu] Could not get GPUAdapter ("NotFound")
     # TLA Err: Error: Couldn't request WebGPU adapter.

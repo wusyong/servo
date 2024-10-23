@@ -8,7 +8,6 @@ use std::borrow::ToOwned;
 use std::cmp::min;
 use std::default::Default;
 use std::ops::{Add, AddAssign, Range};
-use std::usize;
 
 use keyboard_types::{Key, KeyState, Modifiers, ShortcutMatcher};
 use unicode_segmentation::UnicodeSegmentation;
@@ -982,7 +981,7 @@ impl<T: ClipboardProvider> TextInput<T> {
 
     /// Whether the content is empty.
     pub fn is_empty(&self) -> bool {
-        self.lines.len() <= 1 && self.lines.get(0).map_or(true, |line| line.is_empty())
+        self.lines.len() <= 1 && self.lines.first().map_or(true, |line| line.is_empty())
     }
 
     /// The length of the content in bytes.

@@ -13,13 +13,10 @@ import os.path as path
 import pathlib
 import shutil
 import stat
-import subprocess
 import sys
-import urllib
 
 from time import time
-from typing import Dict, Optional
-import zipfile
+from typing import Optional
 
 import notifypy
 
@@ -31,11 +28,16 @@ from mach.decorators import (
 from mach.registrar import Registrar
 
 import servo.platform
+import servo.platform.macos
 import servo.util
 import servo.visual_studio
 
 from servo.command_base import BuildType, CommandBase, call, check_call
-from servo.gstreamer import windows_dlls, windows_plugins, macos_plugins
+from servo.gstreamer import windows_dlls, windows_plugins, package_gstreamer_dylibs
+from servo.platform.build_target import BuildTarget
+
+SUPPORTED_ASAN_TARGETS = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu",
+                          "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 
 
 @CommandProvider
@@ -55,9 +57,9 @@ class MachCommands(CommandBase):
                      help='Print very verbose output')
     @CommandArgument('params', nargs='...',
                      help="Command-line arguments to be passed through to Cargo")
-    @CommandBase.common_command_arguments(build_configuration=True, build_type=True)
+    @CommandBase.common_command_arguments(build_configuration=True, build_type=True, package_configuration=True)
     def build(self, build_type: BuildType, jobs=None, params=None, no_package=False,
-              verbose=False, very_verbose=False, **kwargs):
+              verbose=False, very_verbose=False, with_asan=False, flavor=None, **kwargs):
         opts = params or []
 
         if build_type.is_release():
@@ -78,10 +80,37 @@ class MachCommands(CommandBase):
         self.ensure_bootstrapped()
         self.ensure_clobbered()
 
+        host = servo.platform.host_triple()
+        target_triple = self.target.triple()
+
+        if with_asan:
+            if target_triple not in SUPPORTED_ASAN_TARGETS:
+                print("AddressSanitizer is currently not supported on this platform\n",
+                      "See https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html")
+                sys.exit(1)
+
+            # do not use crown (clashes with different rust version)
+            env["RUSTC"] = "rustc"
+
+            # Enable usage of unstable rust flags
+            env["RUSTC_BOOTSTRAP"] = "1"
+
+            # Enable asan
+            env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -Zsanitizer=address"
+            opts += ["-Zbuild-std"]
+            kwargs["target_override"] = target_triple
+            # TODO: Investigate sanitizers in C/C++ code:
+            # env.setdefault("CFLAGS", "")
+            # env.setdefault("CXXFLAGS", "")
+            # env["CFLAGS"] += " -fsanitize=address"
+            # env["CXXFLAGS"] += " -fsanitize=address"
+
+            # asan replaces system allocator with asan allocator
+            # we need to make sure that we do not replace it with jemalloc
+            self.features.append("servo_allocator/use-system-allocator")
+
         build_start = time()
 
-        host = servo.platform.host_triple()
-        target_triple = self.cross_compile_target or servo.platform.host_triple()
         if host != target_triple and 'windows' in target_triple:
             if os.environ.get('VisualStudioVersion') or os.environ.get('VCINSTALLDIR'):
                 print("Can't cross-compile for Windows inside of a Visual Studio shell.\n"
@@ -99,28 +128,18 @@ class MachCommands(CommandBase):
                 print((key, env[key]))
 
         status = self.run_cargo_build_like_command(
-            "build", opts, env=env, verbose=verbose, **kwargs)
+            "rustc", opts, env=env, verbose=verbose, **kwargs)
 
         if status == 0:
-            built_binary = self.get_binary_path(
-                build_type,
-                target=self.cross_compile_target,
-                android=self.is_android_build,
-            )
+            built_binary = self.get_binary_path(build_type, asan=with_asan)
 
-            if self.is_android_build and not no_package:
-                flavor = None
-                if "googlevr" in self.features:
-                    flavor = "googlevr"
-                elif "oculusvr" in self.features:
-                    flavor = "oculusvr"
-                rv = Registrar.dispatch("package", context=self.context, build_type=build_type,
-                                        target=self.cross_compile_target, flavor=flavor)
+            if not no_package and self.target.needs_packaging():
+                rv = Registrar.dispatch("package", context=self.context, build_type=build_type, flavor=flavor)
                 if rv:
                     return rv
 
             if sys.platform == "win32":
-                if not copy_windows_dlls_to_build_directory(built_binary, target_triple):
+                if not copy_windows_dlls_to_build_directory(built_binary, self.target):
                     status = 1
 
             elif sys.platform == "darwin":
@@ -128,8 +147,8 @@ class MachCommands(CommandBase):
                 assert os.path.exists(servo_bin_dir)
 
                 if self.enable_media:
-                    print("Packaging gstreamer dylibs")
-                    if not package_gstreamer_dylibs(self.cross_compile_target, built_binary):
+                    library_target_directory = path.join(path.dirname(built_binary), "lib/")
+                    if not package_gstreamer_dylibs(built_binary, library_target_directory, self.target):
                         return 1
 
                 # On the Mac, set a lovely icon. This makes it easier to pick out the Servo binary in tools
@@ -154,40 +173,6 @@ class MachCommands(CommandBase):
         print(build_message)
 
         return status
-
-    def download_and_build_android_dependencies_if_needed(self, env: Dict[str, str]):
-        if not self.is_android_build:
-            return
-
-        # Build the name of the package containing all GStreamer dependencies
-        # according to the build target.
-        android_lib = self.config["android"]["lib"]
-        gst_lib = f"gst-build-{android_lib}"
-        gst_lib_zip = f"gstreamer-{android_lib}-1.16.0-20190517-095630.zip"
-        gst_lib_path = os.path.join(self.target_path, "gstreamer", gst_lib)
-        pkg_config_path = os.path.join(gst_lib_path, "pkgconfig")
-        env["PKG_CONFIG_PATH"] = pkg_config_path
-        if not os.path.exists(gst_lib_path):
-            # Download GStreamer dependencies if they have not already been downloaded
-            # This bundle is generated with `libgstreamer_android_gen`
-            # Follow these instructions to build and deploy new binaries
-            # https://github.com/servo/libgstreamer_android_gen#build
-            gst_url = f"https://servo-deps-2.s3.amazonaws.com/gstreamer/{gst_lib_zip}"
-            print(f"Downloading GStreamer dependencies ({gst_url})")
-
-            urllib.request.urlretrieve(gst_url, gst_lib_zip)
-            zip_ref = zipfile.ZipFile(gst_lib_zip, "r")
-            zip_ref.extractall(os.path.join(self.target_path, "gstreamer"))
-            os.remove(gst_lib_zip)
-
-            # Change pkgconfig info to make all GStreamer dependencies point
-            # to the libgstreamer_android.so bundle.
-            for each in os.listdir(pkg_config_path):
-                if each.endswith('.pc'):
-                    print(f"Setting pkgconfig info for {each}")
-                    target_path = os.path.join(pkg_config_path, each)
-                    expr = f"s#libdir=.*#libdir={gst_lib_path}#g"
-                    subprocess.call(["perl", "-i", "-pe", expr, target_path])
 
     @Command('clean',
              description='Clean the target/ and python/_venv[version]/ directories',
@@ -256,113 +241,18 @@ class MachCommands(CommandBase):
                 print("[Warning] Could not generate notification: "
                       f"Could not run '{notify_command}'.", file=sys.stderr)
         else:
-            notifier = LinuxNotifier if sys.platform.startswith("linux") else None
-            notification = notifypy.Notify(use_custom_notifier=notifier)
-            notification.title = title
-            notification.message = message
-            notification.icon = path.join(self.get_top_dir(), "resources", "servo_64.png")
-            notification.send(block=False)
+            try:
+                notifier = LinuxNotifier if sys.platform.startswith("linux") else None
+                notification = notifypy.Notify(use_custom_notifier=notifier)
+                notification.title = title
+                notification.message = message
+                notification.icon = path.join(self.get_top_dir(), "resources", "servo_64.png")
+                notification.send(block=False)
+            except notifypy.exceptions.UnsupportedPlatform as e:
+                print(f"[Warning] Could not generate notification: {e}", file=sys.stderr)
 
 
-def otool(s):
-    o = subprocess.Popen(['/usr/bin/otool', '-L', s], stdout=subprocess.PIPE)
-    for line in map(lambda s: s.decode('ascii'), o.stdout):
-        if line[0] == '\t':
-            yield line.split(' ', 1)[0][1:]
-
-
-def install_name_tool(binary, *args):
-    try:
-        subprocess.check_call(['install_name_tool', *args, binary])
-    except subprocess.CalledProcessError as e:
-        print("install_name_tool exited with return value %d" % e.returncode)
-
-
-def change_link_name(binary, old, new):
-    install_name_tool(binary, '-change', old, f"@executable_path/{new}")
-
-
-def is_system_library(lib):
-    return lib.startswith("/System/Library") or lib.startswith("/usr/lib")
-
-
-def is_relocatable_library(lib):
-    return lib.startswith("@rpath/")
-
-
-def change_non_system_libraries_path(libraries, relative_path, binary):
-    for lib in libraries:
-        if is_system_library(lib) or is_relocatable_library(lib):
-            continue
-        new_path = path.join(relative_path, path.basename(lib))
-        change_link_name(binary, lib, new_path)
-
-
-def resolve_rpath(lib, rpath_root):
-    if not is_relocatable_library(lib):
-        return lib
-
-    rpaths = ['', '../', 'gstreamer-1.0/']
-    for rpath in rpaths:
-        full_path = rpath_root + lib.replace('@rpath/', rpath)
-        if path.exists(full_path):
-            return path.normpath(full_path)
-
-    raise Exception("Unable to satisfy rpath dependency: " + lib)
-
-
-def copy_dependencies(binary_path, lib_path, gst_lib_dir):
-    relative_path = path.relpath(lib_path, path.dirname(binary_path)) + "/"
-
-    # Update binary libraries
-    binary_dependencies = set(otool(binary_path))
-    change_non_system_libraries_path(binary_dependencies, relative_path, binary_path)
-
-    plugins = [os.path.join(gst_lib_dir, "gstreamer-1.0", plugin) for plugin in macos_plugins()]
-    binary_dependencies = binary_dependencies.union(plugins)
-
-    # Update dependencies libraries
-    need_checked = binary_dependencies
-    checked = set()
-    while need_checked:
-        checking = set(need_checked)
-        need_checked = set()
-        for f in checking:
-            # No need to check these for their dylibs
-            if is_system_library(f):
-                continue
-            full_path = resolve_rpath(f, gst_lib_dir)
-            need_relinked = set(otool(full_path))
-            new_path = path.join(lib_path, path.basename(full_path))
-            if not path.exists(new_path):
-                shutil.copyfile(full_path, new_path)
-            change_non_system_libraries_path(need_relinked, relative_path, new_path)
-            need_checked.update(need_relinked)
-        checked.update(checking)
-        need_checked.difference_update(checked)
-
-
-def package_gstreamer_dylibs(cross_compilation_target, servo_bin):
-    gst_root = servo.platform.get().gstreamer_root(cross_compilation_target)
-
-    # This might be None if we are cross-compiling.
-    if not gst_root:
-        return True
-
-    lib_dir = path.join(path.dirname(servo_bin), "lib")
-    if os.path.exists(lib_dir):
-        shutil.rmtree(lib_dir)
-    os.mkdir(lib_dir)
-    try:
-        copy_dependencies(servo_bin, lib_dir, path.join(gst_root, 'lib', ''))
-    except Exception as e:
-        print("ERROR: could not package required dylibs")
-        print(e)
-        return False
-    return True
-
-
-def copy_windows_dlls_to_build_directory(servo_binary: str, target_triple: str) -> bool:
+def copy_windows_dlls_to_build_directory(servo_binary: str, target: BuildTarget) -> bool:
     servo_exe_dir = os.path.dirname(servo_binary)
     assert os.path.exists(servo_exe_dir)
 
@@ -383,18 +273,18 @@ def copy_windows_dlls_to_build_directory(servo_binary: str, target_triple: str) 
     find_and_copy_built_dll("libGLESv2.dll")
 
     print(" • Copying GStreamer DLLs to binary directory...")
-    if not package_gstreamer_dlls(servo_exe_dir, target_triple):
+    if not package_gstreamer_dlls(servo_exe_dir, target):
         return False
 
     print(" • Copying MSVC DLLs to binary directory...")
-    if not package_msvc_dlls(servo_exe_dir, target_triple):
+    if not package_msvc_dlls(servo_exe_dir, target):
         return False
 
     return True
 
 
-def package_gstreamer_dlls(servo_exe_dir: str, target: str):
-    gst_root = servo.platform.get().gstreamer_root(cross_compilation_target=target)
+def package_gstreamer_dlls(servo_exe_dir: str, target: BuildTarget):
+    gst_root = servo.platform.get().gstreamer_root(target)
     if not gst_root:
         print("Could not find GStreamer installation directory.")
         return False
@@ -432,7 +322,7 @@ def package_gstreamer_dlls(servo_exe_dir: str, target: str):
     return not missing
 
 
-def package_msvc_dlls(servo_exe_dir: str, target: str):
+def package_msvc_dlls(servo_exe_dir: str, target: BuildTarget):
     def copy_file(dll_path: Optional[str]) -> bool:
         if not dll_path or not os.path.exists(dll_path):
             print(f"WARNING: Could not find DLL at {dll_path}", file=sys.stderr)
@@ -449,7 +339,7 @@ def package_msvc_dlls(servo_exe_dir: str, target: str):
         "x86_64": "x64",
         "i686": "x86",
         "aarch64": "arm64",
-    }[target.split('-')[0]]
+    }[target.triple().split('-')[0]]
 
     for msvc_redist_dir in servo.visual_studio.find_msvc_redist_dirs(vs_platform):
         if copy_file(os.path.join(msvc_redist_dir, "msvcp140.dll")) and \

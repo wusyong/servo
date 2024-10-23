@@ -7,22 +7,25 @@ use js::jsapi::{JSObject, Type};
 use js::rust::CustomAutoRooterGuard;
 use js::typedarray::{ArrayBufferView, ArrayBufferViewU8, TypedArray};
 use servo_rand::{RngCore, ServoRng};
+use uuid::Uuid;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CryptoBinding::CryptoMethods;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::subtlecrypto::SubtleCrypto;
 use crate::script_runtime::JSContext;
 
 // https://developer.mozilla.org/en-US/docs/Web/API/Crypto
 #[dom_struct]
 pub struct Crypto {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "Defined in rand"]
     #[no_trace]
     rng: DomRefCell<ServoRng>,
+    subtle: MutNullableDom<SubtleCrypto>,
 }
 
 impl Crypto {
@@ -30,6 +33,7 @@ impl Crypto {
         Crypto {
             reflector_: Reflector::new(),
             rng: DomRefCell::new(ServoRng::default()),
+            subtle: MutNullableDom::default(),
         }
     }
 
@@ -39,8 +43,13 @@ impl Crypto {
 }
 
 impl CryptoMethods for Crypto {
+    /// <https://w3c.github.io/webcrypto/#dfn-Crypto-attribute-subtle>
+    fn Subtle(&self) -> DomRoot<SubtleCrypto> {
+        self.subtle.or_init(|| SubtleCrypto::new(&self.global()))
+    }
+
     #[allow(unsafe_code)]
-    // https://dvcs.w3.org/hg/webcrypto-api/raw-file/tip/spec/Overview.html#Crypto-method-getRandomValues
+    // https://w3c.github.io/webcrypto/#Crypto-method-getRandomValues
     fn GetRandomValues(
         &self,
         _cx: JSContext,
@@ -61,6 +70,15 @@ impl CryptoMethods for Crypto {
                 .map_err(|_| Error::JSFailed)
         }
     }
+
+    // https://w3c.github.io/webcrypto/#Crypto-method-randomUUID
+    fn RandomUUID(&self) -> USVString {
+        let uuid = Uuid::new_v4();
+        uuid.hyphenated()
+            .encode_lower(&mut Uuid::encode_buffer())
+            .to_owned()
+            .into()
+    }
 }
 
 fn is_integer_buffer(array_type: Type) -> bool {
@@ -72,6 +90,8 @@ fn is_integer_buffer(array_type: Type) -> bool {
             Type::Uint16 |
             Type::Int16 |
             Type::Uint32 |
-            Type::Int32
+            Type::Int32 |
+            Type::BigInt64 |
+            Type::BigUint64
     )
 }

@@ -9,15 +9,15 @@ use std::collections::LinkedList;
 use std::sync::Arc;
 
 use app_units::Au;
-use gfx::font::{self, FontMetrics, FontRef, RunMetrics, ShapingFlags, ShapingOptions};
-use gfx::font_cache_thread::FontIdentifier;
-use gfx::text::glyph::ByteIndex;
-use gfx::text::text_run::TextRun;
-use gfx::text::util::{self, CompressionMode};
+use base::text::is_bidi_control;
+use fonts::{
+    self, ByteIndex, FontContext, FontIdentifier, FontMetrics, FontRef, RunMetrics, ShapingFlags,
+    ShapingOptions, LAST_RESORT_GLYPH_ADVANCE,
+};
 use log::{debug, warn};
 use range::Range;
 use style::computed_values::text_rendering::T as TextRendering;
-use style::computed_values::white_space::T as WhiteSpace;
+use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::computed_values::word_break::T as WordBreak;
 use style::logical_geometry::{LogicalSize, WritingMode};
 use style::properties::style_structs::Font as FontStyleStruct;
@@ -28,13 +28,13 @@ use unicode_bidi as bidi;
 use unicode_script::Script;
 use xi_unicode::LineBreakLeafIter;
 
-use crate::context::LayoutFontContext;
 use crate::fragment::{
     Fragment, ScannedTextFlags, ScannedTextFragmentInfo, SpecificFragmentInfo,
     UnscannedTextFragmentInfo,
 };
 use crate::inline::{InlineFragmentNodeFlags, InlineFragments};
 use crate::linked_list::split_off_head;
+use crate::text_run::TextRun;
 
 /// Returns the concatenated text of a list of unscanned text fragments.
 fn text(fragments: &LinkedList<Fragment>) -> String {
@@ -46,7 +46,7 @@ fn text(fragments: &LinkedList<Fragment>) -> String {
 
     for fragment in fragments {
         if let SpecificFragmentInfo::UnscannedText(ref info) = fragment.specific {
-            if fragment.white_space().preserve_newlines() {
+            if fragment.white_space_collapse() != WhiteSpaceCollapse::Collapse {
                 text.push_str(&info.text);
             } else {
                 text.push_str(&info.text.replace('\n', " "));
@@ -70,7 +70,7 @@ impl TextRunScanner {
 
     pub fn scan_for_runs(
         &mut self,
-        font_context: &mut LayoutFontContext,
+        font_context: &FontContext,
         mut fragments: LinkedList<Fragment>,
     ) -> InlineFragments {
         debug!(
@@ -150,7 +150,7 @@ impl TextRunScanner {
     /// be adjusted.
     fn flush_clump_to_list(
         &mut self,
-        font_context: &mut LayoutFontContext,
+        font_context: &FontContext,
         out_fragments: &mut Vec<Fragment>,
         paragraph_bytes_processed: &mut usize,
         bidi_levels: Option<&[bidi::Level]>,
@@ -190,12 +190,12 @@ impl TextRunScanner {
                 let font_style = in_fragment.style().clone_font();
                 let inherited_text_style = in_fragment.style().get_inherited_text();
                 font_group = font_context.font_group(font_style);
-                compression = match in_fragment.white_space() {
-                    WhiteSpace::Normal | WhiteSpace::Nowrap => {
-                        CompressionMode::CompressWhitespaceNewline
+                compression = match in_fragment.white_space_collapse() {
+                    WhiteSpaceCollapse::Collapse => CompressionMode::CompressWhitespaceNewline,
+                    WhiteSpaceCollapse::Preserve | WhiteSpaceCollapse::BreakSpaces => {
+                        CompressionMode::CompressNone
                     },
-                    WhiteSpace::Pre | WhiteSpace::PreWrap => CompressionMode::CompressNone,
-                    WhiteSpace::PreLine => CompressionMode::CompressWhitespace,
+                    WhiteSpaceCollapse::PreserveBreaks => CompressionMode::CompressWhitespace,
                 };
                 text_transform = inherited_text_style.text_transform;
                 letter_spacing = inherited_text_style.letter_spacing;
@@ -205,14 +205,13 @@ impl TextRunScanner {
                     .map(|l| l.into())
                     .unwrap_or_else(|| {
                         let space_width = font_group
-                            .borrow_mut()
-                            .find_by_codepoint(font_context, ' ')
+                            .write()
+                            .find_by_codepoint(font_context, ' ', None)
                             .and_then(|font| {
-                                let font = font.borrow();
                                 font.glyph_index(' ')
                                     .map(|glyph_id| font.glyph_h_advance(glyph_id))
                             })
-                            .unwrap_or(font::LAST_RESORT_GLYPH_ADVANCE);
+                            .unwrap_or(LAST_RESORT_GLYPH_ADVANCE);
                         inherited_text_style
                             .word_spacing
                             .to_used_value(Au::from_f64_px(space_width))
@@ -249,9 +248,10 @@ impl TextRunScanner {
                 let (mut start_position, mut end_position) = (0, 0);
                 for (byte_index, character) in text.char_indices() {
                     if !character.is_control() {
-                        let font = font_group
-                            .borrow_mut()
-                            .find_by_codepoint(font_context, character);
+                        let font =
+                            font_group
+                                .write()
+                                .find_by_codepoint(font_context, character, None);
 
                         let bidi_level = match bidi_levels {
                             Some(levels) => levels[*paragraph_bytes_processed],
@@ -369,7 +369,7 @@ impl TextRunScanner {
                 // If no font is found (including fallbacks), there's no way we can render.
                 let font = match run_info
                     .font
-                    .or_else(|| font_group.borrow_mut().first(font_context))
+                    .or_else(|| font_group.write().first(font_context))
                 {
                     Some(font) => font,
                     None => {
@@ -378,8 +378,10 @@ impl TextRunScanner {
                     },
                 };
 
+                let font_instance_key = font.key(font_context);
                 let (run, break_at_zero) = TextRun::new(
-                    &mut font.borrow_mut(),
+                    font,
+                    font_instance_key,
                     run_info.text,
                     &options,
                     run_info.bidi_level,
@@ -537,14 +539,12 @@ fn bounding_box_for_run_metrics(
 /// Panics if no font can be found for the given font style.
 #[inline]
 pub fn font_metrics_for_style(
-    font_context: &mut LayoutFontContext,
+    font_context: &FontContext,
     style: crate::ServoArc<FontStyleStruct>,
 ) -> FontMetrics {
     let font_group = font_context.font_group(style);
-    let font = font_group.borrow_mut().first(font_context);
-    let font = font.as_ref().unwrap().borrow();
-
-    font.metrics.clone()
+    let font = font_group.write().first(font_context);
+    font.as_ref().unwrap().metrics.clone()
 }
 
 /// Returns the line block-size needed by the given computed style and font size.
@@ -568,7 +568,7 @@ fn split_first_fragment_at_newline_if_necessary(fragments: &mut LinkedList<Fragm
         let string_before;
         let selection_before;
         {
-            if !first_fragment.white_space().preserve_newlines() {
+            if first_fragment.white_space_collapse() == WhiteSpaceCollapse::Collapse {
                 return;
             }
 
@@ -666,10 +666,8 @@ impl RunInfo {
 
     fn has_font(&self, font: &Option<FontRef>) -> bool {
         fn identifier_and_pt_size(font: &Option<FontRef>) -> Option<(FontIdentifier, Au)> {
-            font.as_ref().map(|font| {
-                let font = font.borrow();
-                (font.identifier().clone(), font.descriptor.pt_size)
-            })
+            font.as_ref()
+                .map(|font| (font.identifier().clone(), font.descriptor.pt_size))
         }
 
         identifier_and_pt_size(&self.font) == identifier_and_pt_size(font)
@@ -718,7 +716,7 @@ impl RunMapping {
     ) {
         let was_empty = *start_position == end_position;
         let old_byte_length = run_info.text.len();
-        *last_whitespace = util::transform_text(
+        *last_whitespace = transform_text(
             &text[(*start_position)..end_position],
             compression,
             *last_whitespace,
@@ -776,7 +774,7 @@ fn apply_style_transform_if_necessary(
     last_whitespace: bool,
     is_first_run: bool,
 ) {
-    match text_transform.case_ {
+    match text_transform.case() {
         TextTransformCase::None => {},
         TextTransformCase::Uppercase => {
             let original = string[first_character_position..].to_owned();
@@ -833,4 +831,183 @@ fn is_compatible(a: Script, b: Script) -> bool {
 /// Returns true if the script is not invalid or inherited.
 fn is_specific(script: Script) -> bool {
     script != Script::Common && script != Script::Inherited
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names)]
+pub enum CompressionMode {
+    CompressNone,
+    CompressWhitespace,
+    CompressWhitespaceNewline,
+}
+
+// ported from Gecko's nsTextFrameUtils::TransformText.
+//
+// High level TODOs:
+//
+// * Issue #113: consider incoming text state (arabic, etc)
+//               and propagate outgoing text state (dual of above)
+//
+// * Issue #114: record skipped and kept chars for mapping original to new text
+//
+// * Untracked: various edge cases for bidi, CJK, etc.
+pub fn transform_text(
+    text: &str,
+    mode: CompressionMode,
+    incoming_whitespace: bool,
+    output_text: &mut String,
+) -> bool {
+    let out_whitespace = match mode {
+        CompressionMode::CompressNone => {
+            for ch in text.chars() {
+                if is_discardable_char(ch, mode) {
+                    // TODO: record skipped char
+                } else {
+                    // TODO: record kept char
+                    if ch == '\t' {
+                        // TODO: set "has tab" flag
+                    }
+                    output_text.push(ch);
+                }
+            }
+            false
+        },
+
+        CompressionMode::CompressWhitespace | CompressionMode::CompressWhitespaceNewline => {
+            let mut in_whitespace: bool = incoming_whitespace;
+            for ch in text.chars() {
+                // TODO: discard newlines between CJK chars
+                let mut next_in_whitespace: bool = is_in_whitespace(ch, mode);
+
+                if !next_in_whitespace {
+                    if is_always_discardable_char(ch) {
+                        // revert whitespace setting, since this char was discarded
+                        next_in_whitespace = in_whitespace;
+                    // TODO: record skipped char
+                    } else {
+                        // TODO: record kept char
+                        output_text.push(ch);
+                    }
+                } else {
+                    /* next_in_whitespace; possibly add a space char */
+                    if in_whitespace {
+                        // TODO: record skipped char
+                    } else {
+                        // TODO: record kept char
+                        output_text.push(' ');
+                    }
+                }
+                // save whitespace context for next char
+                in_whitespace = next_in_whitespace;
+            } /* /for str::each_char */
+            in_whitespace
+        },
+    };
+
+    return out_whitespace;
+
+    fn is_in_whitespace(ch: char, mode: CompressionMode) -> bool {
+        match (ch, mode) {
+            (' ', _) => true,
+            ('\t', _) => true,
+            ('\n', CompressionMode::CompressWhitespaceNewline) => true,
+            (_, _) => false,
+        }
+    }
+
+    fn is_discardable_char(ch: char, mode: CompressionMode) -> bool {
+        if is_always_discardable_char(ch) {
+            return true;
+        }
+        match mode {
+            CompressionMode::CompressWhitespaceNewline => ch == '\n',
+            _ => false,
+        }
+    }
+
+    fn is_always_discardable_char(ch: char) -> bool {
+        // TODO: check for soft hyphens.
+        is_bidi_control(ch)
+    }
+}
+
+#[test]
+fn test_transform_compress_none() {
+    let test_strs = [
+        "  foo bar",
+        "foo bar  ",
+        "foo\n bar",
+        "foo \nbar",
+        "  foo  bar  \nbaz",
+        "foo bar baz",
+        "foobarbaz\n\n",
+    ];
+
+    let mode = CompressionMode::CompressNone;
+    for &test in test_strs.iter() {
+        let mut trimmed_str = String::new();
+        transform_text(test, mode, true, &mut trimmed_str);
+        assert_eq!(trimmed_str, test)
+    }
+}
+
+#[test]
+fn test_transform_compress_whitespace() {
+    let test_strs = [
+        ("  foo bar", "foo bar"),
+        ("foo bar  ", "foo bar "),
+        ("foo\n bar", "foo\n bar"),
+        ("foo \nbar", "foo \nbar"),
+        ("  foo  bar  \nbaz", "foo bar \nbaz"),
+        ("foo bar baz", "foo bar baz"),
+        ("foobarbaz\n\n", "foobarbaz\n\n"),
+    ];
+
+    let mode = CompressionMode::CompressWhitespace;
+    for &(test, oracle) in test_strs.iter() {
+        let mut trimmed_str = String::new();
+        transform_text(test, mode, true, &mut trimmed_str);
+        assert_eq!(&*trimmed_str, oracle)
+    }
+}
+
+#[test]
+fn test_transform_compress_whitespace_newline() {
+    let test_strs = vec![
+        ("  foo bar", "foo bar"),
+        ("foo bar  ", "foo bar "),
+        ("foo\n bar", "foo bar"),
+        ("foo \nbar", "foo bar"),
+        ("  foo  bar  \nbaz", "foo bar baz"),
+        ("foo bar baz", "foo bar baz"),
+        ("foobarbaz\n\n", "foobarbaz "),
+    ];
+
+    let mode = CompressionMode::CompressWhitespaceNewline;
+    for &(test, oracle) in test_strs.iter() {
+        let mut trimmed_str = String::new();
+        transform_text(test, mode, true, &mut trimmed_str);
+        assert_eq!(&*trimmed_str, oracle)
+    }
+}
+
+#[test]
+fn test_transform_compress_whitespace_newline_no_incoming() {
+    let test_strs = [
+        ("  foo bar", " foo bar"),
+        ("\nfoo bar", " foo bar"),
+        ("foo bar  ", "foo bar "),
+        ("foo\n bar", "foo bar"),
+        ("foo \nbar", "foo bar"),
+        ("  foo  bar  \nbaz", " foo bar baz"),
+        ("foo bar baz", "foo bar baz"),
+        ("foobarbaz\n\n", "foobarbaz "),
+    ];
+
+    let mode = CompressionMode::CompressWhitespaceNewline;
+    for &(test, oracle) in test_strs.iter() {
+        let mut trimmed_str = String::new();
+        transform_text(test, mode, false, &mut trimmed_str);
+        assert_eq!(trimmed_str, oracle)
+    }
 }

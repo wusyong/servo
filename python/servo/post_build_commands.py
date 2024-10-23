@@ -26,11 +26,13 @@ import servo.util
 import servo.platform
 
 from servo.command_base import (
-    BuildType,
     CommandBase,
     check_call,
     is_linux,
 )
+
+
+ANDROID_APP_NAME = "org.servo.servoshell"
 
 
 def read_file(filename, if_exists=False):
@@ -71,16 +73,18 @@ class PostBuildCommands(CommandBase):
                      help='Launch in headless mode')
     @CommandArgument('--software', '-s', action='store_true',
                      help='Launch with software rendering')
-    @CommandArgument('--bin', default=None,
-                     help='Launch with specific binary')
-    @CommandArgument('--nightly', '-n', default=None,
-                     help='Specify a YYYY-MM-DD nightly build to run')
     @CommandArgument(
         'params', nargs='...',
         help="Command-line arguments to be passed through to Servo")
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def run(self, params, build_type: BuildType, android=None, debugger=False, debugger_cmd=None,
-            headless=False, software=False, bin=None, emulator=False, usb=False, nightly=None):
+    @CommandBase.common_command_arguments(binary_selection=True)
+    @CommandBase.allow_target_configuration
+    def run(self, servo_binary: str, params, debugger=False, debugger_cmd=None,
+            headless=False, software=False, emulator=False, usb=False):
+        self._run(servo_binary, params, debugger, debugger_cmd,
+                  headless, software, emulator, usb)
+
+    def _run(self, servo_binary: str, params, debugger=False, debugger_cmd=None,
+             headless=False, software=False, emulator=False, usb=False):
         env = self.build_env()
         env["RUST_BACKTRACE"] = "1"
         if software:
@@ -95,16 +99,13 @@ class PostBuildCommands(CommandBase):
         if debugger_cmd:
             debugger = True
 
-        if android is None:
-            android = self.config["build"]["android"]
-
-        if android:
+        if self.is_android():
             if debugger:
                 print("Android on-device debugging is not supported by mach yet. See")
                 print("https://github.com/servo/servo/wiki/Building-for-Android#debugging-on-device")
                 return
             script = [
-                "am force-stop org.mozilla.servo",
+                f"am force-stop {ANDROID_APP_NAME}",
             ]
             json_params = shell_quote(json.dumps(params))
             extra = "-e servoargs " + json_params
@@ -115,10 +116,10 @@ class PostBuildCommands(CommandBase):
             if gst_debug:
                 extra += " -e gstdebug " + gst_debug
             script += [
-                "am start " + extra + " org.mozilla.servo/org.mozilla.servo.MainActivity",
+                f"am start {extra} {ANDROID_APP_NAME}/{ANDROID_APP_NAME}.MainActivity",
                 "sleep 0.5",
-                "echo Servo PID: $(pidof org.mozilla.servo)",
-                "logcat --pid=$(pidof org.mozilla.servo)",
+                f"echo Servo PID: $(pidof {ANDROID_APP_NAME})",
+                f"logcat --pid=$(pidof {ANDROID_APP_NAME})",
                 "exit"
             ]
             args = [self.android_adb_path(env)]
@@ -133,7 +134,7 @@ class PostBuildCommands(CommandBase):
             shell.communicate(bytes("\n".join(script) + "\n", "utf8"))
             return shell.wait()
 
-        args = [bin or self.get_nightly_binary_path(nightly) or self.get_binary_path(build_type)]
+        args = [servo_binary]
 
         if headless:
             args.append('-z')
@@ -197,20 +198,15 @@ class PostBuildCommands(CommandBase):
     @Command('rr-record',
              description='Run Servo whilst recording execution with rr',
              category='post-build')
-    @CommandArgument('--bin', default=None,
-                     help='Launch with specific binary')
-    @CommandArgument('--nightly', '-n', default=None,
-                     help='Specify a YYYY-MM-DD nightly build to run')
     @CommandArgument(
         'params', nargs='...',
         help="Command-line arguments to be passed through to Servo")
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def rr_record(self, build_type: BuildType, bin=None, nightly=None, params=[]):
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def rr_record(self, servo_binary: str, params=[]):
         env = self.build_env()
         env["RUST_BACKTRACE"] = "1"
 
-        servo_cmd = [bin or self.get_nightly_binary_path(nightly)
-                     or self.get_binary_path(build_type)] + params
+        servo_cmd = [servo_binary] + params
         rr_cmd = ['rr', '--fatal-errors', 'record']
         try:
             check_call(rr_cmd + servo_cmd)
@@ -246,12 +242,16 @@ class PostBuildCommands(CommandBase):
         if not path.exists(docs):
             os.makedirs(docs)
 
+        # Document library crates to avoid package name conflict between severoshell
+        # and libservo. Besides, main.rs in servoshell is just a stub.
+        params.insert(0, "--lib")
         # Documentation build errors shouldn't cause the entire build to fail. This
         # prevents issues with dependencies from breaking our documentation build,
         # with the downside that it hides documentation issues.
         params.insert(0, "--keep-going")
 
         env = self.build_env()
+        env["RUSTC"] = "rustc"
         returncode = self.run_cargo_build_like_command("doc", params, env=env, **kwargs)
         if returncode:
             return returncode

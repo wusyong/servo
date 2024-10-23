@@ -18,7 +18,7 @@ use crate::dom::dompointreadonly::DOMPointReadOnly;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::dom::xrrigidtransform::XRRigidTransform;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
 pub struct XRRay {
@@ -43,15 +43,22 @@ impl XRRay {
         global: &GlobalScope,
         proto: Option<HandleObject>,
         ray: Ray<ApiSpace>,
+        can_gc: CanGc,
     ) -> DomRoot<XRRay> {
-        reflect_dom_object_with_proto(Box::new(XRRay::new_inherited(ray)), global, proto)
+        reflect_dom_object_with_proto(Box::new(XRRay::new_inherited(ray)), global, proto, can_gc)
     }
 
-    #[allow(non_snake_case)]
+    pub fn ray(&self) -> Ray<ApiSpace> {
+        self.ray
+    }
+}
+
+impl XRRayMethods for XRRay {
     /// <https://immersive-web.github.io/hit-test/#dom-xrray-xrray>
-    pub fn Constructor(
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         origin: &DOMPointInit,
         direction: &XRRayDirectionInit,
     ) -> Fallible<DomRoot<Self>> {
@@ -79,14 +86,15 @@ impl XRRay {
             &window.global(),
             proto,
             Ray { origin, direction },
+            can_gc,
         ))
     }
 
-    #[allow(non_snake_case)]
     /// <https://immersive-web.github.io/hit-test/#dom-xrray-xrray-transform>
-    pub fn Constructor_(
+    fn Constructor_(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         transform: &XRRigidTransform,
     ) -> Fallible<DomRoot<Self>> {
         let transform = transform.transform();
@@ -99,34 +107,31 @@ impl XRRay {
             &window.global(),
             proto,
             Ray { origin, direction },
+            can_gc,
         ))
     }
 
-    pub fn ray(&self) -> Ray<ApiSpace> {
-        self.ray
-    }
-}
-
-impl XRRayMethods for XRRay {
     /// <https://immersive-web.github.io/hit-test/#dom-xrray-origin>
-    fn Origin(&self) -> DomRoot<DOMPointReadOnly> {
+    fn Origin(&self, can_gc: CanGc) -> DomRoot<DOMPointReadOnly> {
         DOMPointReadOnly::new(
             &self.global(),
             self.ray.origin.x as f64,
             self.ray.origin.y as f64,
             self.ray.origin.z as f64,
             1.,
+            can_gc,
         )
     }
 
     /// <https://immersive-web.github.io/hit-test/#dom-xrray-direction>
-    fn Direction(&self) -> DomRoot<DOMPointReadOnly> {
+    fn Direction(&self, can_gc: CanGc) -> DomRoot<DOMPointReadOnly> {
         DOMPointReadOnly::new(
             &self.global(),
             self.ray.direction.x as f64,
             self.ray.direction.y as f64,
             self.ray.direction.z as f64,
             0.,
+            can_gc,
         )
     }
 

@@ -1,10 +1,11 @@
 [package]
 name = "servo_config"
-version = "0.0.1"
-authors = ["The Servo Project Developers"]
-license = "MPL-2.0"
-edition = "2018"
-publish = false
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "servo_config"
@@ -14,7 +15,6 @@ path = "lib.rs"
 embedder_traits = { workspace = true }
 euclid = { workspace = true }
 getopts = { workspace = true }
-lazy_static = { workspace = true }
 log = { workspace = true }
 num_cpus = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -26,4 +26,4 @@ style_config = { workspace = true }
 url = { workspace = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-dirs-next = "2.0"
+dirs = "5.0"

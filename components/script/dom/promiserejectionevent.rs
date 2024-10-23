@@ -2,10 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
-use js::jsapi::Heap;
+use js::jsapi::{Heap, JSObject};
 use js::jsval::JSVal;
 use js::rust::{HandleObject, HandleValue};
 use servo_atoms::Atom;
@@ -22,23 +23,23 @@ use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
 pub struct PromiseRejectionEvent {
     event: Event,
-    #[ignore_malloc_size_of = "Rc"]
-    promise: Rc<Promise>,
-    #[ignore_malloc_size_of = "Defined in rust-mozjs"]
+    #[ignore_malloc_size_of = "Defined in mozjs"]
+    promise: Heap<*mut JSObject>,
+    #[ignore_malloc_size_of = "Defined in mozjs"]
     reason: Heap<JSVal>,
 }
 
 impl PromiseRejectionEvent {
     #[allow(crown::unrooted_must_root)]
-    fn new_inherited(promise: Rc<Promise>) -> Self {
+    fn new_inherited() -> Self {
         PromiseRejectionEvent {
             event: Event::new_inherited(),
-            promise,
+            promise: Heap::default(),
             reason: Heap::default(),
         }
     }
@@ -50,25 +51,39 @@ impl PromiseRejectionEvent {
         cancelable: EventCancelable,
         promise: Rc<Promise>,
         reason: HandleValue,
+        can_gc: CanGc,
     ) -> DomRoot<Self> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable, promise, reason)
+        Self::new_with_proto(
+            global,
+            None,
+            type_,
+            bubbles,
+            cancelable,
+            promise.promise_obj(),
+            reason,
+            can_gc,
+        )
     }
 
     #[allow(crown::unrooted_must_root)]
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
-        promise: Rc<Promise>,
+        promise: HandleObject,
         reason: HandleValue,
+        can_gc: CanGc,
     ) -> DomRoot<Self> {
         let ev = reflect_dom_object_with_proto(
-            Box::new(PromiseRejectionEvent::new_inherited(promise)),
+            Box::new(PromiseRejectionEvent::new_inherited()),
             global,
             proto,
+            can_gc,
         );
+        ev.promise.set(promise.get());
 
         {
             let event = ev.upcast::<Event>();
@@ -78,16 +93,18 @@ impl PromiseRejectionEvent {
         }
         ev
     }
+}
 
-    #[allow(crown::unrooted_must_root, non_snake_case)]
-    pub fn Constructor(
+impl PromiseRejectionEventMethods for PromiseRejectionEvent {
+    // https://html.spec.whatwg.org/multipage/#promiserejectionevent
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: RootedTraceableBox<PromiseRejectionEventBinding::PromiseRejectionEventInit>,
     ) -> Fallible<DomRoot<Self>> {
         let reason = init.reason.handle();
-        let promise = init.promise.clone();
         let bubbles = EventBubbles::from(init.parent.bubbles);
         let cancelable = EventCancelable::from(init.parent.cancelable);
 
@@ -97,17 +114,16 @@ impl PromiseRejectionEvent {
             Atom::from(type_),
             bubbles,
             cancelable,
-            promise,
+            init.promise.handle(),
             reason,
+            can_gc,
         );
         Ok(event)
     }
-}
 
-impl PromiseRejectionEventMethods for PromiseRejectionEvent {
     // https://html.spec.whatwg.org/multipage/#dom-promiserejectionevent-promise
-    fn Promise(&self) -> Rc<Promise> {
-        self.promise.clone()
+    fn Promise(&self, _cx: JSContext) -> NonNull<JSObject> {
+        NonNull::new(self.promise.get()).unwrap()
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-promiserejectionevent-reason

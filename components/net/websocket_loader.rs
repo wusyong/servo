@@ -39,7 +39,7 @@ use url::Url;
 
 use crate::async_runtime::HANDLE;
 use crate::connector::{create_tls_config, CACertificates, TlsConfig};
-use crate::cookie::Cookie;
+use crate::cookie::ServoCookie;
 use crate::fetch::methods::should_be_blocked_due_to_bad_port;
 use crate::hosts::replace_host;
 use crate::http_loader::HttpState;
@@ -127,7 +127,7 @@ fn process_ws_response(
     for cookie in response.headers().get_all(header::SET_COOKIE) {
         if let Ok(s) = std::str::from_utf8(cookie.as_bytes()) {
             if let Some(cookie) =
-                Cookie::from_cookie_string(s.into(), resource_url, CookieSource::HTTP)
+                ServoCookie::from_cookie_string(s.into(), resource_url, CookieSource::HTTP)
             {
                 jar.push(cookie, resource_url, CookieSource::HTTP);
             }
@@ -157,10 +157,10 @@ fn setup_dom_listener(
 ) -> UnboundedReceiver<DomMsg> {
     let (sender, receiver) = unbounded_channel();
 
-    ROUTER.add_route(
-        dom_action_receiver.to_opaque(),
+    ROUTER.add_typed_route(
+        dom_action_receiver,
         Box::new(move |message| {
-            let dom_action = message.to().expect("Ws dom_action message to deserialize");
+            let dom_action = message.expect("Ws dom_action message to deserialize");
             trace!("handling WS DOM action: {:?}", dom_action);
             match dom_action {
                 WebSocketDomAction::SendMessage(MessageData::Text(data)) => {

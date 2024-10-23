@@ -8,28 +8,31 @@ mod constellation_msg;
 
 use std::fmt::{Debug, Error, Formatter};
 
-use canvas::canvas_paint_thread::ImageUpdate;
+use base::id::{PipelineId, TopLevelBrowsingContextId};
+use base::Epoch;
 pub use constellation_msg::ConstellationMsg;
 use crossbeam_channel::{Receiver, Sender};
 use embedder_traits::EventLoopWaker;
 use euclid::Rect;
-use gfx_traits::Epoch;
 use ipc_channel::ipc::IpcSender;
 use log::warn;
-use msg::constellation_msg::{PipelineId, TopLevelBrowsingContextId};
-use net_traits::image::base::Image;
-use net_traits::NetToCompositorMsg;
+use pixels::Image;
 use script_traits::{
     AnimationState, ConstellationControlMsg, EventResult, MouseButton, MouseEventType,
-    ScriptToCompositorMsg,
 };
 use style_traits::CSSPixel;
-use webrender_api::units::{DeviceIntPoint, DeviceIntSize, DeviceRect};
-use webrender_api::{self, FontInstanceKey, FontKey, ImageKey, NativeFontHandle};
+use webrender_api::units::DeviceRect;
+use webrender_api::DocumentId;
+use webrender_traits::{CrossProcessCompositorApi, CrossProcessCompositorMessage};
 
 /// Sends messages to the compositor.
+#[derive(Clone)]
 pub struct CompositorProxy {
     pub sender: Sender<CompositorMsg>,
+    /// Access to [`Self::sender`] that is possible to send across an IPC
+    /// channel. These messages are routed via the router thread to
+    /// [`Self::sender`].
+    pub cross_process_compositor_api: CrossProcessCompositorApi,
     pub event_loop_waker: Box<dyn EventLoopWaker>,
 }
 
@@ -39,15 +42,6 @@ impl CompositorProxy {
             warn!("Failed to send response ({:?}).", err);
         }
         self.event_loop_waker.wake();
-    }
-}
-
-impl Clone for CompositorProxy {
-    fn clone(&self) -> CompositorProxy {
-        CompositorProxy {
-            sender: self.sender.clone(),
-            event_loop_waker: self.event_loop_waker.clone(),
-        }
     }
 }
 
@@ -94,8 +88,9 @@ pub enum CompositorMsg {
     /// Set whether to use less resources by stopping animations.
     SetThrottled(PipelineId, bool),
     /// WebRender has produced a new frame. This message informs the compositor that
-    /// the frame is ready, so that it may trigger a recomposite.
-    NewWebRenderFrameReady(bool /* composite_needed */),
+    /// the frame is ready. It contains a bool to indicate if it needs to composite and the
+    /// `DocumentId` of the new frame.
+    NewWebRenderFrameReady(DocumentId, bool),
     /// A pipeline was shut down.
     // This message acts as a synchronization point between the constellation,
     // when it shuts down a pipeline, to the compositor; when the compositor
@@ -113,16 +108,9 @@ pub enum CompositorMsg {
     /// WebDriver mouse move event
     WebDriverMouseMoveEvent(f32, f32),
 
-    /// Get Window Informations size and position.
-    GetClientWindow(IpcSender<(DeviceIntSize, DeviceIntPoint)>),
-    /// Get screen size.
-    GetScreenSize(IpcSender<DeviceIntSize>),
-    /// Get screen available size.
-    GetScreenAvailSize(IpcSender<DeviceIntSize>),
-
     /// Messages forwarded to the compositor by the constellation from other crates. These
     /// messages are mainly passed on from the compositor to WebRender.
-    Forwarded(ForwardedToCompositorMsg),
+    CrossProcess(CrossProcessCompositorMessage),
 }
 
 pub struct SendableFrameTree {
@@ -136,25 +124,6 @@ pub struct CompositionPipeline {
     pub id: PipelineId,
     pub top_level_browsing_context_id: TopLevelBrowsingContextId,
     pub script_chan: IpcSender<ConstellationControlMsg>,
-}
-
-pub enum FontToCompositorMsg {
-    AddFontInstance(FontKey, f32, Sender<FontInstanceKey>),
-    AddFont(Sender<FontKey>, u32, ipc_channel::ipc::IpcBytesReceiver),
-    AddSystemFont(Sender<FontKey>, NativeFontHandle),
-}
-
-pub enum CanvasToCompositorMsg {
-    GenerateKey(Sender<ImageKey>),
-    UpdateImages(Vec<ImageUpdate>),
-}
-
-/// Messages forwarded by the Constellation to the Compositor.
-pub enum ForwardedToCompositorMsg {
-    Layout(ScriptToCompositorMsg),
-    Net(NetToCompositorMsg),
-    Font(FontToCompositorMsg),
-    Canvas(CanvasToCompositorMsg),
 }
 
 impl Debug for CompositorMsg {
@@ -180,10 +149,7 @@ impl Debug for CompositorMsg {
             CompositorMsg::LoadComplete(..) => write!(f, "LoadComplete"),
             CompositorMsg::WebDriverMouseButtonEvent(..) => write!(f, "WebDriverMouseButtonEvent"),
             CompositorMsg::WebDriverMouseMoveEvent(..) => write!(f, "WebDriverMouseMoveEvent"),
-            CompositorMsg::GetClientWindow(..) => write!(f, "GetClientWindow"),
-            CompositorMsg::GetScreenSize(..) => write!(f, "GetScreenSize"),
-            CompositorMsg::GetScreenAvailSize(..) => write!(f, "GetScreenAvailSize"),
-            CompositorMsg::Forwarded(..) => write!(f, "Webrender"),
+            CompositorMsg::CrossProcess(..) => write!(f, "CrossProcess"),
         }
     }
 }

@@ -9,10 +9,10 @@ use std::fmt::Debug;
 use std::sync::Arc as StdArc;
 
 use atomic_refcell::AtomicRef;
-use gfx_traits::{ByteIndex, FragmentType};
+use base::id::{BrowsingContextId, PipelineId};
+use fonts_traits::ByteIndex;
 use html5ever::{local_name, namespace_url, ns, LocalName, Namespace};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image::base::{Image, ImageMetadata};
+use pixels::{Image, ImageMetadata};
 use range::Range;
 use servo_arc::Arc;
 use servo_url::ServoUrl;
@@ -25,7 +25,8 @@ use style::selector_parser::{PseudoElement, PseudoElementCascadeType, SelectorIm
 use style::stylist::RuleInclusion;
 
 use crate::{
-    GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutNodeType, SVGSVGData, StyleData,
+    FragmentType, GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutNodeType, SVGSVGData,
+    StyleData,
 };
 
 pub trait LayoutDataTrait: Default + Send + Sync + 'static {}
@@ -228,6 +229,9 @@ pub trait ThreadSafeLayoutNode<'dom>: Clone + Copy + Debug + NodeInfo + PartialE
 
     /// Returns a ThreadSafeLayoutElement if this is an element, None otherwise.
     fn as_element(&self) -> Option<Self::ConcreteThreadSafeLayoutElement>;
+
+    /// Returns a ThreadSafeLayoutElement if this is an element in an HTML namespace, None otherwise.
+    fn as_html_element(&self) -> Option<Self::ConcreteThreadSafeLayoutElement>;
 
     #[inline]
     fn get_pseudo_element_type(&self) -> PseudoElementType {

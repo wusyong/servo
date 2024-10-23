@@ -90,9 +90,13 @@ def executor_kwargs(logger, test_type, test_environment, run_info_data,
 def env_extras(**kwargs):
     return []
 
+# Default preferences for Android to use when the preference is not specifically stated.
+# See Bug 1577912
+def default_prefs():
+    return {"fission.disableSessionHistoryInParent": "true"}
 
 def run_info_extras(logger, **kwargs):
-    rv = fx_run_info_extras(logger, **kwargs)
+    rv = fx_run_info_extras(logger, default_prefs=default_prefs(), **kwargs)
     rv.update({"headless": False})
 
     if kwargs["browser_version"] is None:
@@ -148,11 +152,13 @@ def get_environ(chaos_mode_flags, env_extras=None):
 class ProfileCreator(FirefoxProfileCreator):
     def __init__(self, logger, prefs_root, config, test_type, extra_prefs,
                  disable_fission, debug_test, browser_channel, binary,
-                 package_name, certutil_binary, ca_certificate_path):
+                 package_name, certutil_binary, ca_certificate_path,
+                 allow_list_paths=None):
 
         super().__init__(logger, prefs_root, config, test_type, extra_prefs,
                          disable_fission, debug_test, browser_channel, None,
-                         package_name, certutil_binary, ca_certificate_path)
+                         package_name, certutil_binary, ca_certificate_path,
+                         allow_list_paths)
 
     def _set_required_prefs(self, profile):
         profile.set_preferences({
@@ -186,6 +192,8 @@ class ProfileCreator(FirefoxProfileCreator):
         profile.set_preferences({"fission.autostart": True})
         if self.disable_fission:
             profile.set_preferences({"fission.autostart": False})
+
+        profile.set_preferences(default_prefs())
 
 
 class FirefoxAndroidBrowser(Browser):

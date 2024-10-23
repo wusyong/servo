@@ -1,10 +1,11 @@
 [package]
 name = "webgpu"
-version = "0.0.1"
-authors = ["The Servo Project Developers"]
-license = "MPL-2.0"
-edition = "2018"
-publish = false
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "webgpu"
@@ -12,14 +13,13 @@ path = "lib.rs"
 
 [dependencies]
 arrayvec = { workspace = true, features = ["serde"] }
+base = { workspace = true }
 euclid = { workspace = true }
 ipc-channel = { workspace = true }
 log = { workspace = true }
 malloc_size_of = { workspace = true }
-msg = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 servo_config = { path = "../config" }
-smallvec = { workspace = true, features = ["serde"] }
 webrender = { workspace = true }
 webrender_api = { workspace = true }
 webrender_traits = { workspace = true }
@@ -34,7 +34,7 @@ features = ["metal"]
 # We want the wgpu-core Vulkan backend on Linux and Windows.
 [target.'cfg(any(windows, all(unix, not(any(target_os = "macos", target_os = "ios")))))'.dependencies.wgpu-core]
 workspace = true
-features = ["vulkan"]
+features = ["gles", "vulkan"]
 
 # We want the wgpu-core Direct3D backends on Windows.
 [target.'cfg(windows)'.dependencies.wgpu-core]

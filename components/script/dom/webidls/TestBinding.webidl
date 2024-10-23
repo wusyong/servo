@@ -43,6 +43,8 @@ dictionary TestDictionary {
   // in dictionaries.
   DOMString? nonRequiredNullable;
   DOMString? nonRequiredNullable2;
+  SimpleCallback noCallbackImport;
+  callbackWithOnlyOneOptionalArg noCallbackImport2;
 };
 
 dictionary TestDictionaryParent {
@@ -572,6 +574,16 @@ interface TestBinding {
   undefined promiseRejectWithTypeError(Promise<any> p, USVString message);
   undefined resolvePromiseDelayed(Promise<any> p, DOMString value, unsigned long long ms);
 
+  [Throws]
+  static Promise<any> staticThrowToRejectPromise();
+  [Throws]
+  Promise<any> methodThrowToRejectPromise();
+  [Throws]
+  readonly attribute Promise<any> getterThrowToRejectPromise;
+
+  static Promise<any> staticInternalThrowToRejectPromise([EnforceRange] unsigned long long arg);
+  Promise<any> methodInternalThrowToRejectPromise([EnforceRange] unsigned long long arg);
+
   undefined panic();
 
   GlobalScope entryGlobal();
@@ -594,6 +606,7 @@ partial interface TestBinding {
 };
 
 callback SimpleCallback = undefined(any value);
+callback callbackWithOnlyOneOptionalArg = Promise<undefined> (optional any reason);
 
 partial interface TestBinding {
   [Pref="dom.testable_crash.enabled"]

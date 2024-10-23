@@ -18,6 +18,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct OfflineAudioCompletionEvent {
@@ -39,8 +40,17 @@ impl OfflineAudioCompletionEvent {
         bubbles: EventBubbles,
         cancelable: EventCancelable,
         rendered_buffer: &AudioBuffer,
+        can_gc: CanGc,
     ) -> DomRoot<OfflineAudioCompletionEvent> {
-        Self::new_with_proto(window, None, type_, bubbles, cancelable, rendered_buffer)
+        Self::new_with_proto(
+            window,
+            None,
+            type_,
+            bubbles,
+            cancelable,
+            rendered_buffer,
+            can_gc,
+        )
     }
 
     fn new_with_proto(
@@ -50,20 +60,24 @@ impl OfflineAudioCompletionEvent {
         bubbles: EventBubbles,
         cancelable: EventCancelable,
         rendered_buffer: &AudioBuffer,
+        can_gc: CanGc,
     ) -> DomRoot<OfflineAudioCompletionEvent> {
         let event = Box::new(OfflineAudioCompletionEvent::new_inherited(rendered_buffer));
-        let ev = reflect_dom_object_with_proto(event, window, proto);
+        let ev = reflect_dom_object_with_proto(event, window, proto, can_gc);
         {
             let event = ev.upcast::<Event>();
             event.init_event(type_, bool::from(bubbles), bool::from(cancelable));
         }
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl OfflineAudioCompletionEventMethods for OfflineAudioCompletionEvent {
+    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocompletionevent-offlineaudiocompletionevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &OfflineAudioCompletionEventInit,
     ) -> Fallible<DomRoot<OfflineAudioCompletionEvent>> {
@@ -76,11 +90,10 @@ impl OfflineAudioCompletionEvent {
             bubbles,
             cancelable,
             &init.renderedBuffer,
+            can_gc,
         ))
     }
-}
 
-impl OfflineAudioCompletionEventMethods for OfflineAudioCompletionEvent {
     // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocompletionevent-renderedbuffer
     fn RenderedBuffer(&self) -> DomRoot<AudioBuffer> {
         DomRoot::from_ref(&*self.rendered_buffer)

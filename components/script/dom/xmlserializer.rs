@@ -13,6 +13,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct XMLSerializer {
@@ -28,24 +29,30 @@ impl XMLSerializer {
         }
     }
 
-    pub fn new(window: &Window, proto: Option<HandleObject>) -> DomRoot<XMLSerializer> {
+    pub fn new(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<XMLSerializer> {
         reflect_dom_object_with_proto(
             Box::new(XMLSerializer::new_inherited(window)),
             window,
             proto,
+            can_gc,
         )
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<XMLSerializer>> {
-        Ok(XMLSerializer::new(window, proto))
     }
 }
 
 impl XMLSerializerMethods for XMLSerializer {
+    // https://w3c.github.io/DOM-Parsing/#dom-xmlserializer
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<XMLSerializer>> {
+        Ok(XMLSerializer::new(window, proto, can_gc))
+    }
+
     // https://w3c.github.io/DOM-Parsing/#the-xmlserializer-interface
     fn SerializeToString(&self, root: &Node) -> Fallible<DOMString> {
         let mut writer = vec![];

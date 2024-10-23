@@ -1,16 +1,19 @@
 [package]
 name = "script_traits"
-version = "0.0.1"
-authors = ["The Servo Project Developers"]
-license = "MPL-2.0"
-edition = "2018"
-publish = false
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "script_traits"
 path = "lib.rs"
 
 [dependencies]
+background_hang_monitor_api = { workspace = true }
+base = { workspace = true }
 bitflags = { workspace = true }
 bluetooth_traits = { workspace = true }
 canvas_traits = { workspace = true }
@@ -19,7 +22,7 @@ crossbeam-channel = { workspace = true }
 devtools_traits = { workspace = true }
 embedder_traits = { workspace = true }
 euclid = { workspace = true }
-gfx_traits = { workspace = true }
+fonts_traits = { workspace = true }
 http = { workspace = true }
 hyper_serde = { workspace = true }
 ipc-channel = { workspace = true }
@@ -29,7 +32,6 @@ log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
 media = { path = "../../media" }
-msg = { workspace = true }
 net_traits = { workspace = true }
 pixels = { path = "../../pixels" }
 profile_traits = { workspace = true }
@@ -38,9 +40,9 @@ servo_atoms = { workspace = true }
 servo_url = { path = "../../url" }
 smallvec = { workspace = true }
 style_traits = { workspace = true }
-time = { workspace = true }
 uuid = { workspace = true }
 webdriver = { workspace = true }
 webgpu = { path = "../../webgpu" }
 webrender_api = { workspace = true }
-webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
+webrender_traits = { workspace = true }
+webxr-api = { workspace = true, features = ["ipc"] }

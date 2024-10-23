@@ -17,7 +17,7 @@ use script_layout_interface::{HTMLCanvasData, HTMLCanvasDataSource};
 use script_traits::ScriptMsg;
 use servo_media::streams::registry::MediaStreamId;
 use servo_media::streams::MediaStreamType;
-use style::attr::{AttrValue, LengthOrPercentageOrAuto};
+use style::attr::AttrValue;
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::{ref_filter_map, DomRefCell, Ref};
@@ -26,6 +26,7 @@ use crate::dom::bindings::codegen::Bindings::HTMLCanvasElementBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::MediaStreamBinding::MediaStreamMethods;
 use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLContextAttributes;
+use crate::dom::bindings::codegen::UnionTypes::HTMLCanvasElementOrOffscreenCanvas;
 use crate::dom::bindings::conversions::ConversionResult;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -47,7 +48,7 @@ use crate::dom::node::{window_from_node, Node};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::webgl2renderingcontext::WebGL2RenderingContext;
 use crate::dom::webglrenderingcontext::WebGLRenderingContext;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 const DEFAULT_WIDTH: u32 = 300;
 const DEFAULT_HEIGHT: u32 = 150;
@@ -104,7 +105,7 @@ impl HTMLCanvasElement {
                 },
                 CanvasContext::WebGL(ref context) => context.recreate(size),
                 CanvasContext::WebGL2(ref context) => context.recreate(size),
-                CanvasContext::WebGPU(_) => unimplemented!(),
+                CanvasContext::WebGPU(ref context) => context.resize(),
             }
         }
     }
@@ -127,8 +128,6 @@ pub trait LayoutCanvasRenderingContextHelpers {
 
 pub trait LayoutHTMLCanvasElementHelpers {
     fn data(self) -> HTMLCanvasData;
-    fn get_width(self) -> LengthOrPercentageOrAuto;
-    fn get_height(self) -> LengthOrPercentageOrAuto;
     fn get_canvas_id_for_layout(self) -> CanvasId;
 }
 
@@ -138,12 +137,12 @@ impl LayoutHTMLCanvasElementHelpers for LayoutDom<'_, HTMLCanvasElement> {
         let source = unsafe {
             match self.unsafe_get().context.borrow_for_layout().as_ref() {
                 Some(CanvasContext::Context2d(context)) => {
-                    HTMLCanvasDataSource::Image(Some(context.to_layout().get_ipc_renderer()))
+                    HTMLCanvasDataSource::Image(context.to_layout().get_ipc_renderer())
                 },
                 Some(CanvasContext::WebGL(context)) => context.to_layout().canvas_data_source(),
                 Some(CanvasContext::WebGL2(context)) => context.to_layout().canvas_data_source(),
                 Some(CanvasContext::WebGPU(context)) => context.to_layout().canvas_data_source(),
-                None => HTMLCanvasDataSource::Image(None),
+                None => HTMLCanvasDataSource::Empty,
             }
         };
 
@@ -159,20 +158,6 @@ impl LayoutHTMLCanvasElementHelpers for LayoutDom<'_, HTMLCanvasElement> {
             height: height_attr.map_or(DEFAULT_HEIGHT, |val| val.as_uint()),
             canvas_id: self.get_canvas_id_for_layout(),
         }
-    }
-
-    fn get_width(self) -> LengthOrPercentageOrAuto {
-        self.upcast::<Element>()
-            .get_attr_for_layout(&ns!(), &local_name!("width"))
-            .map(AttrValue::as_uint_px_dimension)
-            .unwrap_or(LengthOrPercentageOrAuto::Auto)
-    }
-
-    fn get_height(self) -> LengthOrPercentageOrAuto {
-        self.upcast::<Element>()
-            .get_attr_for_layout(&ns!(), &local_name!("height"))
-            .map(AttrValue::as_uint_px_dimension)
-            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 
     #[allow(unsafe_code)]
@@ -212,6 +197,7 @@ impl HTMLCanvasElement {
         &self,
         cx: JSContext,
         options: HandleValue,
+        can_gc: CanGc,
     ) -> Option<DomRoot<WebGLRenderingContext>> {
         if let Some(ctx) = self.context() {
             return match *ctx {
@@ -222,7 +208,15 @@ impl HTMLCanvasElement {
         let window = window_from_node(self);
         let size = self.get_size();
         let attrs = Self::get_gl_attributes(cx, options)?;
-        let context = WebGLRenderingContext::new(&window, self, WebGLVersion::WebGL1, size, attrs)?;
+        let canvas = HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(DomRoot::from_ref(self));
+        let context = WebGLRenderingContext::new(
+            &window,
+            &canvas,
+            WebGLVersion::WebGL1,
+            size,
+            attrs,
+            can_gc,
+        )?;
         *self.context.borrow_mut() = Some(CanvasContext::WebGL(Dom::from_ref(&*context)));
         Some(context)
     }
@@ -231,6 +225,7 @@ impl HTMLCanvasElement {
         &self,
         cx: JSContext,
         options: HandleValue,
+        can_gc: CanGc,
     ) -> Option<DomRoot<WebGL2RenderingContext>> {
         if !WebGL2RenderingContext::is_webgl2_enabled(cx, self.global().reflector().get_jsobject())
         {
@@ -245,7 +240,8 @@ impl HTMLCanvasElement {
         let window = window_from_node(self);
         let size = self.get_size();
         let attrs = Self::get_gl_attributes(cx, options)?;
-        let context = WebGL2RenderingContext::new(&window, self, size, attrs)?;
+        let canvas = HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(DomRoot::from_ref(self));
+        let context = WebGL2RenderingContext::new(&window, &canvas, size, attrs, can_gc)?;
         *self.context.borrow_mut() = Some(CanvasContext::WebGL2(Dom::from_ref(&*context)));
         Some(context)
     }
@@ -360,16 +356,17 @@ impl HTMLCanvasElementMethods for HTMLCanvasElement {
         cx: JSContext,
         id: DOMString,
         options: HandleValue,
+        can_gc: CanGc,
     ) -> Option<RenderingContext> {
         match &*id {
             "2d" => self
                 .get_or_init_2d_context()
                 .map(RenderingContext::CanvasRenderingContext2D),
             "webgl" | "experimental-webgl" => self
-                .get_or_init_webgl_context(cx, options)
+                .get_or_init_webgl_context(cx, options, can_gc)
                 .map(RenderingContext::WebGLRenderingContext),
             "webgl2" | "experimental-webgl2" => self
-                .get_or_init_webgl2_context(cx, options)
+                .get_or_init_webgl2_context(cx, options, can_gc)
                 .map(RenderingContext::WebGL2RenderingContext),
             "webgpu" => self
                 .get_or_init_webgpu_context()
@@ -436,9 +433,13 @@ impl HTMLCanvasElementMethods for HTMLCanvasElement {
     }
 
     /// <https://w3c.github.io/mediacapture-fromelement/#dom-htmlcanvaselement-capturestream>
-    fn CaptureStream(&self, _frame_request_rate: Option<Finite<f64>>) -> DomRoot<MediaStream> {
+    fn CaptureStream(
+        &self,
+        _frame_request_rate: Option<Finite<f64>>,
+        can_gc: CanGc,
+    ) -> DomRoot<MediaStream> {
         let global = self.global();
-        let stream = MediaStream::new(&global);
+        let stream = MediaStream::new(&global, can_gc);
         let track = MediaStreamTrack::new(&global, MediaStreamId::new(), MediaStreamType::Video);
         stream.AddTrack(&track);
         stream

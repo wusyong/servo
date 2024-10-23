@@ -12,6 +12,7 @@ use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::dompointreadonly::{DOMPointReadOnly, DOMPointWriteMethods};
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 // http://dev.w3.org/fxtf/geometry/Overview.html#dompoint
 #[dom_struct]
@@ -27,8 +28,15 @@ impl DOMPoint {
         }
     }
 
-    pub fn new(global: &GlobalScope, x: f64, y: f64, z: f64, w: f64) -> DomRoot<DOMPoint> {
-        Self::new_with_proto(global, None, x, y, z, w)
+    pub fn new(
+        global: &GlobalScope,
+        x: f64,
+        y: f64,
+        z: f64,
+        w: f64,
+        can_gc: CanGc,
+    ) -> DomRoot<DOMPoint> {
+        Self::new_with_proto(global, None, x, y, z, w, can_gc)
     }
 
     fn new_with_proto(
@@ -38,32 +46,44 @@ impl DOMPoint {
         y: f64,
         z: f64,
         w: f64,
+        can_gc: CanGc,
     ) -> DomRoot<DOMPoint> {
-        reflect_dom_object_with_proto(Box::new(DOMPoint::new_inherited(x, y, z, w)), global, proto)
+        reflect_dom_object_with_proto(
+            Box::new(DOMPoint::new_inherited(x, y, z, w)),
+            global,
+            proto,
+            can_gc,
+        )
     }
 
-    pub fn Constructor(
+    pub fn new_from_init(
+        global: &GlobalScope,
+        p: &DOMPointInit,
+        can_gc: CanGc,
+    ) -> DomRoot<DOMPoint> {
+        DOMPoint::new(global, p.x, p.y, p.z, p.w, can_gc)
+    }
+}
+
+impl DOMPointMethods for DOMPoint {
+    // https://drafts.fxtf.org/geometry/#dom-dompointreadonly-dompointreadonly
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         x: f64,
         y: f64,
         z: f64,
         w: f64,
     ) -> Fallible<DomRoot<DOMPoint>> {
-        Ok(DOMPoint::new_with_proto(global, proto, x, y, z, w))
+        Ok(DOMPoint::new_with_proto(global, proto, x, y, z, w, can_gc))
     }
 
     // https://drafts.fxtf.org/geometry/#dom-dompoint-frompoint
-    pub fn FromPoint(global: &GlobalScope, init: &DOMPointInit) -> DomRoot<Self> {
-        Self::new_from_init(global, init)
+    fn FromPoint(global: &GlobalScope, init: &DOMPointInit, can_gc: CanGc) -> DomRoot<Self> {
+        Self::new_from_init(global, init, can_gc)
     }
 
-    pub fn new_from_init(global: &GlobalScope, p: &DOMPointInit) -> DomRoot<DOMPoint> {
-        DOMPoint::new(global, p.x, p.y, p.z, p.w)
-    }
-}
-
-impl DOMPointMethods for DOMPoint {
     // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-x
     fn X(&self) -> f64 {
         self.point.X()

@@ -19,6 +19,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct WheelEvent {
@@ -40,8 +41,12 @@ impl WheelEvent {
         }
     }
 
-    fn new_unintialized(window: &Window, proto: Option<HandleObject>) -> DomRoot<WheelEvent> {
-        reflect_dom_object_with_proto(Box::new(WheelEvent::new_inherited()), window, proto)
+    fn new_unintialized(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<WheelEvent> {
+        reflect_dom_object_with_proto(Box::new(WheelEvent::new_inherited()), window, proto, can_gc)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -56,10 +61,11 @@ impl WheelEvent {
         delta_y: Finite<f64>,
         delta_z: Finite<f64>,
         delta_mode: u32,
+        can_gc: CanGc,
     ) -> DomRoot<WheelEvent> {
         Self::new_with_proto(
             window, None, type_, can_bubble, cancelable, view, detail, delta_x, delta_y, delta_z,
-            delta_mode,
+            delta_mode, can_gc,
         )
     }
 
@@ -76,8 +82,9 @@ impl WheelEvent {
         delta_y: Finite<f64>,
         delta_z: Finite<f64>,
         delta_mode: u32,
+        can_gc: CanGc,
     ) -> DomRoot<WheelEvent> {
-        let ev = WheelEvent::new_unintialized(window, proto);
+        let ev = WheelEvent::new_unintialized(window, proto, can_gc);
         ev.InitWheelEvent(
             type_,
             bool::from(can_bubble),
@@ -92,11 +99,14 @@ impl WheelEvent {
 
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl WheelEventMethods for WheelEvent {
+    // https://w3c.github.io/uievents/#dom-wheelevent-wheelevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &WheelEventBinding::WheelEventInit,
     ) -> Fallible<DomRoot<WheelEvent>> {
@@ -112,13 +122,12 @@ impl WheelEvent {
             init.deltaY,
             init.deltaZ,
             init.deltaMode,
+            can_gc,
         );
 
         Ok(event)
     }
-}
 
-impl WheelEventMethods for WheelEvent {
     // https://w3c.github.io/uievents/#widl-WheelEvent-deltaX
     fn DeltaX(&self) -> Finite<f64> {
         self.delta_x.get()

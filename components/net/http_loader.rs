@@ -9,6 +9,8 @@ use std::sync::{Arc as StdArc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
+use base::cross_process_instant::CrossProcessInstant;
+use base::id::{HistoryStateId, PipelineId};
 use crossbeam_channel::Sender;
 use devtools_traits::{
     ChromeToDevtoolsControlMsg, DevtoolsControlMsg, HttpRequest as DevtoolsHttpRequest,
@@ -20,10 +22,11 @@ use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
     AccessControlAllowOrigin, AccessControlMaxAge, AccessControlRequestHeaders,
     AccessControlRequestMethod, Authorization, CacheControl, ContentLength, HeaderMapExt,
-    IfModifiedSince, LastModified, Origin as HyperOrigin, Pragma, Referer, UserAgent,
+    IfModifiedSince, LastModified, Pragma, Referer, UserAgent,
 };
 use http::header::{
-    self, HeaderValue, ACCEPT, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LOCATION, CONTENT_TYPE,
+    self, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LOCATION,
+    CONTENT_TYPE,
 };
 use http::{HeaderMap, Method, Request as HyperRequest, StatusCode};
 use hyper::header::{HeaderName, TRANSFER_ENCODING};
@@ -32,15 +35,15 @@ use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use log::{debug, error, info, log_enabled, warn};
-use msg::constellation_msg::{HistoryStateId, PipelineId};
+use net_traits::http_status::HttpStatus;
 use net_traits::pub_domains::reg_suffix;
-use net_traits::quality::{quality_to_value, Quality, QualityItem};
 use net_traits::request::Origin::Origin as SpecificOrigin;
 use net_traits::request::{
     get_cors_unsafe_header_names, is_cors_non_wildcard_request_header_name,
     is_cors_safelisted_method, is_cors_safelisted_request_header, BodyChunkRequest,
-    BodyChunkResponse, CacheMode, CredentialsMode, Destination, Origin, RedirectMode, Referrer,
-    Request, RequestBuilder, RequestMode, ResponseTainting, ServiceWorkersMode,
+    BodyChunkResponse, CacheMode, CredentialsMode, Destination, Initiator, Origin, RedirectMode,
+    Referrer, Request, RequestBuilder, RequestMode, ResponseTainting, ServiceWorkersMode,
+    Window as RequestWindow,
 };
 use net_traits::response::{HttpsState, Response, ResponseBody, ResponseType};
 use net_traits::{
@@ -60,14 +63,19 @@ use crate::connector::{
     create_http_client, create_tls_config, CACertificates, CertificateErrorOverrideManager,
     Connector,
 };
-use crate::cookie;
+use crate::cookie::ServoCookie;
 use crate::cookie_storage::CookieStorage;
 use crate::decoder::Decoder;
 use crate::fetch::cors_cache::CorsCache;
+use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
 use crate::fetch::methods::{main_fetch, Data, DoneChannel, FetchContext, Target};
 use crate::hsts::HstsList;
 use crate::http_cache::{CacheKey, HttpCache};
 use crate::resource_thread::AuthCache;
+
+/// <https://fetch.spec.whatwg.org/#document-accept-header-value>
+pub const DOCUMENT_ACCEPT_HEADER_VALUE: HeaderValue =
+    HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
 
 /// The various states an entry of the HttpCache can be in.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,45 +124,29 @@ impl Default for HttpState {
     }
 }
 
-fn precise_time_ms() -> u64 {
-    time::precise_time_ns() / (1000 * 1000)
-}
-
-// Step 3 of https://fetch.spec.whatwg.org/#concept-fetch.
-pub fn set_default_accept(destination: Destination, headers: &mut HeaderMap) {
-    if headers.contains_key(header::ACCEPT) {
+/// Step 13 of <https://fetch.spec.whatwg.org/#concept-fetch>.
+pub fn set_default_accept(request: &mut Request) {
+    if request.headers.contains_key(header::ACCEPT) {
         return;
     }
-    let value = match destination {
-        // Step 3.2.
-        Destination::Document => vec![
-            QualityItem::new(mime::TEXT_HTML, Quality::from_u16(1000)),
-            QualityItem::new(
-                "application/xhtml+xml".parse().unwrap(),
-                Quality::from_u16(1000),
-            ),
-            QualityItem::new("application/xml".parse().unwrap(), Quality::from_u16(900)),
-            QualityItem::new(mime::STAR_STAR, Quality::from_u16(800)),
-        ],
-        // Step 3.3.
-        Destination::Image => vec![
-            QualityItem::new(mime::IMAGE_PNG, Quality::from_u16(1000)),
-            QualityItem::new(mime::IMAGE_SVG, Quality::from_u16(1000)),
-            QualityItem::new(mime::IMAGE_STAR, Quality::from_u16(800)),
-            QualityItem::new(mime::STAR_STAR, Quality::from_u16(500)),
-        ],
-        // Step 3.3.
-        Destination::Style => vec![
-            QualityItem::new(mime::TEXT_CSS, Quality::from_u16(1000)),
-            QualityItem::new(mime::STAR_STAR, Quality::from_u16(100)),
-        ],
-        // Step 3.1.
-        _ => vec![QualityItem::new(mime::STAR_STAR, Quality::from_u16(1000))],
+
+    let value = if request.initiator == Initiator::Prefetch {
+        DOCUMENT_ACCEPT_HEADER_VALUE
+    } else {
+        match request.destination {
+            Destination::Document | Destination::Frame | Destination::IFrame => {
+                DOCUMENT_ACCEPT_HEADER_VALUE
+            },
+            Destination::Image => {
+                HeaderValue::from_static("image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+            },
+            Destination::Json => HeaderValue::from_static("application/json,*/*;q=0.5"),
+            Destination::Style => HeaderValue::from_static("text/css,*/*;q=0.1"),
+            _ => HeaderValue::from_static("*/*"),
+        }
     };
 
-    // Step 3.4.
-    // TODO(eijebong): Change this once typed headers are done
-    headers.insert(header::ACCEPT, quality_to_value(value));
+    request.headers.insert(header::ACCEPT, value);
 }
 
 fn set_default_accept_encoding(headers: &mut HeaderMap) {
@@ -216,6 +208,35 @@ fn strict_origin_when_cross_origin(
     }
     // Step 3
     strip_url_for_use_as_referrer(referrer_url, true)
+}
+
+/// <https://html.spec.whatwg.org/multipage/#concept-site-same-site>
+fn is_same_site(site_a: &ImmutableOrigin, site_b: &ImmutableOrigin) -> bool {
+    // Step 1. If A and B are the same opaque origin, then return true.
+    if !site_a.is_tuple() && !site_b.is_tuple() && site_a == site_b {
+        return true;
+    }
+
+    // Step 2. If A or B is an opaque origin, then return false.
+    let ImmutableOrigin::Tuple(scheme_a, host_a, _) = site_a else {
+        return false;
+    };
+    let ImmutableOrigin::Tuple(scheme_b, host_b, _) = site_b else {
+        return false;
+    };
+
+    // Step 3. If A's and B's scheme values are different, then return false.
+    if scheme_a != scheme_b {
+        return false;
+    }
+
+    // Step 4. If A's and B's host values are not equal, then return false.
+    if host_a != host_b {
+        return false;
+    }
+
+    // Step 5. Return true.
+    true
 }
 
 /// <https://html.spec.whatwg.org/multipage/#schemelessly-same-site>
@@ -328,7 +349,7 @@ fn set_cookie_for_url(cookie_jar: &RwLock<CookieStorage>, request: &ServoUrl, co
     let mut cookie_jar = cookie_jar.write().unwrap();
     let source = CookieSource::HTTP;
 
-    if let Some(cookie) = cookie::Cookie::from_cookie_string(cookie_val.into(), request, source) {
+    if let Some(cookie) = ServoCookie::from_cookie_string(cookie_val.into(), request, source) {
         cookie_jar.push(cookie, request, source);
     }
 }
@@ -353,19 +374,22 @@ fn prepare_devtools_request(
     headers: HeaderMap,
     body: Option<Vec<u8>>,
     pipeline_id: PipelineId,
-    now: SystemTime,
-    connect_time: u64,
-    send_time: u64,
+    connect_time: Duration,
+    send_time: Duration,
     is_xhr: bool,
 ) -> ChromeToDevtoolsControlMsg {
+    let started_date_time = SystemTime::now();
     let request = DevtoolsHttpRequest {
         url,
         method,
         headers,
         body,
         pipeline_id,
-        startedDateTime: now,
-        timeStamp: now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+        started_date_time,
+        time_stamp: started_date_time
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
         connect_time,
         send_time,
         is_xhr,
@@ -388,7 +412,7 @@ fn send_response_to_devtools(
     devtools_chan: &Sender<DevtoolsControlMsg>,
     request_id: String,
     headers: Option<HeaderMap>,
-    status: Option<(u16, Vec<u8>)>,
+    status: HttpStatus,
     pipeline_id: PipelineId,
 ) {
     let response = DevtoolsHttpResponse {
@@ -536,11 +560,11 @@ async fn obtain_response(
             let devtools_bytes = devtools_bytes.clone();
             let chunk_requester2 = chunk_requester.clone();
 
-            ROUTER.add_route(
-                body_port.to_opaque(),
+            ROUTER.add_typed_route(
+                body_port,
                 Box::new(move |message| {
                     info!("Received message");
-                    let bytes: Vec<u8> = match message.to().unwrap() {
+                    let bytes: Vec<u8> = match message.unwrap() {
                         BodyChunkResponse::Chunk(bytes) => bytes,
                         BodyChunkResponse::Done => {
                             // Step 3, abort these parallel steps.
@@ -614,7 +638,7 @@ async fn obtain_response(
 
         // TODO(#21261) connect_start: set if a persistent connection is *not* used and the last non-redirected
         // fetch passes the timing allow check
-        let connect_start = precise_time_ms();
+        let connect_start = CrossProcessInstant::now();
         context
             .timing
             .lock()
@@ -638,7 +662,7 @@ async fn obtain_response(
         };
         *request.headers_mut() = headers.clone();
 
-        let connect_end = precise_time_ms();
+        let connect_end = CrossProcessInstant::now();
         context
             .timing
             .lock()
@@ -649,16 +673,17 @@ async fn obtain_response(
         let pipeline_id = *pipeline_id;
         let closure_url = url.clone();
         let method = method.clone();
-        let send_start = precise_time_ms();
+        let send_start = CrossProcessInstant::now();
 
         let host = request.uri().host().unwrap_or("").to_owned();
         let override_manager = context.state.override_manager.clone();
         let headers = headers.clone();
+        let is_secure_scheme = url.is_secure_scheme();
 
         client
             .request(request)
             .and_then(move |res| {
-                let send_end = precise_time_ms();
+                let send_end = CrossProcessInstant::now();
 
                 // TODO(#21271) response_start: immediately after receiving first byte of response
 
@@ -671,9 +696,8 @@ async fn obtain_response(
                             headers,
                             Some(devtools_bytes.lock().unwrap().clone()),
                             pipeline_id,
-                            SystemTime::now(),
-                            connect_end - connect_start,
-                            send_end - send_start,
+                            (connect_end - connect_start).unsigned_abs(),
+                            (send_end - send_start).unsigned_abs(),
                             is_xhr,
                         ))
                     // TODO: ^This is not right, connect_start is taken before contructing the
@@ -688,7 +712,7 @@ async fn obtain_response(
                     debug!("Not notifying devtools (no request_id)");
                     None
                 };
-                future::ready(Ok((Decoder::detect(res), msg)))
+                future::ready(Ok((Decoder::detect(res, is_secure_scheme), msg)))
             })
             .map_err(move |error| {
                 NetworkError::from_hyper_error(
@@ -811,16 +835,11 @@ pub async fn http_fetch(
     if response
         .actual_response()
         .status
-        .as_ref()
-        .map_or(false, is_redirect_status)
+        .try_code()
+        .is_some_and(is_redirect_status)
     {
         // Substep 1.
-        if response
-            .actual_response()
-            .status
-            .as_ref()
-            .map_or(true, |s| s.0 != StatusCode::SEE_OTHER)
-        {
+        if response.actual_response().status != StatusCode::SEE_OTHER {
             // TODO: send RST_STREAM frame
         }
 
@@ -997,12 +1016,8 @@ pub async fn http_redirect_fetch(
     }
 
     // Step 9
-    if response
-        .actual_response()
-        .status
-        .as_ref()
-        .map_or(true, |s| s.0 != StatusCode::SEE_OTHER) &&
-        request.body.as_ref().map_or(false, |b| b.source_is_null())
+    if response.actual_response().status != StatusCode::SEE_OTHER &&
+        request.body.as_ref().is_some_and(|b| b.source_is_null())
     {
         return Response::network_error(NetworkError::Internal("Request body is not done".into()));
     }
@@ -1016,11 +1031,11 @@ pub async fn http_redirect_fetch(
     if response
         .actual_response()
         .status
-        .as_ref()
-        .map_or(false, |(code, _)| {
-            ((*code == StatusCode::MOVED_PERMANENTLY || *code == StatusCode::FOUND) &&
+        .try_code()
+        .is_some_and(|code| {
+            ((code == StatusCode::MOVED_PERMANENTLY || code == StatusCode::FOUND) &&
                 request.method == Method::POST) ||
-                (*code == StatusCode::SEE_OTHER &&
+                (code == StatusCode::SEE_OTHER &&
                     request.method != Method::HEAD &&
                     request.method != Method::GET)
         })
@@ -1039,15 +1054,27 @@ pub async fn http_redirect_fetch(
         }
     }
 
-    // Step 12
+    // Step 13: If request’s current URL’s origin is not same origin with locationURL’s origin, then
+    // for each headerName of CORS non-wildcard request-header name, delete headerName from
+    // request’s header list.
+    if location_url.origin() != request.current_url().origin() {
+        // This list currently only contains the AUTHORIZATION header
+        // https://fetch.spec.whatwg.org/#cors-non-wildcard-request-header-name
+        request.headers.remove(AUTHORIZATION);
+    }
+
+    // Step 14: If request’s body is non-null, then set request’s body to the body of the result of
+    // safely extracting request’s body’s source.
     if let Some(body) = request.body.as_mut() {
         body.extract_source();
     }
 
-    // Step 13
+    // Steps 15-17 relate to timing, which is not implemented 1:1 with the spec.
+
+    // Step 18: Append locationURL to request’s URL list.
     request.url_list.push(location_url);
 
-    // Step 14
+    // Step 19: Invoke set request’s referrer policy on redirect on request and internalResponse.
     if let Some(referrer_policy) = response
         .actual_response()
         .headers
@@ -1056,9 +1083,11 @@ pub async fn http_redirect_fetch(
         request.referrer_policy = Some(referrer_policy.into());
     }
 
-    // Step 15
+    // Step 20: Let recursive be true.
+    // Step 21: If request’s redirect mode is "manual", then...
     let recursive_flag = request.redirect_mode != RedirectMode::Manual;
 
+    // Step 22: Return the result of running main fetch given fetchParams and recursive.
     let fetch_response = main_fetch(
         request,
         cache,
@@ -1083,19 +1112,6 @@ pub async fn http_redirect_fetch(
     fetch_response
 }
 
-fn try_immutable_origin_to_hyper_origin(url_origin: &ImmutableOrigin) -> Option<HyperOrigin> {
-    match *url_origin {
-        ImmutableOrigin::Opaque(_) => Some(HyperOrigin::NULL),
-        ImmutableOrigin::Tuple(ref scheme, ref host, ref port) => {
-            let port = match (scheme.as_ref(), port) {
-                ("http", 80) | ("https", 443) => None,
-                _ => Some(*port),
-            };
-            HyperOrigin::try_from_parts(scheme, &host.to_string(), port).ok()
-        },
-    }
-}
-
 /// [HTTP network or cache fetch](https://fetch.spec.whatwg.org#http-network-or-cache-fetch)
 #[async_recursion]
 async fn http_network_or_cache_fetch(
@@ -1105,27 +1121,40 @@ async fn http_network_or_cache_fetch(
     done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
-    // Step 2
+    // Step 1. Let request be fetchParams’s request.
+    // NOTE: We get request as an argument (Fetchparams are not implemented, see #33616)
+
+    // Step 3. Let httpRequest be null.
+    let mut http_request;
+
+    // Step 4. Let response be null.
     let mut response: Option<Response> = None;
-    // Step 4
+
+    // Step 7. Let the revalidatingFlag be unset.
     let mut revalidating_flag = false;
 
-    // TODO: Implement Window enum for Request
-    let request_has_no_window = true;
+    // TODO(#33616): Step 8. Run these steps, but abort when fetchParams is canceled:
+    // Step 8.1: If request’s window is "no-window" and request’s redirect mode is "error", then set
+    // httpFetchParams to fetchParams and httpRequest to request.
+    let request_has_no_window = request.window == RequestWindow::NoWindow;
 
-    // Step 5.1
-    let mut http_request;
     let http_request = if request_has_no_window && request.redirect_mode == RedirectMode::Error {
         request
-    } else {
-        // Step 5.2.1, .2.2 and .2.3 and 2.4
+    }
+    // Step 8.2 Otherwise:
+    else {
+        // Step 8.2.1: Set httpRequest to a clone of request.
         http_request = request.clone();
+
+        // TODO(#33616): Step 8.2.2-8.2.3
         &mut http_request
     };
 
-    // Step 5.3
-    let credentials_flag = match http_request.credentials_mode {
+    // Step 8.3: Let includeCredentials be true if one of:
+    let include_credentials = match http_request.credentials_mode {
+        // request’s credentials mode is "include"
         CredentialsMode::Include => true,
+        // request’s credentials mode is "same-origin" and request’s response tainting is "basic"
         CredentialsMode::CredentialsSameOrigin
             if http_request.response_tainting == ResponseTainting::Basic =>
         {
@@ -1134,54 +1163,81 @@ async fn http_network_or_cache_fetch(
         _ => false,
     };
 
-    let content_length_value = match http_request.body {
-        None => match http_request.method {
-            // Step 5.5
-            Method::POST | Method::PUT => Some(0),
-            // Step 5.4
-            _ => None,
-        },
-        // Step 5.6
-        Some(ref http_request_body) => http_request_body.len().map(|size| size as u64),
-    };
+    // Step 8.4: If Cross-Origin-Embedder-Policy allows credentials with request returns false, then
+    // set includeCredentials to false.
+    // TODO(#33616): Requires request's client object
 
-    // Step 5.7
-    if let Some(content_length_value) = content_length_value {
-        http_request
-            .headers
-            .typed_insert(ContentLength(content_length_value));
-        if http_request.keep_alive {
-            // Step 5.8 TODO: needs request's client object
-        }
+    // Step 8.5 Let contentLength be httpRequest’s body’s length, if httpRequest’s body is non-null;
+    // otherwise null.
+    let content_length = http_request
+        .body
+        .as_ref()
+        .and_then(|body| body.len().map(|size| size as u64));
+
+    // Step 8.6 Let contentLengthHeaderValue be null.
+    let mut content_length_header_value = None;
+
+    // Step 8.7 If httpRequest’s body is null and httpRequest’s method is `POST` or `PUT`,
+    // then set contentLengthHeaderValue to `0`.
+    if http_request.body.is_none() && matches!(http_request.method, Method::POST | Method::PUT) {
+        content_length_header_value = Some(0);
     }
 
-    // Step 5.9
+    // Step 8.8 If contentLength is non-null, then set contentLengthHeaderValue to contentLength,
+    // serialized and isomorphic encoded.
+    // NOTE: The header will later be serialized using HeaderMap::typed_insert
+    if let Some(content_length) = content_length {
+        content_length_header_value = Some(content_length);
+    };
+
+    // Step 8.9 If contentLengthHeaderValue is non-null, then append (`Content-Length`, contentLengthHeaderValue)
+    // to httpRequest’s header list.
+    if let Some(content_length_header_value) = content_length_header_value {
+        http_request
+            .headers
+            .typed_insert(ContentLength(content_length_header_value));
+    }
+
+    // Step 8.10 If contentLength is non-null and httpRequest’s keepalive is true, then:
+    if content_length.is_some() && http_request.keep_alive {
+        // TODO(#33616) Keepalive requires request's client object's fetch group
+    }
+
+    // Step 8.11: If httpRequest’s referrer is a URL, then:
     match http_request.referrer {
-        Referrer::NoReferrer => (),
         Referrer::ReferrerUrl(ref http_request_referrer) |
         Referrer::Client(ref http_request_referrer) => {
+            // Step 8.11.1: Let referrerValue be httpRequest’s referrer, serialized and isomorphic
+            // encoded.
             if let Ok(referer) = http_request_referrer.to_string().parse::<Referer>() {
+                // Step 8.11.2: Append (`Referer`, referrerValue) to httpRequest’s header list.
                 http_request.headers.typed_insert(referer);
             } else {
                 // This error should only happen in cases where hyper and rust-url disagree
                 // about how to parse a referer.
                 // https://github.com/servo/servo/issues/24175
-                error!("Failed to parse {} as referer", http_request_referrer);
+                error!("Failed to parse {} as referrer", http_request_referrer);
             }
         },
+        _ => {},
     };
 
-    // Step 5.10
-    if cors_flag || (http_request.method != Method::GET && http_request.method != Method::HEAD) {
-        debug_assert_ne!(http_request.origin, Origin::Client);
-        if let Origin::Origin(ref url_origin) = http_request.origin {
-            if let Some(hyper_origin) = try_immutable_origin_to_hyper_origin(url_origin) {
-                http_request.headers.typed_insert(hyper_origin)
-            }
+    // Step 8.12 Append a request `Origin` header for httpRequest.
+    append_a_request_origin_header(http_request);
+
+    // Step 8.13 Append the Fetch metadata headers for httpRequest.
+    append_the_fetch_metadata_headers(http_request);
+
+    // Step 8.14: If httpRequest’s initiator is "prefetch", then set a structured field value given
+    // (`Sec-Purpose`, the token "prefetch") in httpRequest’s header list.
+    if http_request.initiator == Initiator::Prefetch {
+        if let Ok(value) = HeaderValue::from_str("prefetch") {
+            http_request.headers.insert("Sec-Purpose", value);
         }
     }
 
-    // Step 5.11
+    // Step 8.15: If httpRequest’s header list does not contain `User-Agent`, then user agents
+    // should append (`User-Agent`, default `User-Agent` value) to httpRequest’s header list.
     if !http_request.headers.contains_key(header::USER_AGENT) {
         let user_agent = context.user_agent.clone().into_owned();
         http_request
@@ -1189,27 +1245,40 @@ async fn http_network_or_cache_fetch(
             .typed_insert::<UserAgent>(user_agent.parse().unwrap());
     }
 
+    // Steps 8.16 to 8.18
     match http_request.cache_mode {
-        // Step 5.12
+        // Step 8.16: If httpRequest’s cache mode is "default" and httpRequest’s header list
+        // contains `If-Modified-Since`, `If-None-Match`, `If-Unmodified-Since`, `If-Match`, or
+        // `If-Range`, then set httpRequest’s cache mode to "no-store".
         CacheMode::Default if is_no_store_cache(&http_request.headers) => {
             http_request.cache_mode = CacheMode::NoStore;
         },
 
-        // Step 5.13
+        // Note that the following steps (8.17 and 8.18) are being considered for removal:
+        // https://github.com/whatwg/fetch/issues/722#issuecomment-1420264615
+
+        // Step 8.17: If httpRequest’s cache mode is "no-cache", httpRequest’s prevent no-cache
+        // cache-control header modification flag is unset, and httpRequest’s header list does not
+        // contain `Cache-Control`, then append (`Cache-Control`, `max-age=0`) to httpRequest’s
+        // header list.
+        // TODO: Implement request's prevent no-cache cache-control header modification flag
+        // https://fetch.spec.whatwg.org/#no-cache-prevent-cache-control
         CacheMode::NoCache if !http_request.headers.contains_key(header::CACHE_CONTROL) => {
             http_request
                 .headers
                 .typed_insert(CacheControl::new().with_max_age(Duration::from_secs(0)));
         },
 
-        // Step 5.14
+        // Step 8.18: If httpRequest’s cache mode is "no-store" or "reload", then:
         CacheMode::Reload | CacheMode::NoStore => {
-            // Substep 1
+            // Step 8.18.1: If httpRequest’s header list does not contain `Pragma`, then append
+            // (`Pragma`, `no-cache`) to httpRequest’s header list.
             if !http_request.headers.contains_key(header::PRAGMA) {
                 http_request.headers.typed_insert(Pragma::no_cache());
             }
 
-            // Substep 2
+            // Step 8.18.2: If httpRequest’s header list does not contain `Cache-Control`, then
+            // append (`Cache-Control`, `no-cache`) to httpRequest’s header list.
             if !http_request.headers.contains_key(header::CACHE_CONTROL) {
                 http_request
                     .headers
@@ -1220,20 +1289,26 @@ async fn http_network_or_cache_fetch(
         _ => {},
     }
 
-    // Step 5.15
-    // TODO: if necessary append `Accept-Encoding`/`identity` to headers
+    // Step 8.19: If httpRequest’s header list contains `Range`, then append (`Accept-Encoding`,
+    // `identity`) to httpRequest’s header list.
+    if http_request.headers.contains_key(header::RANGE) {
+        if let Ok(value) = HeaderValue::from_str("identity") {
+            http_request.headers.insert("Accept-Encoding", value);
+        }
+    }
 
-    // Step 5.16
-    let current_url = http_request.current_url();
+    // Step 8.20: Modify httpRequest’s header list per HTTP. Do not append a given header if
+    // httpRequest’s header list contains that header’s name.
+    // `Accept`, `Accept-Charset`, and `Accept-Language` must not be included at this point.
     http_request.headers.remove(header::HOST);
-
-    // unlike http_loader, we should not set the accept header
-    // here, according to the fetch spec
+    // unlike http_loader, we should not set the accept header here
     set_default_accept_encoding(&mut http_request.headers);
 
-    // Step 5.17
+    let current_url = http_request.current_url();
+
+    // Step 8.21: If includeCredentials is true, then:
     // TODO some of this step can't be implemented yet
-    if credentials_flag {
+    if include_credentials {
         // Substep 1
         // TODO http://mxr.mozilla.org/servo/source/components/net/http_loader.rs#504
         // XXXManishearth http_loader has block_cookies: support content blocking here too
@@ -1272,8 +1347,7 @@ async fn http_network_or_cache_fetch(
         }
     }
 
-    // Step 5.18
-    // TODO If there’s a proxy-authentication entry, use it as appropriate.
+    // TODO(#33616) Step 8.22 If there’s a proxy-authentication entry, use it as appropriate.
 
     // If the cache is not ready to construct a response, wait.
     //
@@ -1310,11 +1384,16 @@ async fn http_network_or_cache_fetch(
             }
         }
 
-        // Step 5.19
+        // TODO(#33616): Step 8.23 Set httpCache to the result of determining the
+        // HTTP cache partition, given httpRequest.
         if let Ok(http_cache) = context.state.http_cache.read() {
-            if let Some(response_from_cache) =
-                http_cache.construct_response(http_request, done_chan)
-            {
+            // Step 8.25.1 Set storedResponse to the result of selecting a response from the httpCache,
+            //              possibly needing validation, as per the "Constructing Responses from Caches"
+            //              chapter of HTTP Caching, if any.
+            let stored_response = http_cache.construct_response(http_request, done_chan);
+
+            // Step 8.25.2 If storedResponse is non-null, then:
+            if let Some(response_from_cache) = stored_response {
                 let response_headers = response_from_cache.response.headers.clone();
                 // Substep 1, 2, 3, 4
                 let (cached_response, needs_revalidation) =
@@ -1331,6 +1410,7 @@ async fn http_network_or_cache_fetch(
                             response_from_cache.needs_validation,
                         ),
                     };
+
                 if needs_revalidation {
                     revalidating_flag = true;
                     // Substep 5
@@ -1427,12 +1507,11 @@ async fn http_network_or_cache_fetch(
 
     wait_for_cached_response(done_chan, &mut response).await;
 
-    // Step 6
-    // TODO: https://infra.spec.whatwg.org/#if-aborted
+    // TODO(#33616): Step 9. If aborted, then return the appropriate network error for fetchParams.
 
-    // Step 7
+    // Step 10. If response is null, then:
     if response.is_none() {
-        // Substep 1
+        // Step 10.1 If httpRequest’s cache mode is "only-if-cached", then return a network error.
         if http_request.cache_mode == CacheMode::OnlyIfCached {
             // The cache will not be updated,
             // set its state to ready to construct.
@@ -1441,27 +1520,23 @@ async fn http_network_or_cache_fetch(
                 "Couldn't find response in cache".into(),
             ));
         }
-    }
-    // More Step 7
-    if response.is_none() {
-        // Substep 2
+
+        // Step 10.2 Let forwardResponse be the result of running HTTP-network fetch given httpFetchParams,
+        // includeCredentials, and isNewConnectionFetch.
         let forward_response =
-            http_network_fetch(http_request, credentials_flag, done_chan, context).await;
-        // Substep 3
-        if let Some((200..=399, _)) = forward_response.raw_status {
-            if !http_request.method.is_safe() {
-                if let Ok(mut http_cache) = context.state.http_cache.write() {
-                    http_cache.invalidate(http_request, &forward_response);
-                }
+            http_network_fetch(http_request, include_credentials, done_chan, context).await;
+
+        // Step 10.3 If httpRequest’s method is unsafe and forwardResponse’s status is in the range 200 to 399,
+        // inclusive, invalidate appropriate stored responses in httpCache, as per the
+        // "Invalidating Stored Responses" chapter of HTTP Caching, and set storedResponse to null.
+        if forward_response.status.in_range(200..=399) && !http_request.method.is_safe() {
+            if let Ok(mut http_cache) = context.state.http_cache.write() {
+                http_cache.invalidate(http_request, &forward_response);
             }
         }
-        // Substep 4
-        if revalidating_flag &&
-            forward_response
-                .status
-                .as_ref()
-                .map_or(false, |s| s.0 == StatusCode::NOT_MODIFIED)
-        {
+
+        // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
+        if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
             if let Ok(mut http_cache) = context.state.http_cache.write() {
                 // Ensure done_chan is None,
                 // since the network response will be replaced by the revalidated stored one.
@@ -1471,88 +1546,29 @@ async fn http_network_or_cache_fetch(
             wait_for_cached_response(done_chan, &mut response).await;
         }
 
-        // Substep 5
+        // Step 10.5 If response is null, then:
         if response.is_none() {
+            // Step 10.5.1 Set response to forwardResponse.
+            let forward_response = response.insert(forward_response);
+
+            // Per https://httpwg.org/specs/rfc9111.html#response.cacheability we must not cache responses
+            // if the No-Store directive is present
             if http_request.cache_mode != CacheMode::NoStore {
-                // Subsubstep 2, doing it first to avoid a clone of forward_response.
+                // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
+                //             "Storing Responses in Caches" chapter of HTTP Caching.
                 if let Ok(mut http_cache) = context.state.http_cache.write() {
-                    http_cache.store(http_request, &forward_response);
+                    http_cache.store(http_request, forward_response);
                 }
             }
-            // Subsubstep 1
-            response = Some(forward_response);
         }
     }
-
-    let mut response = response.unwrap();
-
     // The cache has been updated, set its state to ready to construct.
     update_http_cache_state(context, http_request);
 
-    // Step 8
-    // TODO: if necessary set response's range-requested flag
+    let mut response = response.unwrap();
 
-    // Step 9
-    // https://fetch.spec.whatwg.org/#cross-origin-resource-policy-check
-    #[derive(PartialEq)]
-    enum CrossOriginResourcePolicy {
-        Allowed,
-        Blocked,
-    }
-
-    fn cross_origin_resource_policy_check(
-        request: &Request,
-        response: &Response,
-    ) -> CrossOriginResourcePolicy {
-        // Step 1
-        if request.mode != RequestMode::NoCors {
-            return CrossOriginResourcePolicy::Allowed;
-        }
-
-        // Step 2
-        let current_url_origin = request.current_url().origin();
-        let same_origin = if let Origin::Origin(ref origin) = request.origin {
-            *origin == request.current_url().origin()
-        } else {
-            false
-        };
-
-        if same_origin {
-            return CrossOriginResourcePolicy::Allowed;
-        }
-
-        // Step 3
-        let policy = response
-            .headers
-            .get(HeaderName::from_static("cross-origin-resource-policy"))
-            .map(|h| h.to_str().unwrap_or(""))
-            .unwrap_or("");
-
-        // Step 4
-        if policy == "same-origin" {
-            return CrossOriginResourcePolicy::Blocked;
-        }
-
-        // Step 5
-        if let Origin::Origin(ref request_origin) = request.origin {
-            let schemeless_same_origin =
-                is_schemelessy_same_site(request_origin, &current_url_origin);
-            if schemeless_same_origin &&
-                (request_origin.scheme() == Some("https") ||
-                    response.https_state == HttpsState::None)
-            {
-                return CrossOriginResourcePolicy::Allowed;
-            }
-        };
-
-        // Step 6
-        if policy == "same-site" {
-            return CrossOriginResourcePolicy::Blocked;
-        }
-
-        CrossOriginResourcePolicy::Allowed
-    }
-
+    // FIXME: The spec doesn't tell us to do this *here*, but if we don't do it then
+    // tests fail. Where should we do it instead? See also #33615
     if http_request.response_tainting != ResponseTainting::CorsTainting &&
         cross_origin_resource_policy_check(http_request, &response) ==
             CrossOriginResourcePolicy::Blocked
@@ -1562,26 +1578,31 @@ async fn http_network_or_cache_fetch(
         ));
     }
 
-    // Step 10
-    // FIXME: Figure out what to do with request window objects
-    if let (Some((StatusCode::UNAUTHORIZED, _)), false, true) =
-        (response.status.as_ref(), cors_flag, credentials_flag)
-    {
-        // Substep 1
-        // TODO: Spec says requires testing on multiple WWW-Authenticate headers
+    // TODO(#33616): Step 11. Set response’s URL list to a clone of httpRequest’s URL list.
+    // TODO(#33616): Step 12. If httpRequest’s header list contains `Range`,
+    // then set response’s range-requested flag.
+    // TODO(#33616): Step 13 Set response’s request-includes-credentials to includeCredentials.
 
-        // Substep 2
+    // Step 14. If response’s status is 401, httpRequest’s response tainting is not "cors",
+    // includeCredentials is true, and request’s window is an environment settings object, then:
+    // TODO(#33616): Figure out what to do with request window objects
+    if let (Some(StatusCode::UNAUTHORIZED), false, true) =
+        (response.status.try_code(), cors_flag, include_credentials)
+    {
+        // TODO: Step 14.1 Spec says requires testing on multiple WWW-Authenticate headers
+
+        // Step 14.2 If request’s body is non-null, then:
         if http_request.body.is_some() {
             // TODO Implement body source
         }
 
-        // Substep 3
+        // Step 14.3 If request’s use-URL-credentials flag is unset or isAuthenticationFetch is true, then:
         if !http_request.use_url_credentials || authentication_fetch_flag {
-            // FIXME: Prompt the user for username and password from the window
+            // TODO(#33616, #27439): Prompt the user for username and password from the window
 
             // Wrong, but will have to do until we are able to prompt the user
             // otherwise this creates an infinite loop
-            // We basically pretend that the user declined to enter credentials
+            // We basically pretend that the user declined to enter credentials (#33616)
             return response;
         }
 
@@ -1589,7 +1610,7 @@ async fn http_network_or_cache_fetch(
         // since we're about to start a new `http_network_or_cache_fetch`.
         *done_chan = None;
 
-        // Substep 4
+        // Step 14.4 Set response to the result of running HTTP-network-or-cache fetch given fetchParams and true.
         response = http_network_or_cache_fetch(
             http_request,
             true, /* authentication flag */
@@ -1600,38 +1621,107 @@ async fn http_network_or_cache_fetch(
         .await;
     }
 
-    // Step 11
-    if let Some((StatusCode::PROXY_AUTHENTICATION_REQUIRED, _)) = response.status.as_ref() {
-        // Step 1
+    // Step 15. If response’s status is 407, then:
+    if response.status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        // Step 15.1 If request’s window is "no-window", then return a network error.
+
         if request_has_no_window {
             return Response::network_error(NetworkError::Internal(
                 "Can't find Window object".into(),
             ));
         }
 
-        // Step 2
-        // TODO: Spec says requires testing on Proxy-Authenticate headers
+        // (Step 15.2 does not exist, requires testing on Proxy-Authenticate headers)
 
-        // Step 3
-        // FIXME: Prompt the user for proxy authentication credentials
+        // TODO(#33616): Step 15.3 If fetchParams is canceled, then return
+        // the appropriate network error for fetchParams.
+        // TODO(#33616): Step 15.4 Prompt the end user as appropriate in request’s window and store the
+        // result as a proxy-authentication entry.
+
+        // Step 15.5 Set response to the result of running HTTP-network-or-cache fetch given fetchParams.
 
         // Wrong, but will have to do until we are able to prompt the user
         // otherwise this creates an infinite loop
-        // We basically pretend that the user declined to enter credentials
+        // We basically pretend that the user declined to enter credentials (#33616)
         return response;
-
-        // Step 4
-        // return http_network_or_cache_fetch(request, authentication_fetch_flag,
-        //                                    cors_flag, done_chan, context);
     }
 
-    // Step 12
+    // TODO(#33616): Step 16. If all of the following are true:
+    // * response’s status is 421
+    // * isNewConnectionFetch is false
+    // * request’s body is null, or request’s body is non-null and request’s body’s source is non-null
+    // then: [..]
+
+    // Step 17. If isAuthenticationFetch is true, then create an authentication entry for request and the given realm.
     if authentication_fetch_flag {
-        // TODO Create the authentication entry for request and the given realm
+        // TODO(#33616)
     }
 
-    // Step 13
+    // Step 18. Return response.
     response
+}
+
+/// <https://fetch.spec.whatwg.org/#cross-origin-resource-policy-check>
+///
+/// This is obtained from [cross_origin_resource_policy_check]
+#[derive(PartialEq)]
+enum CrossOriginResourcePolicy {
+    Allowed,
+    Blocked,
+}
+
+// TODO(#33615): Judging from the name, this appears to be https://fetch.spec.whatwg.org/#cross-origin-resource-policy-check,
+//       but the steps aren't even close to the spec. Perhaps this needs to be rewritten?
+fn cross_origin_resource_policy_check(
+    request: &Request,
+    response: &Response,
+) -> CrossOriginResourcePolicy {
+    // Step 1
+    if request.mode != RequestMode::NoCors {
+        return CrossOriginResourcePolicy::Allowed;
+    }
+
+    // Step 2
+    let current_url_origin = request.current_url().origin();
+    let same_origin = if let Origin::Origin(ref origin) = request.origin {
+        *origin == request.current_url().origin()
+    } else {
+        false
+    };
+
+    if same_origin {
+        return CrossOriginResourcePolicy::Allowed;
+    }
+
+    // Step 3
+    let policy = response
+        .headers
+        .get(HeaderName::from_static("cross-origin-resource-policy"))
+        .map(|h| h.to_str().unwrap_or(""))
+        .unwrap_or("");
+
+    // Step 4
+    if policy == "same-origin" {
+        return CrossOriginResourcePolicy::Blocked;
+    }
+
+    // Step 5
+    if let Origin::Origin(ref request_origin) = request.origin {
+        let schemeless_same_origin = is_schemelessy_same_site(request_origin, &current_url_origin);
+        if schemeless_same_origin &&
+            (request_origin.scheme() == Some("https") ||
+                response.https_state == HttpsState::None)
+        {
+            return CrossOriginResourcePolicy::Allowed;
+        }
+    };
+
+    // Step 6
+    if policy == "same-site" {
+        return CrossOriginResourcePolicy::Blocked;
+    }
+
+    CrossOriginResourcePolicy::Allowed
 }
 
 // Convenience struct that implements Done, for setting responseEnd on function return
@@ -1784,15 +1874,15 @@ async fn http_network_fetch(
     let timing = context.timing.lock().unwrap().clone();
     let mut response = Response::new(url.clone(), timing);
 
-    response.status = Some((
+    response.status = HttpStatus::new(
         res.status(),
-        res.status().canonical_reason().unwrap_or("").into(),
-    ));
+        res.status()
+            .canonical_reason()
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec(),
+    );
     info!("got {:?} response for {:?}", res.status(), request.url());
-    response.raw_status = Some((
-        res.status().as_u16(),
-        res.status().canonical_reason().unwrap_or("").into(),
-    ));
     response.headers = res.headers().clone();
     response.referrer = request.referrer.to_url().cloned();
     response.referrer_policy = request.referrer_policy;
@@ -1995,12 +2085,7 @@ async fn cors_preflight_fetch(
     let response =
         http_network_or_cache_fetch(&mut preflight, false, false, &mut None, context).await;
     // Step 7
-    if cors_check(request, &response).is_ok() &&
-        response
-            .status
-            .as_ref()
-            .map_or(false, |(status, _)| status.is_success())
-    {
+    if cors_check(request, &response).is_ok() && response.status.code().is_success() {
         // Substep 1
         let mut methods = if response
             .headers
@@ -2097,7 +2182,6 @@ async fn cors_preflight_fetch(
             .typed_get::<AccessControlMaxAge>()
             .map(|acma| acma.into())
             .unwrap_or(Duration::from_secs(5));
-        let max_age = max_age.as_secs() as u32;
         // Substep 10
         // TODO: Need to define what an imposed limit on max-age is
 
@@ -2180,13 +2264,234 @@ fn is_no_store_cache(headers: &HeaderMap) -> bool {
 }
 
 /// <https://fetch.spec.whatwg.org/#redirect-status>
-pub fn is_redirect_status(status: &(StatusCode, String)) -> bool {
+pub fn is_redirect_status(status: StatusCode) -> bool {
     matches!(
-        status.0,
+        status,
         StatusCode::MOVED_PERMANENTLY |
             StatusCode::FOUND |
             StatusCode::SEE_OTHER |
             StatusCode::TEMPORARY_REDIRECT |
             StatusCode::PERMANENT_REDIRECT
     )
+}
+
+/// <https://fetch.spec.whatwg.org/#concept-request-tainted-origin>
+fn request_has_redirect_tainted_origin(request: &Request) -> bool {
+    // Step 1. Assert: request’s origin is not "client".
+    let Origin::Origin(request_origin) = &request.origin else {
+        panic!("origin cannot be \"client\" at this point in time");
+    };
+
+    // Step 2. Let lastURL be null.
+    let mut last_url = None;
+
+    // Step 3. For each url of request’s URL list:
+    for url in &request.url_list {
+        // Step 3.1 If lastURL is null, then set lastURL to url and continue.
+        let Some(last_url) = &mut last_url else {
+            last_url = Some(url);
+            continue;
+        };
+
+        // Step 3.2 If url’s origin is not same origin with lastURL’s origin and
+        //          request’s origin is not same origin with lastURL’s origin, then return true.
+        if url.origin() != last_url.origin() && *request_origin != last_url.origin() {
+            return true;
+        }
+
+        // Step 3.3 Set lastURL to url.
+        *last_url = url;
+    }
+
+    // Step 4. Return false.
+    false
+}
+
+/// <https://fetch.spec.whatwg.org/#serializing-a-request-origin>
+fn serialize_request_origin(request: &Request) -> headers::Origin {
+    // Step 1. Assert: request’s origin is not "client".
+    let Origin::Origin(origin) = &request.origin else {
+        panic!("origin cannot be \"client\" at this point in time");
+    };
+
+    // Step 2. If request has a redirect-tainted origin, then return "null".
+    if request_has_redirect_tainted_origin(request) {
+        return headers::Origin::NULL;
+    }
+
+    // Step 3. Return request’s origin, serialized.
+    match origin {
+        ImmutableOrigin::Opaque(_) => headers::Origin::NULL,
+        ImmutableOrigin::Tuple(scheme, host, port) => {
+            // TODO: Ensure that hyper/servo don't disagree about valid origin headers
+            headers::Origin::try_from_parts(scheme, &host.to_string(), *port)
+                .unwrap_or(headers::Origin::NULL)
+        },
+    }
+}
+
+/// <https://fetch.spec.whatwg.org/#append-a-request-origin-header>
+pub fn append_a_request_origin_header(request: &mut Request) {
+    // Step 1. Assert: request’s origin is not "client".
+    let Origin::Origin(request_origin) = &request.origin else {
+        panic!("origin cannot be \"client\" at this point in time");
+    };
+
+    // Step 2. Let serializedOrigin be the result of byte-serializing a request origin with request.
+    let mut serialized_origin = serialize_request_origin(request);
+
+    // Step 3. If request’s response tainting is "cors" or request’s mode is "websocket",
+    //         then append (`Origin`, serializedOrigin) to request’s header list.
+    if request.response_tainting == ResponseTainting::CorsTainting ||
+        matches!(request.mode, RequestMode::WebSocket { .. })
+    {
+        request.headers.typed_insert(serialized_origin);
+    }
+    // Step 4. Otherwise, if request’s method is neither `GET` nor `HEAD`, then:
+    else if !matches!(request.method, Method::GET | Method::HEAD) {
+        // Step 4.1 If request’s mode is not "cors", then switch on request’s referrer policy:
+        if request.mode != RequestMode::CorsMode {
+            match request.referrer_policy {
+                Some(ReferrerPolicy::NoReferrer) => {
+                    // Set serializedOrigin to `null`.
+                    serialized_origin = headers::Origin::NULL;
+                },
+                Some(
+                    ReferrerPolicy::NoReferrerWhenDowngrade |
+                    ReferrerPolicy::StrictOrigin |
+                    ReferrerPolicy::StrictOriginWhenCrossOrigin,
+                ) => {
+                    // If request’s origin is a tuple origin, its scheme is "https", and
+                    // request’s current URL’s scheme is not "https", then set serializedOrigin to `null`.
+                    if let ImmutableOrigin::Tuple(scheme, _, _) = &request_origin {
+                        if scheme == "https" && request.current_url().scheme() != "https" {
+                            serialized_origin = headers::Origin::NULL;
+                        }
+                    }
+                },
+                Some(ReferrerPolicy::SameOrigin) => {
+                    // If request’s origin is not same origin with request’s current URL’s origin,
+                    // then set serializedOrigin to `null`.
+                    if *request_origin != request.current_url().origin() {
+                        serialized_origin = headers::Origin::NULL;
+                    }
+                },
+                _ => {
+                    // Otherwise, do nothing.
+                },
+            };
+        }
+
+        // Step 4.2. Append (`Origin`, serializedOrigin) to request’s header list.
+        request.headers.typed_insert(serialized_origin);
+    }
+}
+
+/// <https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-append-the-fetch-metadata-headers-for-a-request>
+fn append_the_fetch_metadata_headers(r: &mut Request) {
+    // Step 1. If r’s url is not an potentially trustworthy URL, return.
+    if !r.url().is_potentially_trustworthy() {
+        return;
+    }
+
+    // Step 2. Set the Sec-Fetch-Dest header for r.
+    set_the_sec_fetch_dest_header(r);
+
+    // Step 3. Set the Sec-Fetch-Mode header for r.
+    set_the_sec_fetch_mode_header(r);
+
+    // Step 4. Set the Sec-Fetch-Site header for r.
+    set_the_sec_fetch_site_header(r);
+
+    // Step 5. Set the Sec-Fetch-User header for r.
+    set_the_sec_fetch_user_header(r);
+}
+
+/// <https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-dest>
+fn set_the_sec_fetch_dest_header(r: &mut Request) {
+    // Step 1. Assert: r’s url is a potentially trustworthy URL.
+    debug_assert!(r.url().is_potentially_trustworthy());
+
+    // Step 2. Let header be a Structured Header whose value is a token.
+    // Step 3. If r’s destination is the empty string, set header’s value to the string "empty".
+    // Otherwise, set header’s value to r’s destination.
+    let header = r.destination;
+
+    // Step 4. Set a structured field value `Sec-Fetch-Dest`/header in r’s header list.
+    r.headers.typed_insert(SecFetchDest(header));
+}
+
+/// <https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-mode>
+fn set_the_sec_fetch_mode_header(r: &mut Request) {
+    // Step 1. Assert: r’s url is a potentially trustworthy URL.
+    debug_assert!(r.url().is_potentially_trustworthy());
+
+    // Step 2. Let header be a Structured Header whose value is a token.
+    // Step 3. Set header’s value to r’s mode.
+    let header = &r.mode;
+
+    // Step 4. Set a structured field value `Sec-Fetch-Mode`/header in r’s header list.
+    r.headers.typed_insert(SecFetchMode::from(header));
+}
+
+/// <https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>
+fn set_the_sec_fetch_site_header(r: &mut Request) {
+    // The webappsec spec seems to have a similar issue as
+    // https://github.com/whatwg/fetch/issues/1773
+    let Origin::Origin(request_origin) = &r.origin else {
+        panic!("request origin cannot be \"client\" at this point")
+    };
+
+    // Step 1. Assert: r’s url is a potentially trustworthy URL.
+    debug_assert!(r.url().is_potentially_trustworthy());
+
+    // Step 2. Let header be a Structured Header whose value is a token.
+    // Step 3. Set header’s value to same-origin.
+    let mut header = SecFetchSite::SameOrigin;
+
+    // TODO: Step 3. If r is a navigation request that was explicitly caused by a
+    // user’s interaction with the user agent, then set header’s value to none.
+
+    // Step 5. If header’s value is not none, then for each url in r’s url list:
+    if header != SecFetchSite::None {
+        for url in &r.url_list {
+            // Step 5.1 If url is same origin with r’s origin, continue.
+            if url.origin() == *request_origin {
+                continue;
+            }
+
+            // Step 5.2 Set header’s value to cross-site.
+            header = SecFetchSite::CrossSite;
+
+            // Step 5.3 If r’s origin is not same site with url’s origin, then break.
+            if is_same_site(request_origin, &url.origin()) {
+                break;
+            }
+
+            // Step 5.4 Set header’s value to same-site.
+            header = SecFetchSite::SameSite;
+        }
+    }
+
+    // Step 6. Set a structured field value `Sec-Fetch-Site`/header in r’s header list.
+    r.headers.typed_insert(header);
+}
+
+/// <https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-user>
+fn set_the_sec_fetch_user_header(r: &mut Request) {
+    // Step 1. Assert: r’s url is a potentially trustworthy URL.
+    debug_assert!(r.url().is_potentially_trustworthy());
+
+    // Step 2. If r is not a navigation request, or if r’s user-activation is false, return.
+    // TODO user activation
+    if !r.is_navigation_request() {
+        return;
+    }
+
+    // Step 3. Let header be a Structured Header whose value is a token.
+    // Step 4. Set header’s value to true.
+    let header = SecFetchUser;
+
+    // Step 5. Set a structured field value `Sec-Fetch-User`/header in r’s header list.
+    r.headers.typed_insert(header);
 }

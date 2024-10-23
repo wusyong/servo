@@ -13,21 +13,19 @@ use std::sync::Arc;
 use std::{f32, mem};
 
 use app_units::{Au, AU_PER_PX};
+use base::id::{BrowsingContextId, PipelineId};
 use bitflags::bitflags;
 use canvas_traits::canvas::{CanvasMsg, FromLayoutMsg};
 use embedder_traits::Cursor;
 use euclid::default::{Point2D, Rect, SideOffsets2D as UntypedSideOffsets2D, Size2D};
 use euclid::{rect, SideOffsets2D};
 use fnv::FnvHashMap;
-use gfx::text::glyph::ByteIndex;
-use gfx::text::TextRun;
-use gfx_traits::{combine_id_with_fragment_type, FragmentType, StackingContextId};
+use fonts::ByteIndex;
 use ipc_channel::ipc;
 use log::{debug, warn};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
 use net_traits::image_cache::UsePlaceholder;
 use range::Range;
-use script_traits::compositor::ScrollSensitivity;
+use script_layout_interface::{combine_id_with_fragment_type, FragmentType};
 use servo_config::opts;
 use servo_geometry::{self, MaxRect};
 use style::color::AbsoluteColor;
@@ -52,7 +50,9 @@ use webrender_api::{
     ExternalScrollId, FilterOp, GlyphInstance, ImageRendering, LineStyle, NinePatchBorder,
     NinePatchBorderSource, NormalBorder, PropertyBinding, StickyOffsetBounds,
 };
+use webrender_traits::display_list::ScrollSensitivity;
 
+use super::StackingContextId;
 use crate::block::BlockFlow;
 use crate::context::LayoutContext;
 use crate::display_list::background::{self, get_cyclic};
@@ -72,6 +72,7 @@ use crate::fragment::{
 use crate::inline::InlineFragmentNodeFlags;
 use crate::model::MaybeAuto;
 use crate::table_cell::CollapsedBordersForCell;
+use crate::text_run::TextRun;
 
 static THREAD_TINT_COLORS: [ColorF; 8] = [
     ColorF {
@@ -504,9 +505,10 @@ impl<'a> DisplayListBuildState<'a> {
         // Properly order display items that make up a stacking context. "Steps" here
         // refer to the steps in CSS 2.1 Appendix E.
         // Steps 1 and 2: Borders and background for the root.
-        while child_items.last().map_or(false, |child| {
-            child.section() == DisplayListSection::BackgroundAndBorders
-        }) {
+        while child_items
+            .last()
+            .is_some_and(|child| child.section() == DisplayListSection::BackgroundAndBorders)
+        {
             list.push(child_items.pop().unwrap());
         }
 
@@ -514,31 +516,34 @@ impl<'a> DisplayListBuildState<'a> {
         let mut child_stacking_contexts = child_stacking_contexts.into_iter().peekable();
         while child_stacking_contexts
             .peek()
-            .map_or(false, |child| child.z_index < 0)
+            .is_some_and(|child| child.z_index < 0)
         {
             let context = child_stacking_contexts.next().unwrap();
             self.move_to_display_list_for_stacking_context(list, context);
         }
 
         // Step 4: Block backgrounds and borders.
-        while child_items.last().map_or(false, |child| {
-            child.section() == DisplayListSection::BlockBackgroundsAndBorders
-        }) {
+        while child_items
+            .last()
+            .is_some_and(|child| child.section() == DisplayListSection::BlockBackgroundsAndBorders)
+        {
             list.push(child_items.pop().unwrap());
         }
 
         // Step 5: Floats.
-        while child_stacking_contexts.peek().map_or(false, |child| {
-            child.context_type == StackingContextType::PseudoFloat
-        }) {
+        while child_stacking_contexts
+            .peek()
+            .is_some_and(|child| child.context_type == StackingContextType::PseudoFloat)
+        {
             let context = child_stacking_contexts.next().unwrap();
             self.move_to_display_list_for_stacking_context(list, context);
         }
 
         // Step 6 & 7: Content and inlines that generate stacking contexts.
-        while child_items.last().map_or(false, |child| {
-            child.section() == DisplayListSection::Content
-        }) {
+        while child_items
+            .last()
+            .is_some_and(|child| child.section() == DisplayListSection::Content)
+        {
             list.push(child_items.pop().unwrap());
         }
 
@@ -792,7 +797,7 @@ impl Fragment {
                     }
                 },
                 Image::CrossFade(..) | Image::ImageSet(..) => {
-                    unreachable!("Shouldn't be parsed by Servo for now")
+                    // TODO: Add support for ImageSet and CrossFade rendering.
                 },
             }
         }
@@ -1939,20 +1944,18 @@ impl Fragment {
                 let image_key = match canvas_fragment_info.source {
                     CanvasFragmentSource::WebGL(image_key) => image_key,
                     CanvasFragmentSource::WebGPU(image_key) => image_key,
-                    CanvasFragmentSource::Image(ref ipc_renderer) => match *ipc_renderer {
-                        Some(ref ipc_renderer) => {
-                            let ipc_renderer = ipc_renderer.lock().unwrap();
-                            let (sender, receiver) = ipc::channel().unwrap();
-                            ipc_renderer
-                                .send(CanvasMsg::FromLayout(
-                                    FromLayoutMsg::SendData(sender),
-                                    canvas_fragment_info.canvas_id,
-                                ))
-                                .unwrap();
-                            receiver.recv().unwrap().image_key
-                        },
-                        None => return,
+                    CanvasFragmentSource::Image(ref ipc_renderer) => {
+                        let ipc_renderer = ipc_renderer.lock().unwrap();
+                        let (sender, receiver) = ipc::channel().unwrap();
+                        ipc_renderer
+                            .send(CanvasMsg::FromLayout(
+                                FromLayoutMsg::SendData(sender),
+                                canvas_fragment_info.canvas_id,
+                            ))
+                            .unwrap();
+                        receiver.recv().unwrap().image_key
                     },
+                    CanvasFragmentSource::Empty => return,
                 };
 
                 let base = create_base_display_item(state);
@@ -2198,6 +2201,7 @@ impl Fragment {
                     font_key: text_fragment.run.font_key,
                     color: text_color.to_layout(),
                     glyph_options: None,
+                    ref_frame_offset: LayoutVector2D::zero(),
                 },
                 glyphs,
             )));

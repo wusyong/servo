@@ -12,29 +12,32 @@ pub mod wrapper_traits;
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::sync::atomic::AtomicIsize;
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use app_units::Au;
 use atomic_refcell::AtomicRefCell;
+use base::cross_process_instant::CrossProcessInstant;
+use base::id::{BrowsingContextId, PipelineId};
+use base::Epoch;
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
 use crossbeam_channel::Sender;
 use euclid::default::{Point2D, Rect};
 use euclid::Size2D;
-use gfx::font_cache_thread::FontCacheThread;
-use gfx_traits::Epoch;
+use fonts::SystemFontServiceProxy;
 use ipc_channel::ipc::IpcSender;
 use libc::c_void;
 use malloc_size_of_derive::MallocSizeOf;
 use metrics::PaintTimeMetrics;
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
 use net_traits::image_cache::{ImageCache, PendingImageId};
-use profile_traits::mem::ReportsChan;
+use net_traits::ResourceThreads;
+use profile_traits::mem::Report;
 use profile_traits::time;
 use script_traits::{
-    ConstellationControlMsg, InitialScriptState, LayoutControlMsg, LayoutMsg, LoadData, Painter,
-    ScrollState, UntrustedNodeAddress, WebrenderIpcSender, WindowSizeData,
+    ConstellationControlMsg, InitialScriptState, LayoutMsg, LoadData, Painter, ScrollState,
+    UntrustedNodeAddress, WindowSizeData,
 };
+use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::animation::DocumentAnimationSet;
@@ -50,6 +53,7 @@ use style::stylesheets::Stylesheet;
 use style::Atom;
 use style_traits::CSSPixel;
 use webrender_api::ImageKey;
+use webrender_traits::CrossProcessCompositorApi;
 
 pub type GenericLayoutData = dyn Any + Send + Sync;
 
@@ -100,7 +104,11 @@ pub enum LayoutElementType {
     HTMLInputElement,
     HTMLMediaElement,
     HTMLObjectElement,
+    HTMLOptGroupElement,
+    HTMLOptionElement,
     HTMLParagraphElement,
+    HTMLPreElement,
+    HTMLSelectElement,
     HTMLTableCellElement,
     HTMLTableColElement,
     HTMLTableElement,
@@ -112,8 +120,10 @@ pub enum LayoutElementType {
 
 pub enum HTMLCanvasDataSource {
     WebGL(ImageKey),
-    Image(Option<IpcSender<CanvasMsg>>),
+    Image(IpcSender<CanvasMsg>),
     WebGPU(ImageKey),
+    /// transparent black
+    Empty,
 }
 
 pub struct HTMLCanvasData {
@@ -136,6 +146,7 @@ pub struct TrustedNodeAddress(pub *const c_void);
 unsafe impl Send for TrustedNodeAddress {}
 
 /// Whether the pending image needs to be fetched or is waiting on an existing fetch.
+#[derive(Debug)]
 pub enum PendingImageState {
     Unrequested(ServoUrl),
     PendingResponse,
@@ -144,6 +155,7 @@ pub enum PendingImageState {
 /// The data associated with an image that is not yet present in the image cache.
 /// Used by the script thread to hold on to DOM elements that need to be repainted
 /// when an image fetch is complete.
+#[derive(Debug)]
 pub struct PendingImage {
     pub state: PendingImageState,
     pub node: UntrustedNodeAddress,
@@ -162,9 +174,10 @@ pub struct LayoutConfig {
     pub constellation_chan: IpcSender<LayoutMsg>,
     pub script_chan: IpcSender<ConstellationControlMsg>,
     pub image_cache: Arc<dyn ImageCache>,
-    pub font_cache_thread: FontCacheThread,
+    pub resource_threads: ResourceThreads,
+    pub system_font_service: Arc<SystemFontServiceProxy>,
     pub time_profiler_chan: time::ProfilerChan,
-    pub webrender_api_sender: WebrenderIpcSender,
+    pub compositor_api: CrossProcessCompositorApi,
     pub paint_time_metrics: PaintTimeMetrics,
     pub window_size: WindowSizeData,
 }
@@ -174,12 +187,6 @@ pub trait LayoutFactory: Send + Sync {
 }
 
 pub trait Layout {
-    /// Handle a single message from the Constellation.
-    fn handle_constellation_msg(&mut self, msg: LayoutControlMsg);
-
-    /// Handle a a single mesasge from the FontCacheThread.
-    fn handle_font_cache_msg(&mut self);
-
     /// Get a reference to this Layout's Stylo `Device` used to handle media queries and
     /// resolve font metrics.
     fn device(&self) -> &Device;
@@ -208,7 +215,7 @@ pub trait Layout {
 
     /// Requests that layout measure its memory usage. The resulting reports are sent back
     /// via the supplied channel.
-    fn collect_reports(&self, reports_chan: ReportsChan);
+    fn collect_reports(&self, reports: &mut Vec<Report>);
 
     /// Sets quirks mode for the document, causing the quirks mode stylesheet to be used.
     fn set_quirks_mode(&mut self, quirks_mode: QuirksMode);
@@ -227,10 +234,16 @@ pub trait Layout {
         painter: Box<dyn Painter>,
     );
 
+    /// Set the scroll states of this layout after a compositor scroll.
+    fn set_scroll_states(&mut self, scroll_states: &[ScrollState]);
+
+    /// Set the paint time for a specific epoch.
+    fn set_epoch_paint_time(&mut self, epoch: Epoch, paint_time: CrossProcessInstant);
+
     fn query_content_box(&self, node: OpaqueNode) -> Option<Rect<Au>>;
     fn query_content_boxes(&self, node: OpaqueNode) -> Vec<Rect<Au>>;
     fn query_client_rect(&self, node: OpaqueNode) -> Rect<i32>;
-    fn query_element_inner_text(&self, node: TrustedNodeAddress) -> String;
+    fn query_element_inner_outer_text(&self, node: TrustedNodeAddress) -> String;
     fn query_inner_window_dimension(
         &self,
         context: BrowsingContextId,
@@ -268,7 +281,7 @@ pub trait ScriptThreadFactory {
     fn create(
         state: InitialScriptState,
         layout_factory: Arc<dyn LayoutFactory>,
-        font_cache_thread: FontCacheThread,
+        system_font_service: Arc<SystemFontServiceProxy>,
         load_data: LoadData,
         user_agent: Cow<'static, str>,
     );
@@ -296,7 +309,7 @@ pub enum QueryMsg {
     NodesFromPointQuery,
     ResolvedStyleQuery,
     StyleQuery,
-    ElementInnerTextQuery,
+    ElementInnerOuterTextQuery,
     ResolvedFontStyleQuery,
     InnerWindowDimensionsQuery,
 }
@@ -306,7 +319,7 @@ pub enum QueryMsg {
 pub enum ReflowGoal {
     Full,
     TickAnimations,
-    LayoutQuery(QueryMsg, u64),
+    LayoutQuery(QueryMsg),
 
     /// Tells layout about a single new scrolling offset from the script. The rest will
     /// remain untouched and layout won't forward this back to script.
@@ -319,8 +332,8 @@ impl ReflowGoal {
     pub fn needs_display_list(&self) -> bool {
         match *self {
             ReflowGoal::Full | ReflowGoal::TickAnimations | ReflowGoal::UpdateScrollNode(_) => true,
-            ReflowGoal::LayoutQuery(ref querymsg, _) => match *querymsg {
-                QueryMsg::ElementInnerTextQuery |
+            ReflowGoal::LayoutQuery(ref querymsg) => match *querymsg {
+                QueryMsg::ElementInnerOuterTextQuery |
                 QueryMsg::InnerWindowDimensionsQuery |
                 QueryMsg::NodesFromPointQuery |
                 QueryMsg::ResolvedStyleQuery |
@@ -341,10 +354,10 @@ impl ReflowGoal {
     pub fn needs_display(&self) -> bool {
         match *self {
             ReflowGoal::Full | ReflowGoal::TickAnimations | ReflowGoal::UpdateScrollNode(_) => true,
-            ReflowGoal::LayoutQuery(ref querymsg, _) => match *querymsg {
+            ReflowGoal::LayoutQuery(ref querymsg) => match *querymsg {
                 QueryMsg::NodesFromPointQuery |
                 QueryMsg::TextIndexQuery |
-                QueryMsg::ElementInnerTextQuery => true,
+                QueryMsg::ElementInnerOuterTextQuery => true,
                 QueryMsg::ContentBox |
                 QueryMsg::ContentBoxes |
                 QueryMsg::ClientRectQuery |
@@ -360,19 +373,21 @@ impl ReflowGoal {
 }
 
 /// Information needed for a reflow.
+#[derive(Debug)]
 pub struct Reflow {
     ///  A clipping rectangle for the page, an enlarged rectangle containing the viewport.
     pub page_clip_rect: Rect<Au>,
 }
 
 /// Information derived from a layout pass that needs to be returned to the script thread.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ReflowComplete {
     /// The list of images that were encountered that are in progress.
     pub pending_images: Vec<PendingImage>,
 }
 
 /// Information needed for a script-initiated reflow.
+#[derive(Debug)]
 pub struct ScriptReflow {
     /// General reflow data.
     pub reflow_info: Reflow,
@@ -412,4 +427,51 @@ pub struct PendingRestyle {
 
     /// Any explicit restyles damage that have been accumulated for this element.
     pub damage: RestyleDamage,
+}
+
+/// The type of fragment that a scroll root is created for.
+///
+/// This can only ever grow to maximum 4 entries. That's because we cram the value of this enum
+/// into the lower 2 bits of the `ScrollRootId`, which otherwise contains a 32-bit-aligned
+/// heap address.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+pub enum FragmentType {
+    /// A StackingContext for the fragment body itself.
+    FragmentBody,
+    /// A StackingContext created to contain ::before pseudo-element content.
+    BeforePseudoContent,
+    /// A StackingContext created to contain ::after pseudo-element content.
+    AfterPseudoContent,
+}
+
+/// The next ID that will be used for a special scroll root id.
+///
+/// A special scroll root is a scroll root that is created for generated content.
+static NEXT_SPECIAL_SCROLL_ROOT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// If none of the bits outside this mask are set, the scroll root is a special scroll root.
+/// Note that we assume that the top 16 bits of the address space are unused on the platform.
+const SPECIAL_SCROLL_ROOT_ID_MASK: u64 = 0xffff;
+
+/// Returns a new scroll root ID for a scroll root.
+fn next_special_id() -> u64 {
+    // We shift this left by 2 to make room for the fragment type ID.
+    ((NEXT_SPECIAL_SCROLL_ROOT_ID.fetch_add(1, Ordering::SeqCst) + 1) << 2) &
+        SPECIAL_SCROLL_ROOT_ID_MASK
+}
+
+pub fn combine_id_with_fragment_type(id: usize, fragment_type: FragmentType) -> u64 {
+    debug_assert_eq!(id & (fragment_type as usize), 0);
+    if fragment_type == FragmentType::FragmentBody {
+        id as u64
+    } else {
+        next_special_id() | (fragment_type as u64)
+    }
+}
+
+pub fn node_id_from_scroll_id(id: usize) -> Option<usize> {
+    if (id as u64 & !SPECIAL_SCROLL_ROOT_ID_MASK) != 0 {
+        return Some(id & !3);
+    }
+    None
 }

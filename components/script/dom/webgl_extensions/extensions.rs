@@ -10,7 +10,7 @@ use canvas_traits::webgl::{GlType, TexFormat, WebGLSLVersion, WebGLVersion};
 use fnv::{FnvHashMap, FnvHashSet};
 use js::jsapi::JSObject;
 use malloc_size_of::MallocSizeOf;
-use sparkle::gl::{self, GLenum};
+type GLenum = u32;
 
 use super::wrapper::{TypedWebGLExtensionWrapper, WebGLExtensionWrapper};
 use super::{ext, WebGLExtension, WebGLExtensionSpec};
@@ -250,7 +250,7 @@ impl WebGLExtensions {
         self.extensions
             .borrow()
             .get(&name)
-            .map_or(false, |ext| ext.is_enabled())
+            .is_some_and(|ext| ext.is_enabled())
     }
 
     pub fn supports_gl_extension(&self, name: &str) -> bool {
@@ -279,11 +279,11 @@ impl WebGLExtensions {
     }
 
     pub fn is_tex_type_enabled(&self, data_type: GLenum) -> bool {
-        self.features
+        !self
+            .features
             .borrow()
             .disabled_tex_types
-            .get(&data_type)
-            .is_none()
+            .contains(&data_type)
     }
 
     pub fn add_effective_tex_internal_format(
@@ -321,11 +321,11 @@ impl WebGLExtensions {
     }
 
     pub fn is_filterable(&self, text_data_type: u32) -> bool {
-        self.features
+        !self
+            .features
             .borrow()
             .not_filterable_tex_types
-            .get(&text_data_type)
-            .is_none()
+            .contains(&text_data_type)
     }
 
     pub fn enable_hint_target(&self, name: GLenum) {
@@ -461,7 +461,7 @@ impl WebGLExtensions {
         if type_ == OESTextureHalfFloatConstants::HALF_FLOAT_OES &&
             !self.supports_gl_extension("GL_OES_texture_half_float")
         {
-            return gl::HALF_FLOAT;
+            return glow::HALF_FLOAT;
         }
         type_
     }

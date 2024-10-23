@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use base::id::{PipelineNamespace, ServiceWorkerId, ServiceWorkerRegistrationId};
 use crossbeam_channel::{select, unbounded, Receiver, RecvError, Sender};
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
-use msg::constellation_msg::{PipelineNamespace, ServiceWorkerId, ServiceWorkerRegistrationId};
 use net_traits::{CoreResourceMsg, CustomResponseMediator};
 use script_traits::{
     DOMMessage, Job, JobError, JobResult, JobResultValue, JobType, SWManagerMsg, SWManagerSenders,
@@ -29,11 +29,11 @@ use crate::dom::serviceworkerglobalscope::{
     ServiceWorkerControlMsg, ServiceWorkerGlobalScope, ServiceWorkerScriptMsg,
 };
 use crate::dom::serviceworkerregistration::longest_prefix_match;
-use crate::script_runtime::ContextForRequestInterrupt;
+use crate::script_runtime::ThreadSafeJSContext;
 
 enum Message {
     FromResource(CustomResponseMediator),
-    FromConstellation(ServiceWorkerMsg),
+    FromConstellation(Box<ServiceWorkerMsg>),
 }
 
 /// <https://w3c.github.io/ServiceWorker/#dfn-service-worker>
@@ -103,7 +103,7 @@ impl Drop for ServiceWorkerRegistration {
         self.context
             .take()
             .expect("No context to request interrupt.")
-            .request_interrupt();
+            .request_interrupt_callback();
 
         // TODO: Step 1, 2 and 3.
         if self
@@ -134,7 +134,7 @@ struct ServiceWorkerRegistration {
     /// A handle to join on the worker thread.
     join_handle: Option<JoinHandle<()>>,
     /// A context to request an interrupt.
-    context: Option<ContextForRequestInterrupt>,
+    context: Option<ThreadSafeJSContext>,
     /// The closing flag for the worker.
     closing: Option<Arc<AtomicBool>>,
 }
@@ -157,7 +157,7 @@ impl ServiceWorkerRegistration {
         &mut self,
         join_handle: JoinHandle<()>,
         control_sender: Sender<ServiceWorkerControlMsg>,
-        context: ContextForRequestInterrupt,
+        context: ThreadSafeJSContext,
         closing: Arc<AtomicBool>,
     ) {
         assert!(self.join_handle.is_none());
@@ -253,7 +253,7 @@ impl ServiceWorkerManager {
     fn handle_message(&mut self) {
         while let Ok(message) = self.receive_message() {
             let should_continue = match message {
-                Message::FromConstellation(msg) => self.handle_message_from_constellation(msg),
+                Message::FromConstellation(msg) => self.handle_message_from_constellation(*msg),
                 Message::FromResource(msg) => self.handle_message_from_resource(msg),
             };
             if !should_continue {
@@ -283,7 +283,7 @@ impl ServiceWorkerManager {
 
     fn receive_message(&mut self) -> Result<Message, RecvError> {
         select! {
-            recv(self.own_port) -> msg => msg.map(Message::FromConstellation),
+            recv(self.own_port) -> msg => msg.map(|m| Message::FromConstellation(Box::new(m))),
             recv(self.resource_receiver) -> msg => msg.map(Message::FromResource),
         }
     }
@@ -447,7 +447,7 @@ fn update_serviceworker(
     ServiceWorker,
     JoinHandle<()>,
     Sender<ServiceWorkerControlMsg>,
-    ContextForRequestInterrupt,
+    ThreadSafeJSContext,
     Arc<AtomicBool>,
 ) {
     let (sender, receiver) = unbounded();

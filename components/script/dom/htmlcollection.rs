@@ -25,9 +25,9 @@ pub trait CollectionFilter: JSTraceable {
     fn filter<'a>(&self, elem: &'a Element, root: &'a Node) -> bool;
 }
 
-/// An optional u32, using maxint to represent None.
-/// It would be nicer just to use Option<u32> for this, but that would produce word
-/// alignment issues since Option<u32> uses 33 bits.
+/// An optional `u32`, using `u32::MAX` to represent None.  It would be nicer
+/// just to use `Option<u32>` for this, but that would produce word alignment
+/// issues since `Option<u32>` uses 33 bits.
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
 struct OptionU32 {
     bits: u32,
@@ -35,7 +35,7 @@ struct OptionU32 {
 
 impl OptionU32 {
     fn to_option(self) -> Option<u32> {
-        if self.bits == u32::max_value() {
+        if self.bits == u32::MAX {
             None
         } else {
             Some(self.bits)
@@ -43,14 +43,12 @@ impl OptionU32 {
     }
 
     fn some(bits: u32) -> OptionU32 {
-        assert_ne!(bits, u32::max_value());
+        assert_ne!(bits, u32::MAX);
         OptionU32 { bits }
     }
 
     fn none() -> OptionU32 {
-        OptionU32 {
-            bits: u32::max_value(),
-        }
+        OptionU32 { bits: u32::MAX }
     }
 }
 
@@ -385,8 +383,8 @@ impl HTMLCollectionMethods for HTMLCollection {
 
         // Step 2.
         self.elements_iter().find(|elem| {
-            elem.get_id().map_or(false, |id| id == key) ||
-                (elem.namespace() == &ns!(html) && elem.get_name().map_or(false, |id| id == key))
+            elem.get_id().is_some_and(|id| id == key) ||
+                (elem.namespace() == &ns!(html) && elem.get_name().is_some_and(|id| id == key))
         })
     }
 

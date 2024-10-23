@@ -8,7 +8,7 @@ use std::borrow::ToOwned;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ipc_channel::ipc::{self, IpcReceiver};
 use ipc_channel::router::ROUTER;
@@ -16,8 +16,6 @@ use profile_traits::mem::{
     ProfilerChan, ProfilerMsg, ReportKind, Reporter, ReporterRequest, ReportsChan,
 };
 use profile_traits::path;
-
-use crate::time::duration_from_seconds;
 
 pub struct Profiler {
     /// The port through which messages are received.
@@ -43,7 +41,7 @@ impl Profiler {
             thread::Builder::new()
                 .name("MemoryProfTimer".to_owned())
                 .spawn(move || loop {
-                    thread::sleep(duration_from_seconds(period));
+                    thread::sleep(Duration::from_secs_f64(period));
                     if chan.send(ProfilerMsg::Print).is_err() {
                         break;
                     }
@@ -67,10 +65,10 @@ impl Profiler {
         // be unregistered, because as long as the memory profiler is running the system memory
         // reporter can make measurements.
         let (system_reporter_sender, system_reporter_receiver) = ipc::channel().unwrap();
-        ROUTER.add_route(
-            system_reporter_receiver.to_opaque(),
+        ROUTER.add_typed_route(
+            system_reporter_receiver,
             Box::new(|message| {
-                let request: ReporterRequest = message.to().unwrap();
+                let request: ReporterRequest = message.unwrap();
                 system_reporter::collect_reports(request)
             }),
         );
@@ -387,16 +385,16 @@ impl ReportsForest {
 //---------------------------------------------------------------------------
 
 mod system_reporter {
-    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    #[cfg(not(any(target_os = "windows", target_env = "ohos")))]
     use std::ffi::CString;
-    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    #[cfg(not(any(target_os = "windows", target_env = "ohos")))]
     use std::mem::size_of;
-    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    #[cfg(not(any(target_os = "windows", target_env = "ohos")))]
     use std::ptr::null_mut;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     use libc::c_int;
-    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    #[cfg(not(any(target_os = "windows", target_env = "ohos")))]
     use libc::{c_void, size_t};
     use profile_traits::mem::{Report, ReportKind, ReporterRequest};
     use profile_traits::path;
@@ -455,12 +453,12 @@ mod system_reporter {
         request.reports_channel.send(reports);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     extern "C" {
         fn mallinfo() -> struct_mallinfo;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[repr(C)]
     pub struct struct_mallinfo {
         arena: c_int,
@@ -475,7 +473,7 @@ mod system_reporter {
         keepcost: c_int,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn system_heap_allocated() -> Option<usize> {
         let info: struct_mallinfo = unsafe { mallinfo() };
 
@@ -494,15 +492,15 @@ mod system_reporter {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
     fn system_heap_allocated() -> Option<usize> {
         None
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "android")))]
-    use jemalloc_sys::mallctl;
+    #[cfg(not(any(target_os = "windows", target_env = "ohos")))]
+    use tikv_jemalloc_sys::mallctl;
 
-    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    #[cfg(not(any(target_os = "windows", target_env = "ohos")))]
     fn jemalloc_stat(value_name: &str) -> Option<usize> {
         // Before we request the measurement of interest, we first send an "epoch"
         // request. Without that jemalloc gives cached statistics(!) which can be
@@ -549,7 +547,7 @@ mod system_reporter {
         Some(value as usize)
     }
 
-    #[cfg(any(target_os = "windows", target_os = "android"))]
+    #[cfg(any(target_os = "windows", target_env = "ohos"))]
     fn jemalloc_stat(_value_name: &str) -> Option<usize> {
         None
     }

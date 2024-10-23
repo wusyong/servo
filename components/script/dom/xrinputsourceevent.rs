@@ -20,6 +20,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::dom::xrframe::XRFrame;
 use crate::dom::xrinputsource::XRInputSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct XRInputSourceEvent {
@@ -45,10 +46,14 @@ impl XRInputSourceEvent {
         cancelable: bool,
         frame: &XRFrame,
         source: &XRInputSource,
+        can_gc: CanGc,
     ) -> DomRoot<XRInputSourceEvent> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable, frame, source)
+        Self::new_with_proto(
+            global, None, type_, bubbles, cancelable, frame, source, can_gc,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -57,11 +62,13 @@ impl XRInputSourceEvent {
         cancelable: bool,
         frame: &XRFrame,
         source: &XRInputSource,
+        can_gc: CanGc,
     ) -> DomRoot<XRInputSourceEvent> {
         let trackevent = reflect_dom_object_with_proto(
             Box::new(XRInputSourceEvent::new_inherited(frame, source)),
             global,
             proto,
+            can_gc,
         );
         {
             let event = trackevent.upcast::<Event>();
@@ -69,11 +76,14 @@ impl XRInputSourceEvent {
         }
         trackevent
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl XRInputSourceEventMethods for XRInputSourceEvent {
+    // https://immersive-web.github.io/webxr/#dom-xrinputsourceevent-xrinputsourceevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &XRInputSourceEventBinding::XRInputSourceEventInit,
     ) -> Fallible<DomRoot<XRInputSourceEvent>> {
@@ -85,11 +95,10 @@ impl XRInputSourceEvent {
             init.parent.cancelable,
             &init.frame,
             &init.inputSource,
+            can_gc,
         ))
     }
-}
 
-impl XRInputSourceEventMethods for XRInputSourceEvent {
     // https://immersive-web.github.io/webxr/#dom-xrinputsourceeventinit-frame
     fn Frame(&self) -> DomRoot<XRFrame> {
         DomRoot::from_ref(&*self.frame)

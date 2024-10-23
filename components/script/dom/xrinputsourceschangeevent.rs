@@ -23,7 +23,7 @@ use crate::dom::window::Window;
 use crate::dom::xrinputsource::XRInputSource;
 use crate::dom::xrsession::XRSession;
 use crate::realms::enter_realm;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
 pub struct XRInputSourcesChangeEvent {
@@ -46,6 +46,7 @@ impl XRInputSourcesChangeEvent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         global: &GlobalScope,
         type_: Atom,
@@ -54,9 +55,10 @@ impl XRInputSourcesChangeEvent {
         session: &XRSession,
         added: &[DomRoot<XRInputSource>],
         removed: &[DomRoot<XRInputSource>],
+        can_gc: CanGc,
     ) -> DomRoot<XRInputSourcesChangeEvent> {
         Self::new_with_proto(
-            global, None, type_, bubbles, cancelable, session, added, removed,
+            global, None, type_, bubbles, cancelable, session, added, removed, can_gc,
         )
     }
 
@@ -71,11 +73,13 @@ impl XRInputSourcesChangeEvent {
         session: &XRSession,
         added: &[DomRoot<XRInputSource>],
         removed: &[DomRoot<XRInputSource>],
+        can_gc: CanGc,
     ) -> DomRoot<XRInputSourcesChangeEvent> {
         let changeevent = reflect_dom_object_with_proto(
             Box::new(XRInputSourcesChangeEvent::new_inherited(session)),
             global,
             proto,
+            can_gc,
         );
         {
             let event = changeevent.upcast::<Event>();
@@ -94,11 +98,14 @@ impl XRInputSourcesChangeEvent {
 
         changeevent
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl XRInputSourcesChangeEventMethods for XRInputSourcesChangeEvent {
+    // https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-xrinputsourceschangeevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &XRInputSourcesChangeEventBinding::XRInputSourcesChangeEventInit,
     ) -> DomRoot<XRInputSourcesChangeEvent> {
@@ -111,11 +118,10 @@ impl XRInputSourcesChangeEvent {
             &init.session,
             &init.added,
             &init.removed,
+            can_gc,
         )
     }
-}
 
-impl XRInputSourcesChangeEventMethods for XRInputSourcesChangeEvent {
     // https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-session
     fn Session(&self) -> DomRoot<XRSession> {
         DomRoot::from_ref(&*self.session)

@@ -11,13 +11,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use cookie_rs::Cookie as CookiePair;
-use crossbeam_channel::{unbounded, Receiver};
+use base::id::TEST_PIPELINE_ID;
+use cookie::Cookie as CookiePair;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use devtools_traits::{
     ChromeToDevtoolsControlMsg, DevtoolsControlMsg, HttpRequest as DevtoolsHttpRequest,
     HttpResponse as DevtoolsHttpResponse, NetworkEvent,
 };
-use flate2::write::{DeflateEncoder, GzEncoder};
+use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
 use headers::authorization::Basic;
 use headers::{
@@ -25,23 +26,25 @@ use headers::{
 };
 use http::header::{self, HeaderMap, HeaderValue};
 use http::uri::Authority;
-use http::{Method, StatusCode};
+use http::{HeaderName, Method, StatusCode};
 use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
-use msg::constellation_msg::TEST_PIPELINE_ID;
-use net::cookie::Cookie;
+use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
+use net::fetch::methods::{self};
 use net::http_loader::determine_requests_referrer;
 use net::resource_thread::AuthCacheEntry;
-use net::test::replace_host_table;
+use net::test::{replace_host_table, DECODER_BUFFER_SIZE};
+use net_traits::http_status::HttpStatus;
 use net_traits::request::{
     BodyChunkRequest, BodyChunkResponse, BodySource, CredentialsMode, Destination, Referrer,
-    RequestBody, RequestBuilder,
+    Request, RequestBody, RequestBuilder,
 };
-use net_traits::response::ResponseBody;
-use net_traits::{CookieSource, NetworkError, ReferrerPolicy};
+use net_traits::response::{Response, ResponseBody};
+use net_traits::{CookieSource, FetchTaskTarget, NetworkError, ReferrerPolicy};
 use servo_url::{ImmutableOrigin, ServoUrl};
+use tokio_test::block_on;
 
 use crate::{fetch, fetch_with_context, make_server, new_fetch_context};
 
@@ -95,10 +98,10 @@ fn create_request_body_with_content(content: Vec<u8>) -> RequestBody {
     let content_len = content.len();
 
     let (chunk_request_sender, chunk_request_receiver) = ipc::channel().unwrap();
-    ROUTER.add_route(
-        chunk_request_receiver.to_opaque(),
+    ROUTER.add_typed_route(
+        chunk_request_receiver,
         Box::new(move |message| {
-            let request = message.to().unwrap();
+            let request = message.unwrap();
             if let BodyChunkRequest::Connect(sender) = request {
                 let _ = sender.send(BodyChunkResponse::Chunk(content.clone()));
                 let _ = sender.send(BodyChunkResponse::Done);
@@ -146,6 +149,24 @@ fn test_check_default_headers_loaded_in_every_request() {
 
     headers.typed_insert::<UserAgent>(crate::DEFAULT_USER_AGENT.parse().unwrap());
 
+    // Append fetch metadata headers
+    headers.insert(
+        HeaderName::from_static("sec-fetch-dest"),
+        HeaderValue::from_static("document"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-mode"),
+        HeaderValue::from_static("no-cors"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-user"),
+        HeaderValue::from_static("?1"),
+    );
+
     *expected_headers.lock().unwrap() = Some(headers.clone());
 
     // Testing for method.GET
@@ -156,13 +177,12 @@ fn test_check_default_headers_loaded_in_every_request() {
         .pipeline_id(Some(TEST_PIPELINE_ID))
         .build();
 
-    let response = fetch(&mut request, None);
+    let response = dbg!(fetch(&mut request, None));
     assert!(response
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 
     // Testing for method.POST
@@ -188,8 +208,7 @@ fn test_check_default_headers_loaded_in_every_request() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 
     let _ = server.close();
@@ -219,8 +238,7 @@ fn test_load_when_request_is_not_get_or_head_and_there_is_no_body_content_length
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 
     let _ = server.close();
@@ -253,8 +271,7 @@ fn test_request_and_response_data_with_network_messages() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 
     let _ = server.close();
@@ -283,14 +300,32 @@ fn test_request_and_response_data_with_network_messages() {
         HeaderValue::from_static("gzip, deflate, br"),
     );
 
+    // Append fetch metadata headers
+    headers.insert(
+        HeaderName::from_static("sec-fetch-dest"),
+        HeaderValue::from_static("document"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-mode"),
+        HeaderValue::from_static("no-cors"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        HeaderValue::from_static("same-site"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-user"),
+        HeaderValue::from_static("?1"),
+    );
+
     let httprequest = DevtoolsHttpRequest {
         url: url,
         method: Method::GET,
         headers: headers,
         body: Some(vec![]),
         pipeline_id: TEST_PIPELINE_ID,
-        startedDateTime: devhttprequest.startedDateTime,
-        timeStamp: devhttprequest.timeStamp,
+        started_date_time: devhttprequest.started_date_time,
+        time_stamp: devhttprequest.time_stamp,
         connect_time: devhttprequest.connect_time,
         send_time: devhttprequest.send_time,
         is_xhr: false,
@@ -312,7 +347,7 @@ fn test_request_and_response_data_with_network_messages() {
 
     let httpresponse = DevtoolsHttpResponse {
         headers: Some(response_headers),
-        status: Some((200, b"OK".to_vec())),
+        status: HttpStatus::default(),
         body: None,
         pipeline_id: TEST_PIPELINE_ID,
     };
@@ -341,13 +376,7 @@ fn test_request_and_response_message_from_devtool_without_pipeline_id() {
 
     let (devtools_chan, devtools_port) = unbounded();
     let response = fetch(&mut request, Some(devtools_chan));
-    assert!(response
-        .actual_response()
-        .status
-        .as_ref()
-        .unwrap()
-        .0
-        .is_success());
+    assert!(response.actual_response().status.code().is_success());
 
     let _ = server.close();
 
@@ -393,7 +422,7 @@ fn test_redirected_request_to_devtools() {
     assert_eq!(devhttprequest.url, pre_url);
     assert_eq!(
         devhttpresponse.status,
-        Some((301, b"Moved Permanently".to_vec()))
+        HttpStatus::from(StatusCode::MOVED_PERMANENTLY)
     );
 
     let devhttprequest = expect_devtools_http_request(&devtools_port);
@@ -401,7 +430,7 @@ fn test_redirected_request_to_devtools() {
 
     assert_eq!(devhttprequest.method, Method::GET);
     assert_eq!(devhttprequest.url, post_url);
-    assert_eq!(devhttpresponse.status, Some((200, b"OK".to_vec())));
+    assert_eq!(devhttpresponse.status, HttpStatus::default());
 }
 
 #[test]
@@ -435,7 +464,7 @@ fn test_load_when_redirecting_from_a_post_should_rewrite_next_request_as_get() {
     let _ = pre_server.close();
     let _ = post_server.close();
 
-    assert!(response.to_actual().status.unwrap().0.is_success());
+    assert!(response.to_actual().status.code().is_success());
 }
 
 #[test]
@@ -446,7 +475,7 @@ fn test_load_should_decode_the_response_as_deflate_when_response_headers_have_co
             header::CONTENT_ENCODING,
             HeaderValue::from_static("deflate"),
         );
-        let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
         e.write(b"Yay!").unwrap();
         let encoded_content = e.finish().unwrap();
         *response.body_mut() = encoded_content.into();
@@ -466,7 +495,7 @@ fn test_load_should_decode_the_response_as_deflate_when_response_headers_have_co
     let _ = server.close();
 
     let internal_response = response.internal_response.unwrap();
-    assert!(internal_response.status.clone().unwrap().0.is_success());
+    assert!(internal_response.status.clone().code().is_success());
     assert_eq!(
         *internal_response.body.lock().unwrap(),
         ResponseBody::Done(b"Yay!".to_vec())
@@ -499,7 +528,7 @@ fn test_load_should_decode_the_response_as_gzip_when_response_headers_have_conte
     let _ = server.close();
 
     let internal_response = response.internal_response.unwrap();
-    assert!(internal_response.status.clone().unwrap().0.is_success());
+    assert!(internal_response.status.clone().code().is_success());
     assert_eq!(
         *internal_response.body.lock().unwrap(),
         ResponseBody::Done(b"Yay!".to_vec())
@@ -544,7 +573,7 @@ fn test_load_doesnt_send_request_body_on_any_redirect() {
     let _ = pre_server.close();
     let _ = post_server.close();
 
-    assert!(response.to_actual().status.unwrap().0.is_success());
+    assert!(response.to_actual().status.code().is_success());
 }
 
 #[test]
@@ -576,8 +605,7 @@ fn test_load_doesnt_add_host_to_hsts_list_when_url_is_http_even_if_hsts_headers_
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
     assert_eq!(
         context
@@ -622,8 +650,7 @@ fn test_load_sets_cookies_in_the_resource_manager_when_it_get_set_cookie_header_
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 
     assert_cookie_for_domain(
@@ -648,7 +675,7 @@ fn test_load_sets_requests_cookies_header_for_url_by_getting_cookies_from_the_re
 
     {
         let mut cookie_jar = context.state.cookie_jar.write().unwrap();
-        let cookie = Cookie::new_wrapped(
+        let cookie = ServoCookie::new_wrapped(
             CookiePair::new("mozillaIs".to_owned(), "theBest".to_owned()),
             &url,
             CookieSource::HTTP,
@@ -674,8 +701,7 @@ fn test_load_sets_requests_cookies_header_for_url_by_getting_cookies_from_the_re
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 }
 
@@ -694,7 +720,7 @@ fn test_load_sends_cookie_if_nonhttp() {
 
     {
         let mut cookie_jar = context.state.cookie_jar.write().unwrap();
-        let cookie = Cookie::new_wrapped(
+        let cookie = ServoCookie::new_wrapped(
             CookiePair::new("mozillaIs".to_owned(), "theBest".to_owned()),
             &url,
             CookieSource::NonHTTP,
@@ -720,8 +746,7 @@ fn test_load_sends_cookie_if_nonhttp() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 }
 
@@ -758,8 +783,7 @@ fn test_cookie_set_with_httponly_should_not_be_available_using_getcookiesforurl(
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 
     assert_cookie_for_domain(
@@ -802,13 +826,7 @@ fn test_when_cookie_received_marked_secure_is_ignored_for_http() {
 
     let _ = server.close();
 
-    assert!(response
-        .actual_response()
-        .status
-        .as_ref()
-        .unwrap()
-        .0
-        .is_success());
+    assert!(response.actual_response().status.code().is_success());
 
     assert_cookie_for_domain(&context.state.cookie_jar, url.as_str(), None);
 }
@@ -844,8 +862,7 @@ fn test_load_sets_content_length_to_length_of_request_body() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 }
 
@@ -883,8 +900,7 @@ fn test_load_uses_explicit_accept_from_headers_in_load_data() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 }
 
@@ -919,8 +935,7 @@ fn test_load_sets_default_accept_to_html_xhtml_xml_and_then_anything_else() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 }
 
@@ -958,8 +973,7 @@ fn test_load_uses_explicit_accept_encoding_from_load_data_headers() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 }
 
@@ -994,8 +1008,7 @@ fn test_load_sets_default_accept_encoding_to_gzip_and_deflate() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 }
 
@@ -1140,7 +1153,7 @@ fn test_load_follows_a_redirect() {
     let _ = post_server.close();
 
     let internal_response = response.internal_response.unwrap();
-    assert!(internal_response.status.clone().unwrap().0.is_success());
+    assert!(internal_response.status.clone().code().is_success());
     assert_eq!(
         *internal_response.body.lock().unwrap(),
         ResponseBody::Done(b"Yay!".to_vec())
@@ -1192,7 +1205,7 @@ fn test_redirect_from_x_to_y_provides_y_cookies_from_y() {
     let mut context = new_fetch_context(None, None, None);
     {
         let mut cookie_jar = context.state.cookie_jar.write().unwrap();
-        let cookie_x = Cookie::new_wrapped(
+        let cookie_x = ServoCookie::new_wrapped(
             CookiePair::new("mozillaIsNot".to_owned(), "dotOrg".to_owned()),
             &url_x,
             CookieSource::HTTP,
@@ -1201,7 +1214,7 @@ fn test_redirect_from_x_to_y_provides_y_cookies_from_y() {
 
         cookie_jar.push(cookie_x, &url_x, CookieSource::HTTP);
 
-        let cookie_y = Cookie::new_wrapped(
+        let cookie_y = ServoCookie::new_wrapped(
             CookiePair::new("mozillaIs".to_owned(), "theBest".to_owned()),
             &url_y,
             CookieSource::HTTP,
@@ -1223,7 +1236,7 @@ fn test_redirect_from_x_to_y_provides_y_cookies_from_y() {
     let _ = server.close();
 
     let internal_response = response.internal_response.unwrap();
-    assert!(internal_response.status.clone().unwrap().0.is_success());
+    assert!(internal_response.status.clone().code().is_success());
     assert_eq!(
         *internal_response.body.lock().unwrap(),
         ResponseBody::Done(b"Yay!".to_vec())
@@ -1272,7 +1285,7 @@ fn test_redirect_from_x_to_x_provides_x_with_cookie_from_first_response() {
     let _ = server.close();
 
     let internal_response = response.internal_response.unwrap();
-    assert!(internal_response.status.clone().unwrap().0.is_success());
+    assert!(internal_response.status.clone().code().is_success());
     assert_eq!(
         *internal_response.body.lock().unwrap(),
         ResponseBody::Done(b"Yay!".to_vec())
@@ -1322,8 +1335,7 @@ fn test_if_auth_creds_not_in_url_but_in_cache_it_sets_it() {
         .internal_response
         .unwrap()
         .status
-        .unwrap()
-        .0
+        .code()
         .is_success());
 }
 
@@ -1348,7 +1360,7 @@ fn test_auth_ui_needs_www_auth() {
     let _ = server.close();
 
     assert_eq!(
-        response.internal_response.unwrap().status.unwrap().0,
+        response.internal_response.unwrap().status,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -1381,4 +1393,67 @@ fn test_determine_requests_referrer_longer_than_4k() {
     let referer = determine_requests_referrer(referrer_policy, referrer_source, current_url);
 
     assert_eq!(referer.unwrap().as_str(), "http://example.com/");
+}
+
+#[test]
+fn test_fetch_compressed_response_update_count() {
+    // contents of ../../tests/wpt/tests/fetch/content-encoding/br/resources/foo.text.br
+    const DATA_BROTLI_COMPRESSED: [u8; 15] = [
+        0xe1, 0x18, 0x48, 0xc1, 0x2f, 0x65, 0xf6, 0x16, 0x9f, 0x05, 0x01, 0xbb, 0x20, 0x00, 0x06,
+    ];
+    const DATA_DECOMPRESSED_LEN: usize = 10500;
+
+    let handler = move |_: HyperRequest<Body>, response: &mut HyperResponse<Body>| {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
+        *response.body_mut() = DATA_BROTLI_COMPRESSED.to_vec().into();
+    };
+    let (server, url) = make_server(handler);
+
+    let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
+        .method(Method::GET)
+        .body(None)
+        .destination(Destination::Document)
+        .origin(mock_origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .build();
+
+    struct FetchResponseCollector {
+        sender: Sender<usize>,
+        update_count: usize,
+    }
+    impl FetchTaskTarget for FetchResponseCollector {
+        fn process_request_body(&mut self, _: &Request) {}
+        fn process_request_eof(&mut self, _: &Request) {}
+        fn process_response(&mut self, _: &Request, _: &Response) {}
+        fn process_response_chunk(&mut self, _: &Request, _: Vec<u8>) {
+            self.update_count += 1;
+        }
+        /// Fired when the response is fully fetched
+        fn process_response_eof(&mut self, _: &Request, _: &Response) {
+            let _ = self.sender.send(self.update_count);
+        }
+    }
+
+    let (sender, receiver) = unbounded();
+    let mut target = FetchResponseCollector {
+        sender: sender,
+        update_count: 0,
+    };
+    let response_update_count = block_on(async move {
+        methods::fetch(
+            &mut request,
+            &mut target,
+            &mut new_fetch_context(None, None, None),
+        )
+        .await;
+        receiver.recv().unwrap()
+    });
+
+    server.close();
+
+    const EXPECTED_UPDATE_COUNT: usize =
+        (DATA_DECOMPRESSED_LEN + DECODER_BUFFER_SIZE - 1) / DECODER_BUFFER_SIZE;
+    assert_eq!(response_update_count, EXPECTED_UPDATE_COUNT);
 }

@@ -7,11 +7,11 @@ use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use base::id::{BlobId, BlobIndex, PipelineNamespaceId};
 use dom_struct::dom_struct;
 use encoding_rs::UTF_8;
 use js::jsapi::JSObject;
 use js::rust::HandleObject;
-use msg::constellation_msg::{BlobId, BlobIndex, PipelineNamespaceId};
 use net_traits::filemanager_thread::RelativePos;
 use script_traits::serializable::BlobImpl;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::readablestream::ReadableStream;
 use crate::realms::{AlreadyInRealm, InRealm};
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 // https://w3c.github.io/FileAPI/#blob
 #[dom_struct]
@@ -41,17 +41,22 @@ pub struct Blob {
 }
 
 impl Blob {
-    pub fn new(global: &GlobalScope, blob_impl: BlobImpl) -> DomRoot<Blob> {
-        Self::new_with_proto(global, None, blob_impl)
+    pub fn new(global: &GlobalScope, blob_impl: BlobImpl, can_gc: CanGc) -> DomRoot<Blob> {
+        Self::new_with_proto(global, None, blob_impl, can_gc)
     }
 
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         blob_impl: BlobImpl,
+        can_gc: CanGc,
     ) -> DomRoot<Blob> {
-        let dom_blob =
-            reflect_dom_object_with_proto(Box::new(Blob::new_inherited(&blob_impl)), global, proto);
+        let dom_blob = reflect_dom_object_with_proto(
+            Box::new(Blob::new_inherited(&blob_impl)),
+            global,
+            proto,
+            can_gc,
+        );
         global.track_blob(&dom_blob, blob_impl);
         dom_blob
     }
@@ -62,28 +67,6 @@ impl Blob {
             reflector_: Reflector::new(),
             blob_id: blob_impl.blob_id(),
         }
-    }
-
-    // https://w3c.github.io/FileAPI/#constructorBlob
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        blobParts: Option<Vec<ArrayBufferOrArrayBufferViewOrBlobOrString>>,
-        blobPropertyBag: &BlobBinding::BlobPropertyBag,
-    ) -> Fallible<DomRoot<Blob>> {
-        let bytes: Vec<u8> = match blobParts {
-            None => Vec::new(),
-            Some(blobparts) => match blob_parts_to_bytes(blobparts) {
-                Ok(bytes) => bytes,
-                Err(_) => return Err(Error::InvalidCharacter),
-            },
-        };
-
-        let type_string = normalize_type_string(blobPropertyBag.type_.as_ref());
-        let blob_impl = BlobImpl::new_from_bytes(bytes, type_string);
-
-        Ok(Blob::new_with_proto(global, proto, blob_impl))
     }
 
     /// Get a slice to inner data, this might incur synchronous read and caching
@@ -149,6 +132,7 @@ impl Serializable for Blob {
         owner: &GlobalScope,
         sc_holder: &mut StructuredDataHolder,
         storage_key: StorageKey,
+        can_gc: CanGc,
     ) -> Result<(), ()> {
         // 1. Re-build the key for the storage location
         // of the serialized object.
@@ -179,7 +163,7 @@ impl Serializable for Blob {
             *blob_impls = None;
         }
 
-        let deserialized_blob = Blob::new(owner, blob_impl);
+        let deserialized_blob = Blob::new(owner, blob_impl, can_gc);
 
         let blobs = blobs.get_or_insert_with(HashMap::new);
         blobs.insert(storage_key, deserialized_blob);
@@ -219,6 +203,29 @@ pub fn blob_parts_to_bytes(
 }
 
 impl BlobMethods for Blob {
+    // https://w3c.github.io/FileAPI/#constructorBlob
+    #[allow(non_snake_case)]
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        blobParts: Option<Vec<ArrayBufferOrArrayBufferViewOrBlobOrString>>,
+        blobPropertyBag: &BlobBinding::BlobPropertyBag,
+    ) -> Fallible<DomRoot<Blob>> {
+        let bytes: Vec<u8> = match blobParts {
+            None => Vec::new(),
+            Some(blobparts) => match blob_parts_to_bytes(blobparts) {
+                Ok(bytes) => bytes,
+                Err(_) => return Err(Error::InvalidCharacter),
+            },
+        };
+
+        let type_string = normalize_type_string(blobPropertyBag.type_.as_ref());
+        let blob_impl = BlobImpl::new_from_bytes(bytes, type_string);
+
+        Ok(Blob::new_with_proto(global, proto, blob_impl, can_gc))
+    }
+
     // https://w3c.github.io/FileAPI/#dfn-size
     fn Size(&self) -> u64 {
         self.global().get_blob_size(&self.blob_id)
@@ -240,19 +247,20 @@ impl BlobMethods for Blob {
         start: Option<i64>,
         end: Option<i64>,
         content_type: Option<DOMString>,
+        can_gc: CanGc,
     ) -> DomRoot<Blob> {
         let type_string =
             normalize_type_string(content_type.unwrap_or(DOMString::from("")).as_ref());
         let rel_pos = RelativePos::from_opts(start, end);
         let blob_impl = BlobImpl::new_sliced(rel_pos, self.blob_id, type_string);
-        Blob::new(&self.global(), blob_impl)
+        Blob::new(&self.global(), blob_impl, can_gc)
     }
 
     // https://w3c.github.io/FileAPI/#text-method-algo
-    fn Text(&self) -> Rc<Promise> {
+    fn Text(&self, can_gc: CanGc) -> Rc<Promise> {
         let global = self.global();
         let in_realm_proof = AlreadyInRealm::assert();
-        let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof));
+        let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc);
         let id = self.get_blob_url_id();
         global.read_file_async(
             id,
@@ -272,10 +280,10 @@ impl BlobMethods for Blob {
     }
 
     // https://w3c.github.io/FileAPI/#arraybuffer-method-algo
-    fn ArrayBuffer(&self) -> Rc<Promise> {
+    fn ArrayBuffer(&self, can_gc: CanGc) -> Rc<Promise> {
         let global = self.global();
         let in_realm_proof = AlreadyInRealm::assert();
-        let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof));
+        let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc);
 
         let id = self.get_blob_url_id();
 

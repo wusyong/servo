@@ -2,6 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// TODO: Is this actor still relevant?
+#![allow(dead_code)]
+
 use std::net::TcpStream;
 
 use serde::Serialize;
@@ -16,12 +19,14 @@ pub struct PerformanceActor {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PerformanceFeatures {
-    withMarkers: bool,
-    withMemory: bool,
-    withTicks: bool,
-    withAllocations: bool,
-    withJITOptimizations: bool,
+    with_markers: bool,
+    with_memory: bool,
+    with_ticks: bool,
+    with_allocations: bool,
+    #[serde(rename = "withJITOptimizations")]
+    with_jitoptimizations: bool,
 }
 
 #[derive(Serialize)]
@@ -69,11 +74,11 @@ impl Actor for PerformanceActor {
                     from: self.name(),
                     traits: PerformanceTraits {
                         features: PerformanceFeatures {
-                            withMarkers: true,
-                            withMemory: true,
-                            withTicks: true,
-                            withAllocations: true,
-                            withJITOptimizations: true,
+                            with_markers: true,
+                            with_memory: true,
+                            with_ticks: true,
+                            with_allocations: true,
+                            with_jitoptimizations: true,
                         },
                     },
                 };
@@ -104,7 +109,7 @@ impl PerformanceActor {
     pub fn description() -> ActorDescription {
         ActorDescription {
             category: "actor",
-            typeName: "performance",
+            type_name: "performance",
             methods: vec![Method {
                 name: "canCurrentlyRecord",
                 request: Value::Object(

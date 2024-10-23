@@ -5,27 +5,28 @@
 use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
+use std::sync::LazyLock;
 
 use embedder_traits::resources::{self, Resource};
 use gen::Prefs;
-use lazy_static::lazy_static;
-use log::warn;
+use log::{error, warn};
 use serde_json::{self, Value};
 
 use crate::pref_util::Preferences;
 pub use crate::pref_util::{PrefError, PrefValue};
 
-lazy_static! {
-    static ref PREFS: Preferences<'static, Prefs> = {
-        let def_prefs: Prefs = serde_json::from_str(&resources::read_string(Resource::Preferences))
-            .expect("Failed to initialize config preferences.");
-        let result = Preferences::new(def_prefs, &gen::PREF_ACCESSORS);
-        for (key, value) in result.iter() {
-            set_stylo_pref_ref(&key, &value);
-        }
-        result
-    };
-}
+static PREFS: LazyLock<Preferences<'static, Prefs>> = LazyLock::new(|| {
+    let def_prefs: Prefs = serde_json::from_str(&resources::read_string(Resource::Preferences))
+        .unwrap_or_else(|_| {
+            error!("Preference json file is invalid. Setting Preference to default values");
+            Prefs::default()
+        });
+    let result = Preferences::new(def_prefs, &gen::PREF_ACCESSORS);
+    for (key, value) in result.iter() {
+        set_stylo_pref_ref(&key, &value);
+    }
+    result
+});
 
 /// A convenience macro for accessing a preference value using its static path.
 /// Passing an invalid path is a compile-time error.
@@ -165,12 +166,12 @@ mod gen {
         std::cmp::max(num_cpus::get() * 3 / 4, 1) as i64
     }
 
-    fn black() -> i64 {
-        0x000000
+    fn default_font_size() -> i64 {
+        16
     }
 
-    fn white() -> i64 {
-        0xFFFFFF
+    fn default_monospace_font_size() -> i64 {
+        13
     }
 
     build_structs! {
@@ -180,13 +181,22 @@ mod gen {
         gen_accessors = PREF_ACCESSORS,
         // tree of structs to generate
         gen_types = Prefs {
-            browser: {
-                display: {
-                    #[serde(default = "white")]
-                    background_color: i64,
-                    #[serde(default = "black")]
-                    foreground_color: i64,
-                }
+            fonts: {
+                #[serde(default)]
+                default: String,
+                #[serde(default)]
+                serif: String,
+                #[serde(default)]
+                #[serde(rename = "fonts.sans-serif")]
+                sans_serif: String,
+                #[serde(default)]
+                monospace: String,
+                #[serde(default = "default_font_size")]
+                #[serde(rename = "fonts.default-size")]
+                default_size: i64,
+                #[serde(default = "default_monospace_font_size")]
+                #[serde(rename = "fonts.default-monospace-size")]
+                default_monospace_size: i64,
             },
             css: {
                 animations: {
@@ -206,6 +216,8 @@ mod gen {
                 webgpu: {
                     /// Enable WebGPU APIs.
                     enabled: bool,
+                    /// List of comma-separated backends to be used by wgpu
+                    wgpu_backend: String,
                 },
                 bluetooth: {
                     enabled: bool,
@@ -213,6 +225,7 @@ mod gen {
                         enabled: bool,
                     }
                 },
+                allow_scripts_to_close_windows: bool,
                 canvas_capture: {
                     enabled: bool,
                 },
@@ -222,6 +235,11 @@ mod gen {
                 composition_event: {
                     #[serde(rename = "dom.compositionevent.enabled")]
                     enabled: bool,
+                },
+                crypto: {
+                    subtle: {
+                        enabled: bool,
+                    }
                 },
                 custom_elements: {
                     #[serde(rename = "dom.customelements.enabled")]
@@ -265,6 +283,9 @@ mod gen {
                     testing: {
                         allowed_in_nonsecure_contexts: bool,
                     }
+                },
+                resize_observer: {
+                    enabled: bool,
                 },
                 script: {
                     asynch: bool,
@@ -368,6 +389,9 @@ mod gen {
                         enabled: bool,
                     },
                     layers: {
+                        enabled: bool,
+                    },
+                    openxr: {
                         enabled: bool,
                     },
                     sessionavailable: bool,
@@ -478,12 +502,6 @@ mod gen {
                 shared_memory: {
                     enabled: bool,
                 },
-                strict: {
-                    debug: {
-                        enabled: bool,
-                    },
-                    enabled: bool,
-                },
                 throw_on_asmjs_validation_failure: {
                     enabled: bool,
                 },
@@ -546,9 +564,20 @@ mod gen {
                     #[serde(rename = "network.http-cache.disabled")]
                     disabled: bool,
                 },
+                local_directory_listing: {
+                    enabled: bool,
+                },
                 mime: {
                     sniff: bool,
-                }
+                },
+                tls: {
+                    /// Ignore `std::io::Error` with `ErrorKind::UnexpectedEof` received when a TLS connection
+                    /// is closed without a close_notify.
+                    ///
+                    /// Used for tests because WPT server doesn't properly close the TLS connection.
+                    // TODO: remove this when WPT server is updated to use a proper TLS implementation.
+                    ignore_unexpected_eof: bool,
+                },
             },
             session_history: {
                 #[serde(rename = "session-history.max-length")]
@@ -565,9 +594,6 @@ mod gen {
                 },
                 /// URL string of the homepage.
                 homepage: String,
-                keep_screen_on: {
-                    enabled: bool,
-                },
                 #[serde(rename = "shell.native-orientation")]
                 native_orientation: String,
                 native_titlebar: {

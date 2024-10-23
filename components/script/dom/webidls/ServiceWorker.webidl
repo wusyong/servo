@@ -8,13 +8,12 @@ interface ServiceWorker : EventTarget {
   readonly attribute USVString scriptURL;
   readonly attribute ServiceWorkerState state;
   [Throws] undefined postMessage(any message, sequence<object> transfer);
-  [Throws] undefined postMessage(any message, optional PostMessageOptions options = {});
+  [Throws] undefined postMessage(any message, optional StructuredSerializeOptions options = {});
 
   // event
   attribute EventHandler onstatechange;
 };
 
-// FIXME: use `includes` instead of `implements` after #22539 is fixed.
 ServiceWorker includes AbstractWorker;
 
 enum ServiceWorkerState {

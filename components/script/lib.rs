@@ -9,7 +9,7 @@
 // crate. Issue a warning if `crown` is not being used to compile, but not when
 // building rustdoc or running clippy.
 #![register_tool(crown)]
-#![cfg_attr(any(doc, clippy, feature = "cargo-clippy"), allow(unknown_lints))]
+#![cfg_attr(any(doc, clippy), allow(unknown_lints))]
 #![deny(crown_is_not_used)]
 
 // These are used a lot so let's keep them for now
@@ -68,6 +68,8 @@ pub mod script_runtime;
 #[allow(unsafe_code)]
 pub mod script_thread;
 #[warn(deprecated)]
+pub mod security_manager;
+#[warn(deprecated)]
 pub mod serviceworker_manager;
 #[warn(deprecated)]
 mod stylesheet_loader;
@@ -92,5 +94,14 @@ mod webdriver_handlers;
 #[warn(deprecated)]
 mod window_named_properties;
 
+mod links;
+
 pub use init::init;
 pub use script_runtime::JSEngineSetup;
+
+// These trait exports are public, because they are used in the DOM bindings.
+// Since they are used in derive macros,
+// it is useful that they are accessible at the root of the crate.
+pub use crate::dom::bindings::inheritance::HasParent;
+pub use crate::dom::bindings::reflector::{DomObject, MutDomObject, Reflector};
+pub use crate::dom::bindings::trace::{CustomTraceable, JSTraceable};

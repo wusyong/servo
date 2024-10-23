@@ -132,6 +132,7 @@ def browser_kwargs(logger, test_type, run_info_data, config, subsuite, **kwargs)
                       "headless": kwargs["headless"],
                       "preload_browser": kwargs["preload_browser"] and not kwargs["pause_after_test"] and not kwargs["num_test_groups"] == 1,
                       "specialpowers_path": kwargs["specialpowers_path"],
+                      "allow_list_paths": kwargs["allow_list_paths"],
                       "debug_test": kwargs["debug_test"]}
     if test_type == "wdspec" and kwargs["binary"]:
         browser_kwargs["webdriver_args"].extend(["--binary", kwargs["binary"]])
@@ -193,17 +194,23 @@ def env_options():
             "supports_debugger": True}
 
 
-def run_info_extras(logger, **kwargs):
+def get_bool_pref(default_prefs, extra_prefs, pref):
+    pref_value = False
 
-    def get_bool_pref_if_exists(pref):
-        for key, value in kwargs.get('extra_prefs', []):
-            if pref == key:
-                return value.lower() in ('true', '1')
-        return None
+    for key, value in extra_prefs + default_prefs:
+        if pref == key:
+            pref_value = value.lower() in ('true', '1')
+            break
 
-    def get_bool_pref(pref):
-        pref_value = get_bool_pref_if_exists(pref)
-        return pref_value if pref_value is not None else False
+    return pref_value
+
+
+def run_info_extras(logger, default_prefs=None, **kwargs):
+    extra_prefs = kwargs.get("extra_prefs", [])
+    default_prefs = list(default_prefs.items()) if default_prefs is not None else []
+
+    def bool_pref(pref):
+        return get_bool_pref(default_prefs, extra_prefs, pref)
 
     # Default fission to on, unless we get --disable-fission
     rv = {"e10s": kwargs["gecko_e10s"],
@@ -212,8 +219,8 @@ def run_info_extras(logger, **kwargs):
           "headless": kwargs.get("headless", False) or "MOZ_HEADLESS" in os.environ,
           "fission": not kwargs.get("disable_fission"),
           "sessionHistoryInParent": (not kwargs.get("disable_fission") or
-                                     not get_bool_pref("fission.disableSessionHistoryInParent")),
-          "swgl": get_bool_pref("gfx.webrender.software"),
+                                     not bool_pref("fission.disableSessionHistoryInParent")),
+          "swgl": bool_pref("gfx.webrender.software"),
           "privateBrowsing": (kwargs["tags"] is not None and ("privatebrowsing" in kwargs["tags"]))}
 
     rv.update(run_info_browser_version(**kwargs))
@@ -644,7 +651,8 @@ class GeckodriverOutputHandler(FirefoxOutputHandler):
 class ProfileCreator:
     def __init__(self, logger, prefs_root, config, test_type, extra_prefs,
                  disable_fission, debug_test, browser_channel, binary,
-                 package_name, certutil_binary, ca_certificate_path):
+                 package_name, certutil_binary, ca_certificate_path,
+                 allow_list_paths):
         self.logger = logger
         self.prefs_root = prefs_root
         self.config = config
@@ -658,6 +666,7 @@ class ProfileCreator:
         self.package_name = package_name
         self.certutil_binary = certutil_binary
         self.ca_certificate_path = ca_certificate_path
+        self.allow_list_paths = allow_list_paths
 
     def create(self, **kwargs):
         """Create a Firefox profile and return the mozprofile Profile object pointing at that
@@ -669,6 +678,7 @@ class ProfileCreator:
 
         profile = FirefoxProfile(preferences=preferences,
                                  restore=False,
+                                 allowlistpaths=self.allow_list_paths,
                                  **kwargs)
         self._set_required_prefs(profile)
         if self.ca_certificate_path is not None:
@@ -750,7 +760,7 @@ class ProfileCreator:
         certutil_dir = os.path.dirname(self.binary or self.certutil_binary)
         if mozinfo.isMac:
             env_var = "DYLD_LIBRARY_PATH"
-        elif mozinfo.isUnix:
+        elif mozinfo.isLinux:
             env_var = "LD_LIBRARY_PATH"
         else:
             env_var = "PATH"
@@ -795,7 +805,7 @@ class FirefoxBrowser(Browser):
                  stackfix_dir=None, binary_args=None, timeout_multiplier=None, leak_check=False,
                  asan=False, chaos_mode_flags=None, config=None,
                  browser_channel="nightly", headless=None, preload_browser=False,
-                 specialpowers_path=None, debug_test=False, **kwargs):
+                 specialpowers_path=None, debug_test=False, allow_list_paths=None, **kwargs):
         Browser.__init__(self, logger)
 
         self.logger = logger
@@ -826,7 +836,8 @@ class FirefoxBrowser(Browser):
                                          binary,
                                          package_name,
                                          certutil_binary,
-                                         ca_certificate_path)
+                                         ca_certificate_path,
+                                         allow_list_paths)
 
         if preload_browser:
             instance_manager_cls = PreloadInstanceManager
@@ -899,7 +910,7 @@ class FirefoxWdSpecBrowser(WebDriverBrowser):
                  disable_fission=False, stackfix_dir=None, leak_check=False,
                  asan=False, chaos_mode_flags=None, config=None, browser_channel="nightly",
                  headless=None, debug_test=False, profile_creator_cls=ProfileCreator,
-                 **kwargs):
+                 allow_list_paths=None, **kwargs):
 
         super().__init__(logger, binary, webdriver_binary, webdriver_args)
         self.binary = binary
@@ -927,7 +938,8 @@ class FirefoxWdSpecBrowser(WebDriverBrowser):
                                               binary,
                                               package_name,
                                               certutil_binary,
-                                              ca_certificate_path)
+                                              ca_certificate_path,
+                                              allow_list_paths)
 
         self.profile = profile_creator.create()
         self.marionette_port = None

@@ -16,6 +16,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 use crate::setlike;
 
 // setlike<DOMString>
@@ -27,7 +28,11 @@ pub struct TestBindingSetlike {
 }
 
 impl TestBindingSetlike {
-    fn new(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<TestBindingSetlike> {
+    fn new(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<TestBindingSetlike> {
         reflect_dom_object_with_proto(
             Box::new(TestBindingSetlike {
                 reflector: Reflector::new(),
@@ -35,19 +40,20 @@ impl TestBindingSetlike {
             }),
             global,
             proto,
+            can_gc,
         )
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<TestBindingSetlike>> {
-        Ok(TestBindingSetlike::new(global, proto))
     }
 }
 
 impl TestBindingSetlikeMethods for TestBindingSetlike {
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<TestBindingSetlike>> {
+        Ok(TestBindingSetlike::new(global, proto, can_gc))
+    }
+
     fn Size(&self) -> u32 {
         self.internal.size()
     }

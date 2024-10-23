@@ -7,7 +7,7 @@ use std::default::Default;
 use dom_struct::dom_struct;
 use html5ever::{local_name, LocalName, Prefix};
 use js::rust::HandleObject;
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::HTMLFieldSetElementBinding::HTMLFieldSetElementMethods;
@@ -25,6 +25,7 @@ use crate::dom::node::{window_from_node, Node, ShadowIncluding};
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidityState;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
 #[dom_struct]
@@ -90,7 +91,7 @@ impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
         impl CollectionFilter for ElementsFilter {
             fn filter<'a>(&self, elem: &'a Element, _root: &'a Node) -> bool {
                 elem.downcast::<HTMLElement>()
-                    .map_or(false, HTMLElement::is_listed_element)
+                    .is_some_and(HTMLElement::is_listed_element)
             }
         }
         let filter = Box::new(ElementsFilter);
@@ -126,13 +127,13 @@ impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -143,6 +144,11 @@ impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
     // https://html.spec.whatwg.org/multipage/#dom-cva-setcustomvalidity
     fn SetCustomValidity(&self, error: DOMString) {
         self.validity_state().set_custom_error_message(error);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-fieldset-type>
+    fn Type(&self) -> DOMString {
+        DOMString::from_string(String::from("fieldset"))
     }
 }
 
@@ -205,7 +211,7 @@ impl VirtualMethods for HTMLFieldSetElement {
                             element.set_enabled_state(false);
                             if element
                                 .downcast::<HTMLElement>()
-                                .map_or(false, |h| h.is_form_associated_custom_element())
+                                .is_some_and(|h| h.is_form_associated_custom_element())
                             {
                                 ScriptThread::enqueue_callback_reaction(
                                     element,
@@ -214,7 +220,7 @@ impl VirtualMethods for HTMLFieldSetElement {
                                 );
                             }
                         }
-                        element.update_sequentially_focusable_status();
+                        element.update_sequentially_focusable_status(CanGc::note());
                     }
                 } else {
                     for field in fields {
@@ -226,7 +232,7 @@ impl VirtualMethods for HTMLFieldSetElement {
                             if element.enabled_state() &&
                                 element
                                     .downcast::<HTMLElement>()
-                                    .map_or(false, |h| h.is_form_associated_custom_element())
+                                    .is_some_and(|h| h.is_form_associated_custom_element())
                             {
                                 ScriptThread::enqueue_callback_reaction(
                                     element,
@@ -235,10 +241,10 @@ impl VirtualMethods for HTMLFieldSetElement {
                                 );
                             }
                         }
-                        element.update_sequentially_focusable_status();
+                        element.update_sequentially_focusable_status(CanGc::note());
                     }
                 }
-                element.update_sequentially_focusable_status();
+                element.update_sequentially_focusable_status(CanGc::note());
             },
             local_name!("form") => {
                 self.form_attribute_mutated(mutation);

@@ -21,6 +21,7 @@ use crate::dom::blob::Blob;
 use crate::dom::file::File;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlformelement::{FormDatum, FormDatumValue, HTMLFormElement};
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct FormData {
@@ -44,41 +45,52 @@ impl FormData {
         }
     }
 
-    pub fn new(form_datums: Option<Vec<FormDatum>>, global: &GlobalScope) -> DomRoot<FormData> {
-        Self::new_with_proto(form_datums, global, None)
+    pub fn new(
+        form_datums: Option<Vec<FormDatum>>,
+        global: &GlobalScope,
+        can_gc: CanGc,
+    ) -> DomRoot<FormData> {
+        Self::new_with_proto(form_datums, global, None, can_gc)
     }
 
     fn new_with_proto(
         form_datums: Option<Vec<FormDatum>>,
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<FormData> {
         reflect_dom_object_with_proto(
             Box::new(FormData::new_inherited(form_datums)),
             global,
             proto,
+            can_gc,
         )
-    }
-
-    // https://xhr.spec.whatwg.org/#dom-formdata
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        form: Option<&HTMLFormElement>,
-    ) -> Fallible<DomRoot<FormData>> {
-        if let Some(opt_form) = form {
-            return match opt_form.get_form_dataset(None, None) {
-                Some(form_datums) => Ok(FormData::new_with_proto(Some(form_datums), global, proto)),
-                None => Err(Error::InvalidState),
-            };
-        }
-
-        Ok(FormData::new_with_proto(None, global, proto))
     }
 }
 
 impl FormDataMethods for FormData {
+    // https://xhr.spec.whatwg.org/#dom-formdata
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        form: Option<&HTMLFormElement>,
+    ) -> Fallible<DomRoot<FormData>> {
+        if let Some(opt_form) = form {
+            return match opt_form.get_form_dataset(None, None, can_gc) {
+                Some(form_datums) => Ok(FormData::new_with_proto(
+                    Some(form_datums),
+                    global,
+                    proto,
+                    can_gc,
+                )),
+                None => Err(Error::InvalidState),
+            };
+        }
+
+        Ok(FormData::new_with_proto(None, global, proto, can_gc))
+    }
+
     // https://xhr.spec.whatwg.org/#dom-formdata-append
     fn Append(&self, name: USVString, str_value: USVString) {
         let datum = FormDatum {
@@ -98,7 +110,11 @@ impl FormDataMethods for FormData {
         let datum = FormDatum {
             ty: DOMString::from("file"),
             name: DOMString::from(name.0.clone()),
-            value: FormDatumValue::File(DomRoot::from_ref(&*self.create_an_entry(blob, filename))),
+            value: FormDatumValue::File(DomRoot::from_ref(&*self.create_an_entry(
+                blob,
+                filename,
+                CanGc::note(),
+            ))),
         };
 
         self.data
@@ -175,6 +191,8 @@ impl FormDataMethods for FormData {
     #[allow(crown::unrooted_must_root)]
     // https://xhr.spec.whatwg.org/#dom-formdata-set
     fn Set_(&self, name: USVString, blob: &Blob, filename: Option<USVString>) {
+        let file = self.create_an_entry(blob, filename, CanGc::note());
+
         let mut data = self.data.borrow_mut();
         let local_name = LocalName::from(name.0.clone());
 
@@ -185,9 +203,7 @@ impl FormDataMethods for FormData {
             FormDatum {
                 ty: DOMString::from("file"),
                 name: DOMString::from(name.0),
-                value: FormDatumValue::File(DomRoot::from_ref(
-                    &*self.create_an_entry(blob, filename),
-                )),
+                value: FormDatumValue::File(file),
             },
         ));
     }
@@ -195,7 +211,12 @@ impl FormDataMethods for FormData {
 
 impl FormData {
     // https://xhr.spec.whatwg.org/#create-an-entry
-    fn create_an_entry(&self, blob: &Blob, opt_filename: Option<USVString>) -> DomRoot<File> {
+    fn create_an_entry(
+        &self,
+        blob: &Blob,
+        opt_filename: Option<USVString>,
+        can_gc: CanGc,
+    ) -> DomRoot<File> {
         // Steps 3-4
         let name = match opt_filename {
             Some(filename) => DOMString::from(filename.0),
@@ -217,6 +238,7 @@ impl FormData {
             BlobImpl::new_from_bytes(bytes, blob.type_string()),
             name,
             None,
+            can_gc,
         )
     }
 

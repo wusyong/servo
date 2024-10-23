@@ -21,6 +21,7 @@ use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::node::{window_from_node, Node};
 use crate::dom::nodelist::NodeList;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#documentfragment
 #[dom_struct]
@@ -54,22 +55,23 @@ impl DocumentFragment {
         )
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<DocumentFragment>> {
-        let document = window.Document();
-
-        Ok(DocumentFragment::new_with_proto(&document, proto))
-    }
-
     pub fn id_map(&self) -> &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
         &self.id_map
     }
 }
 
 impl DocumentFragmentMethods for DocumentFragment {
+    // https://dom.spec.whatwg.org/#dom-documentfragment-documentfragment
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        _can_gc: CanGc,
+    ) -> Fallible<DomRoot<DocumentFragment>> {
+        let document = window.Document();
+
+        Ok(DocumentFragment::new_with_proto(&document, proto))
+    }
+
     // https://dom.spec.whatwg.org/#dom-parentnode-children
     fn Children(&self) -> DomRoot<HTMLCollection> {
         let window = window_from_node(self);

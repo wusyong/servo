@@ -11,9 +11,13 @@ use std::default::Default;
 use std::mem;
 use std::rc::Rc;
 use std::slice::from_ref;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use base::cross_process_instant::CrossProcessInstant;
+use base::id::BrowsingContextId;
 use canvas_traits::webgl::{self, WebGLContextId, WebGLMsg};
+use chrono::Local;
 use content_security_policy::{self as csp, CspList};
 use cookie::Cookie;
 use cssparser::match_ignore_ascii_case;
@@ -24,30 +28,28 @@ use encoding_rs::{Encoding, UTF_8};
 use euclid::default::{Point2D, Rect, Size2D};
 use html5ever::{local_name, namespace_url, ns, LocalName, Namespace, QualName};
 use hyper_serde::Serde;
-use ipc_channel::ipc::{self, IpcSender};
-use js::rust::HandleObject;
+use ipc_channel::ipc;
+use js::rust::{HandleObject, HandleValue};
 use keyboard_types::{Code, Key, KeyState};
-use lazy_static::lazy_static;
 use metrics::{
     InteractiveFlag, InteractiveMetrics, InteractiveWindow, ProfilerMetadataFactory,
     ProgressiveWebMetric,
 };
 use mime::{self, Mime};
-use msg::constellation_msg::BrowsingContextId;
 use net_traits::pub_domains::is_pub_domain;
 use net_traits::request::RequestBuilder;
 use net_traits::response::HttpsState;
 use net_traits::CookieSource::NonHTTP;
 use net_traits::CoreResourceMsg::{GetCookiesForUrl, SetCookiesForUrl};
-use net_traits::{FetchResponseMsg, IpcSend, ReferrerPolicy};
+use net_traits::{FetchResponseListener, IpcSend, ReferrerPolicy};
 use num_traits::ToPrimitive;
 use percent_encoding::percent_decode;
 use profile_traits::ipc as profile_ipc;
 use profile_traits::time::{TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType};
 use script_layout_interface::{PendingRestyle, ReflowGoal, TrustedNodeAddress};
 use script_traits::{
-    AnimationState, DocumentActivity, MouseButton, MouseEventType, MsDuration, ScriptMsg,
-    TouchEventType, TouchId, UntrustedNodeAddress, WheelDelta,
+    AnimationState, AnimationTickType, CompositorEvent, DocumentActivity, MouseButton,
+    MouseEventType, ScriptMsg, TouchEventType, TouchId, UntrustedNodeAddress, WheelDelta,
 };
 use servo_arc::Arc;
 use servo_atoms::Atom;
@@ -57,7 +59,6 @@ use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use style::attr::AttrValue;
 use style::context::QuirksMode;
 use style::invalidation::element::restyle_hints::RestyleHint;
-use style::media_queries::Device;
 use style::selector_parser::Snapshot;
 use style::shared_lock::SharedRwLock as StyleSharedRwLock;
 use style::str::{split_html_space_chars, str_join};
@@ -65,9 +66,9 @@ use style::stylesheet_set::DocumentStylesheetSet;
 use style::stylesheets::{Origin, OriginSet, Stylesheet};
 use url::Host;
 use uuid::Uuid;
+use webgpu::swapchain::WebGPUContextId;
 use webrender_api::units::DeviceIntRect;
 
-use super::bindings::trace::{HashMapTracedValues, NoTrace};
 use crate::animation_timeline::AnimationTimeline;
 use crate::animations::Animations;
 use crate::document_loader::{DocumentLoader, LoadType};
@@ -77,7 +78,7 @@ use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::{ref_filter_map, DomRefCell, Ref, RefMut};
 use crate::dom::bindings::codegen::Bindings::BeforeUnloadEventBinding::BeforeUnloadEvent_Binding::BeforeUnloadEventMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
-    DocumentMethods, DocumentReadyState, NamedPropertyValue,
+    DocumentMethods, DocumentReadyState, DocumentVisibilityState, NamedPropertyValue,
 };
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElement_Binding::HTMLIFrameElementMethods;
@@ -93,14 +94,15 @@ use crate::dom::bindings::codegen::Bindings::WindowBinding::{
     FrameRequestCallback, ScrollBehavior, WindowMethods,
 };
 use crate::dom::bindings::codegen::UnionTypes::{NodeOrString, StringOrElementCreationOptions};
-use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+use crate::dom::bindings::error::{Error, ErrorInfo, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
 use crate::dom::bindings::root::{Dom, DomRoot, DomSlice, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::bindings::xmlname::XMLName::InvalidXMLName;
+use crate::dom::bindings::trace::{HashMapTracedValues, NoTrace};
+use crate::dom::bindings::xmlname::XMLName::Invalid;
 use crate::dom::bindings::xmlname::{
     namespace_from_domstring, validate_and_extract, xml_name_type,
 };
@@ -121,8 +123,9 @@ use crate::dom::element::{
 use crate::dom::event::{Event, EventBubbles, EventCancelable, EventDefault, EventStatus};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::focusevent::FocusEvent;
+use crate::dom::fontfaceset::FontFaceSet;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::gpucanvascontext::{GPUCanvasContext, WebGPUContextId};
+use crate::dom::gpucanvascontext::GPUCanvasContext;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::htmlareaelement::HTMLAreaElement;
@@ -152,9 +155,11 @@ use crate::dom::node::{
 use crate::dom::nodeiterator::NodeIterator;
 use crate::dom::nodelist::NodeList;
 use crate::dom::pagetransitionevent::PageTransitionEvent;
+use crate::dom::performanceentry::PerformanceEntry;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::promise::Promise;
 use crate::dom::range::Range;
+use crate::dom::resizeobserver::{ResizeObservationDepth, ResizeObserver};
 use crate::dom::selection::Selection;
 use crate::dom::servoparser::ServoParser;
 use crate::dom::shadowroot::ShadowRoot;
@@ -165,6 +170,7 @@ use crate::dom::touch::Touch;
 use crate::dom::touchevent::TouchEvent;
 use crate::dom::touchlist::TouchList;
 use crate::dom::treewalker::TreeWalker;
+use crate::dom::types::VisibilityStateEntry;
 use crate::dom::uievent::UIEvent;
 use crate::dom::virtualmethods::vtable_for;
 use crate::dom::webglrenderingcontext::WebGLRenderingContext;
@@ -172,8 +178,9 @@ use crate::dom::wheelevent::WheelEvent;
 use crate::dom::window::{ReflowReason, Window};
 use crate::dom::windowproxy::WindowProxy;
 use crate::fetch::FetchCanceller;
+use crate::network_listener::{NetworkListener, PreInvoke};
 use crate::realms::{AlreadyInRealm, InRealm};
-use crate::script_runtime::{CommonScriptMsg, ScriptThreadEventCategory};
+use crate::script_runtime::{CanGc, CommonScriptMsg, ScriptThreadEventCategory};
 use crate::script_thread::{MainThreadScriptMsg, ScriptThread};
 use crate::stylesheet_set::StylesheetSetRef;
 use crate::task::TaskBox;
@@ -323,7 +330,7 @@ pub struct Document {
     /// The current active HTML parser, to allow resuming after interruptions.
     current_parser: MutNullableDom<ServoParser>,
     /// When we should kick off a reflow. This happens during parsing.
-    reflow_timeout: Cell<Option<u64>>,
+    reflow_timeout: Cell<Option<Instant>>,
     /// The cached first `base` element with an `href` attribute.
     base_element: MutNullableDom<HTMLBaseElement>,
     /// This field is set to the document itself for inert documents.
@@ -339,16 +346,24 @@ pub struct Document {
     active_touch_points: DomRefCell<Vec<Dom<Touch>>>,
     /// Navigation Timing properties:
     /// <https://w3c.github.io/navigation-timing/#sec-PerformanceNavigationTiming>
-    dom_loading: Cell<u64>,
-    dom_interactive: Cell<u64>,
-    dom_content_loaded_event_start: Cell<u64>,
-    dom_content_loaded_event_end: Cell<u64>,
-    dom_complete: Cell<u64>,
-    top_level_dom_complete: Cell<u64>,
-    load_event_start: Cell<u64>,
-    load_event_end: Cell<u64>,
-    unload_event_start: Cell<u64>,
-    unload_event_end: Cell<u64>,
+    #[no_trace]
+    dom_interactive: Cell<Option<CrossProcessInstant>>,
+    #[no_trace]
+    dom_content_loaded_event_start: Cell<Option<CrossProcessInstant>>,
+    #[no_trace]
+    dom_content_loaded_event_end: Cell<Option<CrossProcessInstant>>,
+    #[no_trace]
+    dom_complete: Cell<Option<CrossProcessInstant>>,
+    #[no_trace]
+    top_level_dom_complete: Cell<Option<CrossProcessInstant>>,
+    #[no_trace]
+    load_event_start: Cell<Option<CrossProcessInstant>>,
+    #[no_trace]
+    load_event_end: Cell<Option<CrossProcessInstant>>,
+    #[no_trace]
+    unload_event_start: Cell<Option<CrossProcessInstant>>,
+    #[no_trace]
+    unload_event_end: Cell<Option<CrossProcessInstant>>,
     /// <https://html.spec.whatwg.org/multipage/#concept-document-https-state>
     #[no_trace]
     https_state: Cell<HttpsState>,
@@ -430,7 +445,7 @@ pub struct Document {
     dirty_webgl_contexts:
         DomRefCell<HashMapTracedValues<WebGLContextId, Dom<WebGLRenderingContext>>>,
     /// List of all WebGPU context IDs that need flushing.
-    dirty_webgpu_contexts: DomRefCell<HashMap<WebGPUContextId, Dom<GPUCanvasContext>>>,
+    dirty_webgpu_contexts: DomRefCell<HashMapTracedValues<WebGPUContextId, Dom<GPUCanvasContext>>>,
     /// <https://html.spec.whatwg.org/multipage/#concept-document-csp-list>
     #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
     #[no_trace]
@@ -446,6 +461,32 @@ pub struct Document {
     dirty_root: MutNullableDom<Element>,
     /// <https://html.spec.whatwg.org/multipage/#will-declaratively-refresh>
     declarative_refresh: DomRefCell<Option<DeclarativeRefresh>>,
+    /// Pending composition events, to be handled at the next rendering opportunity.
+    #[no_trace]
+    #[ignore_malloc_size_of = "CompositorEvent contains data from outside crates"]
+    pending_compositor_events: DomRefCell<Vec<CompositorEvent>>,
+    /// The index of the last mouse move event in the pending compositor events queue.
+    mouse_move_event_index: DomRefCell<Option<usize>>,
+    /// Pending animation ticks, to be handled at the next rendering opportunity.
+    #[no_trace]
+    #[ignore_malloc_size_of = "AnimationTickType contains data from an outside crate"]
+    pending_animation_ticks: DomRefCell<AnimationTickType>,
+    /// <https://drafts.csswg.org/resize-observer/#dom-document-resizeobservers-slot>
+    ///
+    /// Note: we are storing, but never removing, resize observers.
+    /// The lifetime of resize observers is specified at
+    /// <https://drafts.csswg.org/resize-observer/#lifetime>.
+    /// But implementing it comes with known problems:
+    /// - <https://bugzilla.mozilla.org/show_bug.cgi?id=1596992>
+    /// - <https://github.com/w3c/csswg-drafts/issues/4518>
+    resize_observers: DomRefCell<Vec<Dom<ResizeObserver>>>,
+    /// The set of all fonts loaded by this document.
+    /// <https://drafts.csswg.org/css-font-loading/#font-face-source>
+    fonts: MutNullableDom<FontFaceSet>,
+    /// <https://html.spec.whatwg.org/multipage/#visibility-state>
+    visibility_state: Cell<DocumentVisibilityState>,
+    /// <https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml>
+    status_code: Option<u16>,
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -653,7 +694,7 @@ impl Document {
         self.activity.get() != DocumentActivity::Inactive
     }
 
-    pub fn set_activity(&self, activity: DocumentActivity) {
+    pub fn set_activity(&self, activity: DocumentActivity, can_gc: CanGc) {
         // This function should only be called on documents with a browsing context
         assert!(self.has_browsing_context);
         if activity == self.activity.get() {
@@ -675,8 +716,11 @@ impl Document {
 
         self.title_changed();
         self.dirty_all_nodes();
-        self.window()
-            .reflow(ReflowGoal::Full, ReflowReason::CachedPageNeededReflow);
+        self.window().reflow(
+            ReflowGoal::Full,
+            ReflowReason::CachedPageNeededReflow,
+            can_gc,
+        );
         self.window().resume();
         media.resume(&client_context_id);
 
@@ -684,8 +728,9 @@ impl Document {
             return;
         }
 
-        // html.spec.whatwg.org/multipage/#history-traversal
-        // Step 4.6
+        // This step used to be Step 4.6 in html.spec.whatwg.org/multipage/#history-traversal
+        // But it's now Step 4 in https://html.spec.whatwg.org/multipage/#reactivate-a-document
+        // TODO: See #32687 for more information.
         let document = Trusted::new(self);
         self.window
             .task_manager()
@@ -698,22 +743,23 @@ impl Document {
                     if document.page_showing.get() {
                         return;
                     }
-                    // Step 4.6.2
+                    // Step 4.6.2 Set document's page showing flag to true.
                     document.page_showing.set(true);
-                    // Step 4.6.4
+                    // Step 4.6.3 Update the visibility state of document to "visible".
+                    document.update_visibility_state(DocumentVisibilityState::Visible, CanGc::note());
+                    // Step 4.6.4 Fire a page transition event named pageshow at document's relevant
+                    // global object with true.
                     let event = PageTransitionEvent::new(
                         window,
                         atom!("pageshow"),
                         false, // bubbles
                         false, // cancelable
                         true, // persisted
+                        CanGc::note(),
                     );
                     let event = event.upcast::<Event>();
                     event.set_trusted(true);
-                    // FIXME(nox): Why are errors silenced here?
-                    let _ = window.dispatch_event_with_target_override(
-                        event,
-                    );
+                    window.dispatch_event_with_target_override(event, CanGc::note());
                 }),
                 self.window.upcast(),
             )
@@ -724,7 +770,7 @@ impl Document {
         &self.origin
     }
 
-    // https://dom.spec.whatwg.org/#concept-document-url
+    /// <https://dom.spec.whatwg.org/#concept-document-url>
     pub fn url(&self) -> ServoUrl {
         self.url.borrow().clone()
     }
@@ -733,7 +779,7 @@ impl Document {
         *self.url.borrow_mut() = url;
     }
 
-    // https://html.spec.whatwg.org/multipage/#fallback-base-url
+    /// <https://html.spec.whatwg.org/multipage/#fallback-base-url>
     pub fn fallback_base_url(&self) -> ServoUrl {
         let document_url = self.url();
         if let Some(browsing_context) = self.browsing_context() {
@@ -743,8 +789,10 @@ impl Document {
                 .parent()
                 .and_then(|parent| parent.document())
                 .map(|document| document.base_url());
-            if document_url.as_str() == "about:srcdoc" && container_base_url.is_some() {
-                return container_base_url.unwrap();
+            if document_url.as_str() == "about:srcdoc" {
+                if let Some(base_url) = container_base_url {
+                    return base_url;
+                }
             }
             // Step 2: If document's URL is about:blank, and document's browsing
             // context's creator base URL is non-null, then return that creator base URL.
@@ -756,7 +804,7 @@ impl Document {
         document_url
     }
 
-    // https://html.spec.whatwg.org/multipage/#document-base-url
+    /// <https://html.spec.whatwg.org/multipage/#document-base-url>
     pub fn base_url(&self) -> ServoUrl {
         match self.base_element() {
             // Step 1.
@@ -838,9 +886,7 @@ impl Document {
         let old_mode = self.quirks_mode.replace(new_mode);
 
         if old_mode != new_mode {
-            let _ = self
-                .window
-                .with_layout(move |layout| layout.set_quirks_mode(new_mode));
+            self.window.layout_mut().set_quirks_mode(new_mode);
         }
     }
 
@@ -863,28 +909,33 @@ impl Document {
     }
 
     /// Reflows and disarms the timer if the reflow timer has expired.
-    pub fn reflow_if_reflow_timer_expired(&self) {
-        if let Some(reflow_timeout) = self.reflow_timeout.get() {
-            if time::precise_time_ns() < reflow_timeout {
-                return;
-            }
+    pub fn reflow_if_reflow_timer_expired(&self, can_gc: CanGc) {
+        let Some(reflow_timeout) = self.reflow_timeout.get() else {
+            return;
+        };
 
-            self.reflow_timeout.set(None);
-            self.window
-                .reflow(ReflowGoal::Full, ReflowReason::RefreshTick);
+        if Instant::now() < reflow_timeout {
+            return;
         }
+
+        self.reflow_timeout.set(None);
+        self.window
+            .reflow(ReflowGoal::Full, ReflowReason::RefreshTick, can_gc);
     }
 
-    /// Schedules a reflow to be kicked off at the given `timeout` (in `time::precise_time_ns()`
-    /// units). This reflow happens even if the event loop is busy. This is used to display initial
-    /// page content during parsing.
-    pub fn set_reflow_timeout(&self, timeout: u64) {
-        if let Some(existing_timeout) = self.reflow_timeout.get() {
-            if existing_timeout < timeout {
-                return;
-            }
+    /// Schedules a reflow to be kicked off at the given [`Duration`] in the future. This reflow
+    /// happens even if the event loop is busy. This is used to display initial page content during
+    /// parsing.
+    pub fn set_reflow_timeout(&self, duration: Duration) {
+        let new_reflow_time = Instant::now() + duration;
+
+        // Do not schedule a timeout that is longer than the one that is currently queued.
+        if matches!(self.reflow_timeout.get(), Some(existing_timeout) if existing_timeout < new_reflow_time)
+        {
+            return;
         }
-        self.reflow_timeout.set(Some(timeout))
+
+        self.reflow_timeout.set(Some(new_reflow_time))
     }
 
     /// Remove any existing association between the provided id and any elements in this document.
@@ -971,11 +1022,11 @@ impl Document {
     /// Scroll to the target element, and when we do not find a target
     /// and the fragment is empty or "top", scroll to the top.
     /// <https://html.spec.whatwg.org/multipage/#scroll-to-the-fragment-identifier>
-    pub fn check_and_scroll_fragment(&self, fragment: &str) {
+    pub fn check_and_scroll_fragment(&self, fragment: &str, can_gc: CanGc) {
         let target = self.find_fragment_node(fragment);
 
         // Step 1
-        self.set_target_element(target.as_deref());
+        self.set_target_element(target.as_deref(), can_gc);
 
         let point = target
             .as_ref()
@@ -984,7 +1035,9 @@ impl Document {
                 // inside other scrollable containers. Ideally this should use an implementation of
                 // `scrollIntoView` when that is available:
                 // See https://github.com/servo/servo/issues/24059.
-                let rect = element.upcast::<Node>().bounding_content_box_or_zero();
+                let rect = element
+                    .upcast::<Node>()
+                    .bounding_content_box_or_zero(can_gc);
 
                 // In order to align with element edges, we snap to unscaled pixel boundaries, since
                 // the paint thread currently does the same for drawing elements. This is important
@@ -992,8 +1045,8 @@ impl Document {
                 // (like Acid2).
                 let device_pixel_ratio = self.window.device_pixel_ratio().get();
                 (
-                    rect.origin.x.to_nearest_pixel(device_pixel_ratio) as f32,
-                    rect.origin.y.to_nearest_pixel(device_pixel_ratio) as f32,
+                    rect.origin.x.to_nearest_pixel(device_pixel_ratio),
+                    rect.origin.y.to_nearest_pixel(device_pixel_ratio),
                 )
             })
             .or_else(|| {
@@ -1008,7 +1061,7 @@ impl Document {
 
         if let Some((x, y)) = point {
             self.window
-                .scroll(x as f64, y as f64, ScrollBehavior::Instant)
+                .scroll(x as f64, y as f64, ScrollBehavior::Instant, can_gc)
         }
     }
 
@@ -1028,16 +1081,16 @@ impl Document {
             DocumentReadyState::Loading => {
                 if self.window().is_top_level() {
                     self.send_to_embedder(EmbedderMsg::LoadStart);
+                    self.send_to_embedder(EmbedderMsg::Status(None));
                 }
-                update_with_current_time_ms(&self.dom_loading);
             },
             DocumentReadyState::Complete => {
                 if self.window().is_top_level() {
                     self.send_to_embedder(EmbedderMsg::LoadComplete);
                 }
-                update_with_current_time_ms(&self.dom_complete);
+                update_with_current_instant(&self.dom_complete);
             },
-            DocumentReadyState::Interactive => update_with_current_time_ms(&self.dom_interactive),
+            DocumentReadyState::Interactive => update_with_current_instant(&self.dom_interactive),
         };
 
         self.ready_state.set(state);
@@ -1064,20 +1117,26 @@ impl Document {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#focus-fixup-rule>
-    pub(crate) fn perform_focus_fixup_rule(&self, not_focusable: &Element) {
+    pub(crate) fn perform_focus_fixup_rule(&self, not_focusable: &Element, can_gc: CanGc) {
         if Some(not_focusable) != self.focused.get().as_deref() {
             return;
         }
         self.request_focus(
             self.GetBody().as_ref().map(|e| e.upcast()),
             FocusType::Element,
+            can_gc,
         )
     }
 
     /// Request that the given element receive focus once the current transaction is complete.
     /// If None is passed, then whatever element is currently focused will no longer be focused
     /// once the transaction is complete.
-    pub(crate) fn request_focus(&self, elem: Option<&Element>, focus_type: FocusType) {
+    pub(crate) fn request_focus(
+        &self,
+        elem: Option<&Element>,
+        focus_type: FocusType,
+        can_gc: CanGc,
+    ) {
         let implicit_transaction = matches!(
             *self.focus_transaction.borrow(),
             FocusTransaction::NotInTransaction
@@ -1090,13 +1149,13 @@ impl Document {
                 FocusTransaction::InTransaction(elem.map(Dom::from_ref));
         }
         if implicit_transaction {
-            self.commit_focus_transaction(focus_type);
+            self.commit_focus_transaction(focus_type, can_gc);
         }
     }
 
     /// Reassign the focus context to the element that last requested focus during this
     /// transaction, or none if no elements requested it.
-    fn commit_focus_transaction(&self, focus_type: FocusType) {
+    fn commit_focus_transaction(&self, focus_type: FocusType, can_gc: CanGc) {
         let possibly_focused = match *self.focus_transaction.borrow() {
             FocusTransaction::NotInTransaction => unreachable!(),
             FocusTransaction::InTransaction(ref elem) => {
@@ -1111,7 +1170,7 @@ impl Document {
             let node = elem.upcast::<Node>();
             elem.set_focus_state(false);
             // FIXME: pass appropriate relatedTarget
-            self.fire_focus_event(FocusEventType::Blur, node, None);
+            self.fire_focus_event(FocusEventType::Blur, node, None, can_gc);
 
             // Notify the embedder to hide the input method.
             if elem.input_method_type().is_some() {
@@ -1125,7 +1184,7 @@ impl Document {
             elem.set_focus_state(true);
             let node = elem.upcast::<Node>();
             // FIXME: pass appropriate relatedTarget
-            self.fire_focus_event(FocusEventType::Focus, node, None);
+            self.fire_focus_event(FocusEventType::Focus, node, None, can_gc);
             // Update the focus state for all elements in the focus chain.
             // https://html.spec.whatwg.org/multipage/#focus-chain
             if focus_type == FocusType::Element {
@@ -1134,7 +1193,7 @@ impl Document {
 
             // Notify the embedder to display an input method.
             if let Some(kind) = elem.input_method_type() {
-                let rect = elem.upcast::<Node>().bounding_content_box_or_zero();
+                let rect = elem.upcast::<Node>().bounding_content_box_or_zero(can_gc);
                 let rect = Rect::new(
                     Point2D::new(rect.origin.x.to_px(), rect.origin.y.to_px()),
                     Size2D::new(rect.size.width.to_px(), rect.size.height.to_px()),
@@ -1187,11 +1246,39 @@ impl Document {
         }
     }
 
+    /// Determine the title of the [`Document`] according to the specification at:
+    /// <https://html.spec.whatwg.org/multipage/#document.title>. The difference
+    /// here is that when the title isn't specified `None` is returned.
+    fn title(&self) -> Option<DOMString> {
+        let title = self.GetDocumentElement().and_then(|root| {
+            if root.namespace() == &ns!(svg) && root.local_name() == &local_name!("svg") {
+                // Step 1.
+                root.upcast::<Node>()
+                    .child_elements()
+                    .find(|node| {
+                        node.namespace() == &ns!(svg) && node.local_name() == &local_name!("title")
+                    })
+                    .map(DomRoot::upcast::<Node>)
+            } else {
+                // Step 2.
+                root.upcast::<Node>()
+                    .traverse_preorder(ShadowIncluding::No)
+                    .find(|node| node.is::<HTMLTitleElement>())
+            }
+        });
+
+        title.map(|title| {
+            // Steps 3-4.
+            let value = title.child_text_content();
+            DOMString::from(str_join(split_html_space_chars(&value), " "))
+        })
+    }
+
     /// Sends this document's title to the constellation.
     pub fn send_title_to_embedder(&self) {
         let window = self.window();
         if window.is_top_level() {
-            let title = Some(String::from(self.Title()));
+            let title = self.title().map(String::from);
             self.send_to_embedder(EmbedderMsg::ChangePageTitle(title));
         }
     }
@@ -1215,7 +1302,8 @@ impl Document {
     }
 
     #[allow(unsafe_code)]
-    pub unsafe fn handle_mouse_event(
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn handle_mouse_button_event(
         &self,
         button: MouseButton,
         client_point: Point2D<f32>,
@@ -1223,6 +1311,7 @@ impl Document {
         node_address: Option<UntrustedNodeAddress>,
         point_in_node: Option<Point2D<f32>>,
         pressed_mouse_buttons: u16,
+        can_gc: CanGc,
     ) {
         let mouse_event_type_string = match mouse_event_type {
             MouseEventType::Click => "click".to_owned(),
@@ -1252,7 +1341,7 @@ impl Document {
             }
 
             self.begin_focus_transaction();
-            self.request_focus(Some(&*el), FocusType::Element);
+            self.request_focus(Some(&*el), FocusType::Element, can_gc);
         }
 
         // https://w3c.github.io/uievents/#event-type-click
@@ -1282,6 +1371,7 @@ impl Document {
             pressed_mouse_buttons,
             None,
             point_in_node,
+            can_gc,
         );
         let event = event.upcast::<Event>();
 
@@ -1314,12 +1404,9 @@ impl Document {
         }
 
         if let MouseEventType::Click = mouse_event_type {
-            self.commit_focus_transaction(FocusType::Element);
-            self.maybe_fire_dblclick(client_point, node, pressed_mouse_buttons);
+            self.commit_focus_transaction(FocusType::Element, can_gc);
+            self.maybe_fire_dblclick(client_point, node, pressed_mouse_buttons, can_gc);
         }
-
-        self.window
-            .reflow(ReflowGoal::Full, ReflowReason::MouseEvent);
     }
 
     fn maybe_fire_dblclick(
@@ -1327,6 +1414,7 @@ impl Document {
         click_pos: Point2D<f32>,
         target: &Node,
         pressed_mouse_buttons: u16,
+        can_gc: CanGc,
     ) {
         // https://w3c.github.io/uievents/#event-type-dblclick
         let now = Instant::now();
@@ -1369,6 +1457,7 @@ impl Document {
                     pressed_mouse_buttons,
                     None,
                     None,
+                    can_gc,
                 );
                 event.upcast::<Event>().fire(target.upcast());
 
@@ -1382,6 +1471,7 @@ impl Document {
         *self.last_click_info.borrow_mut() = Some((now, click_pos));
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn fire_mouse_event(
         &self,
         client_point: Point2D<f32>,
@@ -1390,6 +1480,7 @@ impl Document {
         can_bubble: EventBubbles,
         cancelable: EventCancelable,
         pressed_mouse_buttons: u16,
+        can_gc: CanGc,
     ) {
         let client_x = client_point.x.to_i32().unwrap_or(0);
         let client_y = client_point.y.to_i32().unwrap_or(0);
@@ -1413,6 +1504,7 @@ impl Document {
             pressed_mouse_buttons,
             None,
             None,
+            can_gc,
         );
         let event = mouse_event.upcast::<Event>();
         event.fire(target);
@@ -1425,6 +1517,7 @@ impl Document {
         prev_mouse_over_target: &MutNullableDom<Element>,
         node_address: Option<UntrustedNodeAddress>,
         pressed_mouse_buttons: u16,
+        can_gc: CanGc,
     ) {
         let maybe_new_target = node_address.and_then(|address| {
             let node = node::from_untrusted_node_address(address);
@@ -1472,6 +1565,7 @@ impl Document {
                     EventBubbles::Bubbles,
                     EventCancelable::Cancelable,
                     pressed_mouse_buttons,
+                    can_gc,
                 );
 
                 if !old_target_is_ancestor_of_new_target {
@@ -1483,6 +1577,7 @@ impl Document {
                         moving_into,
                         event_target,
                         pressed_mouse_buttons,
+                        can_gc,
                     );
                 }
             }
@@ -1506,6 +1601,7 @@ impl Document {
                 EventBubbles::Bubbles,
                 EventCancelable::Cancelable,
                 pressed_mouse_buttons,
+                can_gc,
             );
 
             let moving_from = prev_mouse_over_target
@@ -1518,6 +1614,7 @@ impl Document {
                 moving_from,
                 event_target,
                 pressed_mouse_buttons,
+                can_gc,
             );
         }
 
@@ -1530,13 +1627,12 @@ impl Document {
             EventBubbles::Bubbles,
             EventCancelable::Cancelable,
             pressed_mouse_buttons,
+            can_gc,
         );
 
         // If the target has changed then store the current mouse over target for next frame.
         if target_has_changed {
             prev_mouse_over_target.set(maybe_new_target.as_deref());
-            self.window
-                .reflow(ReflowGoal::Full, ReflowReason::MouseEvent);
         }
     }
 
@@ -1547,6 +1643,7 @@ impl Document {
         related_target: Option<DomRoot<Node>>,
         event_target: DomRoot<Node>,
         pressed_mouse_buttons: u16,
+        can_gc: CanGc,
     ) {
         assert!(matches!(
             event_type,
@@ -1586,6 +1683,7 @@ impl Document {
                 EventBubbles::DoesNotBubble,
                 EventCancelable::NotCancelable,
                 pressed_mouse_buttons,
+                can_gc,
             );
         }
     }
@@ -1596,6 +1694,7 @@ impl Document {
         delta: WheelDelta,
         client_point: Point2D<f32>,
         node_address: Option<UntrustedNodeAddress>,
+        can_gc: CanGc,
     ) {
         let wheel_event_type_string = "wheel".to_owned();
         debug!("{}: at {:?}", wheel_event_type_string, client_point);
@@ -1627,6 +1726,7 @@ impl Document {
             Finite::wrap(delta.y),
             Finite::wrap(delta.z),
             delta.mode as u32,
+            can_gc,
         );
 
         let event = event.upcast::<Event>();
@@ -1737,8 +1837,6 @@ impl Document {
         let event = event.upcast::<Event>();
         let result = event.fire(&target);
 
-        window.reflow(ReflowGoal::Full, ReflowReason::MouseEvent);
-
         match result {
             EventStatus::Canceled => TouchEventResult::Processed(false),
             EventStatus::NotCanceled => TouchEventResult::Processed(true),
@@ -1746,7 +1844,11 @@ impl Document {
     }
 
     /// The entry point for all key processing for web content
-    pub fn dispatch_key_event(&self, keyboard_event: ::keyboard_types::KeyboardEvent) {
+    pub fn dispatch_key_event(
+        &self,
+        keyboard_event: ::keyboard_types::KeyboardEvent,
+        can_gc: CanGc,
+    ) {
         let focused = self.get_focused_element();
         let body = self.GetBody();
 
@@ -1771,6 +1873,7 @@ impl Document {
             keyboard_event.modifiers,
             0,
             keyboard_event.key.legacy_keycode(),
+            can_gc,
         );
         let event = keyevent.upcast::<Event>();
         event.fire(target);
@@ -1798,6 +1901,7 @@ impl Document {
                 keyboard_event.modifiers,
                 keyboard_event.key.legacy_charcode(),
                 0,
+                can_gc,
             );
             let ev = event.upcast::<Event>();
             ev.fire(target);
@@ -1818,24 +1922,24 @@ impl Document {
             {
                 if let Some(elem) = target.downcast::<Element>() {
                     elem.upcast::<Node>()
-                        .fire_synthetic_mouse_event_not_trusted(DOMString::from("click"));
+                        .fire_synthetic_mouse_event_not_trusted(DOMString::from("click"), can_gc);
                 }
             }
         }
-
-        self.window.reflow(ReflowGoal::Full, ReflowReason::KeyEvent);
     }
 
-    pub fn ime_dismissed(&self) {
+    pub fn ime_dismissed(&self, can_gc: CanGc) {
         self.request_focus(
             self.GetBody().as_ref().map(|e| e.upcast()),
             FocusType::Element,
+            can_gc,
         )
     }
 
     pub fn dispatch_composition_event(
         &self,
         composition_event: ::keyboard_types::CompositionEvent,
+        can_gc: CanGc,
     ) {
         // spec: https://w3c.github.io/uievents/#compositionstart
         // spec: https://w3c.github.io/uievents/#compositionupdate
@@ -1859,6 +1963,7 @@ impl Document {
             Some(&self.window),
             0,
             DOMString::from(composition_event.data),
+            can_gc,
         );
         let event = compositionevent.upcast::<Event>();
         event.fire(target);
@@ -1962,7 +2067,7 @@ impl Document {
             };
             self.global().schedule_callback(
                 OneshotTimerCallback::FakeRequestAnimationFrame(callback),
-                MsDuration::new(FAKE_REQUEST_ANIMATION_FRAME_DELAY),
+                Duration::from_millis(FAKE_REQUEST_ANIMATION_FRAME_DELAY),
             );
         } else if !self.running_animation_callbacks.get() {
             // No need to send a `ChangeRunningAnimationsState` if we're running animation callbacks:
@@ -1988,7 +2093,7 @@ impl Document {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#run-the-animation-frame-callbacks>
-    pub fn run_the_animation_frame_callbacks(&self) {
+    pub fn run_the_animation_frame_callbacks(&self, can_gc: CanGc) {
         rooted_vec!(let mut animation_frame_list);
         mem::swap(
             &mut *animation_frame_list,
@@ -2007,9 +2112,11 @@ impl Document {
 
         self.running_animation_callbacks.set(false);
 
-        let spurious = !self
-            .window
-            .reflow(ReflowGoal::Full, ReflowReason::RequestAnimationFrame);
+        let spurious = !self.window.reflow(
+            ReflowGoal::Full,
+            ReflowReason::RequestAnimationFrame,
+            can_gc,
+        );
 
         if spurious && !was_faking_animation_frames {
             // If the rAF callbacks did not mutate the DOM, then the
@@ -2064,21 +2171,58 @@ impl Document {
         }
     }
 
-    pub fn fetch_async(
+    /// Add the CSP list and HTTPS state to a given request.
+    ///
+    /// TODO: Can this hapen for all requests that go through the document?
+    pub(crate) fn prepare_request(&self, request: RequestBuilder) -> RequestBuilder {
+        request
+            .csp_list(self.get_csp_list().map(|list| list.clone()))
+            .https_state(self.https_state.get())
+    }
+
+    pub(crate) fn fetch<Listener: FetchResponseListener + PreInvoke + Send + 'static>(
         &self,
         load: LoadType,
-        mut request: RequestBuilder,
-        fetch_target: IpcSender<FetchResponseMsg>,
+        request: RequestBuilder,
+        listener: Listener,
     ) {
-        request.csp_list = self.get_csp_list().map(|x| x.clone());
-        request.https_state = self.https_state.get();
-        let mut loader = self.loader.borrow_mut();
-        loader.fetch_async(load, request, fetch_target);
+        let (task_source, canceller) = self
+            .window()
+            .task_manager()
+            .networking_task_source_with_canceller();
+        let callback = NetworkListener {
+            context: std::sync::Arc::new(Mutex::new(listener)),
+            task_source,
+            canceller: Some(canceller),
+        }
+        .into_callback();
+        self.loader_mut()
+            .fetch_async_with_callback(load, request, callback);
+    }
+
+    pub(crate) fn fetch_background<Listener: FetchResponseListener + PreInvoke + Send + 'static>(
+        &self,
+        request: RequestBuilder,
+        listener: Listener,
+        cancel_override: Option<ipc::IpcReceiver<()>>,
+    ) {
+        let (task_source, canceller) = self
+            .window()
+            .task_manager()
+            .networking_task_source_with_canceller();
+        let callback = NetworkListener {
+            context: std::sync::Arc::new(Mutex::new(listener)),
+            task_source,
+            canceller: Some(canceller),
+        }
+        .into_callback();
+        self.loader_mut()
+            .fetch_async_background(request, callback, cancel_override);
     }
 
     // https://html.spec.whatwg.org/multipage/#the-end
     // https://html.spec.whatwg.org/multipage/#delay-the-load-event
-    pub fn finish_load(&self, load: LoadType) {
+    pub fn finish_load(&self, load: LoadType, can_gc: CanGc) {
         // This does not delay the load event anymore.
         debug!("Document got finish_load: {:?}", load);
         self.loader.borrow_mut().finish_load(&load);
@@ -2087,7 +2231,7 @@ impl Document {
             LoadType::Stylesheet(_) => {
                 // A stylesheet finishing to load may unblock any pending
                 // parsing-blocking script or deferred script.
-                self.process_pending_parsing_blocking_script();
+                self.process_pending_parsing_blocking_script(can_gc);
 
                 // Step 3.
                 self.process_deferred_scripts();
@@ -2102,7 +2246,7 @@ impl Document {
                     self.reflow_timeout.set(None);
                     self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
                     self.window
-                        .reflow(ReflowGoal::Full, ReflowReason::FirstLoad);
+                        .reflow(ReflowGoal::Full, ReflowReason::FirstLoad, can_gc);
                 }
 
                 // Deferred scripts have to wait for page to finish loading,
@@ -2123,8 +2267,8 @@ impl Document {
         let loader = self.loader.borrow();
 
         // Servo measures when the top-level content (not iframes) is loaded.
-        if (self.top_level_dom_complete.get() == 0) && loader.is_only_blocked_by_iframes() {
-            update_with_current_time_ms(&self.top_level_dom_complete);
+        if self.top_level_dom_complete.get().is_none() && loader.is_only_blocked_by_iframes() {
+            update_with_current_instant(&self.top_level_dom_complete);
         }
 
         if loader.is_blocked() || loader.events_inhibited() {
@@ -2136,7 +2280,7 @@ impl Document {
     }
 
     // https://html.spec.whatwg.org/multipage/#prompt-to-unload-a-document
-    pub fn prompt_to_unload(&self, recursive_flag: bool) -> bool {
+    pub fn prompt_to_unload(&self, recursive_flag: bool, can_gc: CanGc) -> bool {
         // TODO: Step 1, increase the event loop's termination nesting level by 1.
         // Step 2
         self.incr_ignore_opens_during_unload_counter();
@@ -2151,7 +2295,8 @@ impl Document {
         event.set_trusted(true);
         let event_target = self.window.upcast::<EventTarget>();
         let has_listeners = event_target.has_listeners_for(&atom!("beforeunload"));
-        self.window.dispatch_event_with_target_override(event);
+        self.window
+            .dispatch_event_with_target_override(event, can_gc);
         // TODO: Step 6, decrease the event loop's termination nesting level by 1.
         // Step 7
         if has_listeners {
@@ -2176,7 +2321,7 @@ impl Document {
             for iframe in self.iter_iframes() {
                 // TODO: handle the case of cross origin iframes.
                 let document = document_from_node(&*iframe);
-                can_unload = document.prompt_to_unload(true);
+                can_unload = document.prompt_to_unload(true, can_gc);
                 if !document.salvageable() {
                     self.salvageable.set(false);
                 }
@@ -2191,24 +2336,31 @@ impl Document {
     }
 
     // https://html.spec.whatwg.org/multipage/#unload-a-document
-    pub fn unload(&self, recursive_flag: bool) {
+    pub fn unload(&self, recursive_flag: bool, can_gc: CanGc) {
         // TODO: Step 1, increase the event loop's termination nesting level by 1.
         // Step 2
         self.incr_ignore_opens_during_unload_counter();
-        // Step 3-6
+        // Step 3-6 If oldDocument's page showing is true:
         if self.page_showing.get() {
+            // Set oldDocument's page showing to false.
             self.page_showing.set(false);
+            // Fire a page transition event named pagehide at oldDocument's relevant global object with oldDocument's
+            // salvageable state.
             let event = PageTransitionEvent::new(
                 &self.window,
                 atom!("pagehide"),
                 false,                  // bubbles
                 false,                  // cancelable
                 self.salvageable.get(), // persisted
+                can_gc,
             );
             let event = event.upcast::<Event>();
             event.set_trusted(true);
-            let _ = self.window.dispatch_event_with_target_override(event);
-            // TODO Step 6, document visibility steps.
+            let _ = self
+                .window
+                .dispatch_event_with_target_override(event, can_gc);
+            // Step 6 Update the visibility state of oldDocument to "hidden".
+            self.update_visibility_state(DocumentVisibilityState::Hidden, can_gc);
         }
         // Step 7
         if !self.fired_unload.get() {
@@ -2217,11 +2369,14 @@ impl Document {
                 atom!("unload"),
                 EventBubbles::Bubbles,
                 EventCancelable::Cancelable,
+                can_gc,
             );
             event.set_trusted(true);
             let event_target = self.window.upcast::<EventTarget>();
             let has_listeners = event_target.has_listeners_for(&atom!("unload"));
-            let _ = self.window.dispatch_event_with_target_override(&event);
+            let _ = self
+                .window
+                .dispatch_event_with_target_override(&event, can_gc);
             self.fired_unload.set(true);
             // Step 9
             if has_listeners {
@@ -2235,7 +2390,7 @@ impl Document {
             for iframe in self.iter_iframes() {
                 // TODO: handle the case of cross origin iframes.
                 let document = document_from_node(&*iframe);
-                document.unload(true);
+                document.unload(true, can_gc);
                 if !document.salvageable() {
                     self.salvageable.set(false);
                 }
@@ -2309,25 +2464,21 @@ impl Document {
                         atom!("load"),
                         EventBubbles::DoesNotBubble,
                         EventCancelable::NotCancelable,
+                        CanGc::note(),
                     );
                     event.set_trusted(true);
 
                     // http://w3c.github.io/navigation-timing/#widl-PerformanceNavigationTiming-loadEventStart
-                    update_with_current_time_ms(&document.load_event_start);
+                    update_with_current_instant(&document.load_event_start);
 
                     debug!("About to dispatch load for {:?}", document.url());
-                    // FIXME(nox): Why are errors silenced here?
-                    let _ = window.dispatch_event_with_target_override(
-                        &event,
-                    );
+                    window.dispatch_event_with_target_override(&event, CanGc::note());
 
                     // http://w3c.github.io/navigation-timing/#widl-PerformanceNavigationTiming-loadEventEnd
-                    update_with_current_time_ms(&document.load_event_end);
-
-                    window.reflow(ReflowGoal::Full, ReflowReason::DocumentLoaded);
+                    update_with_current_instant(&document.load_event_end);
 
                     if let Some(fragment) = document.url().fragment() {
-                        document.check_and_scroll_fragment(fragment);
+                        document.check_and_scroll_fragment(fragment, CanGc::note());
                     }
                 }),
                 self.window.upcast(),
@@ -2356,14 +2507,12 @@ impl Document {
                             false, // bubbles
                             false, // cancelable
                             false, // persisted
+                            CanGc::note(),
                         );
                         let event = event.upcast::<Event>();
                         event.set_trusted(true);
 
-                        // FIXME(nox): Why are errors silenced here?
-                        let _ = window.dispatch_event_with_target_override(
-                            event,
-                        );
+                        window.dispatch_event_with_target_override(event, CanGc::note());
                     }),
                     self.window.upcast(),
                 )
@@ -2410,7 +2559,7 @@ impl Document {
                                     window: window_from_node(&*document),
                                     url: url.clone(),
                                 }),
-                                MsDuration::new(time.saturating_mul(1000)),
+                                Duration::from_secs(*time),
                             );
                         }
                         // Note: this will, among others, result in the "iframe-load-event-steps" being run.
@@ -2448,6 +2597,7 @@ impl Document {
         &self,
         element: &HTMLScriptElement,
         result: ScriptResult,
+        can_gc: CanGc,
     ) {
         {
             let mut blocking_script = self.pending_parsing_blocking_script.borrow_mut();
@@ -2455,10 +2605,10 @@ impl Document {
             assert!(&*entry.element == element);
             entry.loaded(result);
         }
-        self.process_pending_parsing_blocking_script();
+        self.process_pending_parsing_blocking_script(can_gc);
     }
 
-    fn process_pending_parsing_blocking_script(&self) {
+    fn process_pending_parsing_blocking_script(&self, can_gc: CanGc) {
         if self.script_blocking_stylesheets_count.get() > 0 {
             return;
         }
@@ -2471,7 +2621,7 @@ impl Document {
             *self.pending_parsing_blocking_script.borrow_mut() = None;
             self.get_current_parser()
                 .unwrap()
-                .resume_with_pending_parsing_blocking_script(&element, result);
+                .resume_with_pending_parsing_blocking_script(&element, result, can_gc);
         }
     }
 
@@ -2560,7 +2710,7 @@ impl Document {
             "Complete before DOMContentLoaded?"
         );
 
-        update_with_current_time_ms(&self.dom_content_loaded_event_start);
+        update_with_current_instant(&self.dom_content_loaded_event_start);
 
         // Step 4.1.
         let window = self.window();
@@ -2571,8 +2721,8 @@ impl Document {
             .queue(
                 task!(fire_dom_content_loaded_event: move || {
                 let document = document.root();
-                document.upcast::<EventTarget>().fire_bubbling_event(atom!("DOMContentLoaded"));
-                update_with_current_time_ms(&document.dom_content_loaded_event_end);
+                document.upcast::<EventTarget>().fire_bubbling_event(atom!("DOMContentLoaded"), CanGc::note());
+                update_with_current_instant(&document.dom_content_loaded_event_end);
                 }),
                 window.upcast(),
             )
@@ -2588,7 +2738,7 @@ impl Document {
     }
 
     // https://html.spec.whatwg.org/multipage/#abort-a-document
-    pub fn abort(&self) {
+    pub fn abort(&self, can_gc: CanGc) {
         // We need to inhibit the loader before anything else.
         self.loader.borrow_mut().inhibit_events();
 
@@ -2596,7 +2746,7 @@ impl Document {
         for iframe in self.iter_iframes() {
             if let Some(document) = iframe.GetContentDocument() {
                 // TODO: abort the active documents of every child browsing context.
-                document.abort();
+                document.abort(can_gc);
                 // TODO: salvageable flag.
             }
         }
@@ -2625,7 +2775,7 @@ impl Document {
         // Step 3.
         if let Some(parser) = self.get_current_parser() {
             self.active_parser_was_aborted.set(true);
-            parser.abort();
+            parser.abort(can_gc);
             self.salvageable.set(false);
         }
     }
@@ -2640,18 +2790,6 @@ impl Document {
 
     pub fn get_current_parser(&self) -> Option<DomRoot<ServoParser>> {
         self.current_parser.get()
-    }
-
-    pub fn can_invoke_script(&self) -> bool {
-        match self.get_current_parser() {
-            Some(parser) => {
-                // It is safe to run script if the parser is not actively parsing,
-                // or if it is impossible to interact with the token stream.
-                parser.parser_is_not_active() ||
-                    self.throw_on_dynamic_markup_insertion_counter.get() > 0
-            },
-            None => true,
-        }
     }
 
     /// Iterate over all iframes in the document.
@@ -2670,15 +2808,11 @@ impl Document {
             .find(|node| node.browsing_context_id() == Some(browsing_context_id))
     }
 
-    pub fn get_dom_loading(&self) -> u64 {
-        self.dom_loading.get()
-    }
-
-    pub fn get_dom_interactive(&self) -> u64 {
+    pub fn get_dom_interactive(&self) -> Option<CrossProcessInstant> {
         self.dom_interactive.get()
     }
 
-    pub fn set_navigation_start(&self, navigation_start: u64) {
+    pub fn set_navigation_start(&self, navigation_start: CrossProcessInstant) {
         self.interactive_time
             .borrow_mut()
             .set_navigation_start(navigation_start);
@@ -2692,35 +2826,35 @@ impl Document {
         self.get_interactive_metrics().get_tti().is_some()
     }
 
-    pub fn get_dom_content_loaded_event_start(&self) -> u64 {
+    pub fn get_dom_content_loaded_event_start(&self) -> Option<CrossProcessInstant> {
         self.dom_content_loaded_event_start.get()
     }
 
-    pub fn get_dom_content_loaded_event_end(&self) -> u64 {
+    pub fn get_dom_content_loaded_event_end(&self) -> Option<CrossProcessInstant> {
         self.dom_content_loaded_event_end.get()
     }
 
-    pub fn get_dom_complete(&self) -> u64 {
+    pub fn get_dom_complete(&self) -> Option<CrossProcessInstant> {
         self.dom_complete.get()
     }
 
-    pub fn get_top_level_dom_complete(&self) -> u64 {
+    pub fn get_top_level_dom_complete(&self) -> Option<CrossProcessInstant> {
         self.top_level_dom_complete.get()
     }
 
-    pub fn get_load_event_start(&self) -> u64 {
+    pub fn get_load_event_start(&self) -> Option<CrossProcessInstant> {
         self.load_event_start.get()
     }
 
-    pub fn get_load_event_end(&self) -> u64 {
+    pub fn get_load_event_end(&self) -> Option<CrossProcessInstant> {
         self.load_event_end.get()
     }
 
-    pub fn get_unload_event_start(&self) -> u64 {
+    pub fn get_unload_event_start(&self) -> Option<CrossProcessInstant> {
         self.unload_event_start.get()
     }
 
-    pub fn get_unload_event_end(&self) -> u64 {
+    pub fn get_unload_event_end(&self) -> Option<CrossProcessInstant> {
         self.unload_event_end.get()
     }
 
@@ -2751,6 +2885,7 @@ impl Document {
         focus_event_type: FocusEventType,
         node: &Node,
         related_target: Option<&EventTarget>,
+        can_gc: CanGc,
     ) {
         let (event_name, does_bubble) = match focus_event_type {
             FocusEventType::Focus => (DOMString::from("focus"), EventBubbles::DoesNotBubble),
@@ -2764,6 +2899,7 @@ impl Document {
             Some(&self.window),
             0i32,
             related_target,
+            can_gc,
         );
         let event = event.upcast::<Event>();
         event.set_trusted(true);
@@ -2875,10 +3011,6 @@ impl Document {
 
         #[allow(unused)]
         let mut time = 0;
-        #[cfg(feature = "xr-profile")]
-        {
-            time = time::precise_time_ns();
-        }
         let (sender, receiver) = webgl::webgl_channel().unwrap();
         self.window
             .webgl_chan()
@@ -2900,7 +3032,7 @@ impl Document {
         self.dirty_webgpu_contexts
             .borrow_mut()
             .drain()
-            .for_each(|(_, context)| context.send_swap_chain_present());
+            .for_each(|(_, context)| context.update_rendering_of_webgpu_canvas());
     }
 
     pub fn id_map(&self) -> Ref<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
@@ -2909,6 +3041,97 @@ impl Document {
 
     pub fn name_map(&self) -> Ref<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
         self.name_map.borrow()
+    }
+
+    /// <https://drafts.csswg.org/resize-observer/#dom-resizeobserver-resizeobserver>
+    pub(crate) fn add_resize_observer(&self, resize_observer: &ResizeObserver) {
+        self.resize_observers
+            .borrow_mut()
+            .push(Dom::from_ref(resize_observer));
+    }
+
+    /// <https://drafts.csswg.org/resize-observer/#gather-active-observations-h>
+    /// <https://drafts.csswg.org/resize-observer/#has-active-resize-observations>
+    pub(crate) fn gather_active_resize_observations_at_depth(
+        &self,
+        depth: &ResizeObservationDepth,
+        can_gc: CanGc,
+    ) -> bool {
+        let mut has_active_resize_observations = false;
+        for observer in self.resize_observers.borrow_mut().iter_mut() {
+            observer.gather_active_resize_observations_at_depth(
+                depth,
+                &mut has_active_resize_observations,
+                can_gc,
+            );
+        }
+        has_active_resize_observations
+    }
+
+    /// <https://drafts.csswg.org/resize-observer/#broadcast-active-resize-observations>
+    pub(crate) fn broadcast_active_resize_observations(
+        &self,
+        can_gc: CanGc,
+    ) -> ResizeObservationDepth {
+        let mut shallowest = ResizeObservationDepth::max();
+        // Breaking potential re-borrow cycle on `resize_observers`:
+        // broadcasting resize observations calls into a JS callback,
+        // which can add new observers.
+        for observer in self
+            .resize_observers
+            .borrow()
+            .iter()
+            .map(|obs| DomRoot::from_ref(&**obs))
+        {
+            observer.broadcast_active_resize_observations(&mut shallowest, can_gc);
+        }
+        shallowest
+    }
+
+    /// <https://drafts.csswg.org/resize-observer/#has-skipped-observations-h>
+    pub(crate) fn has_skipped_resize_observations(&self) -> bool {
+        self.resize_observers
+            .borrow()
+            .iter()
+            .any(|observer| observer.has_skipped_resize_observations())
+    }
+
+    /// <https://drafts.csswg.org/resize-observer/#deliver-resize-loop-error-notification>
+    pub(crate) fn deliver_resize_loop_error_notification(&self, can_gc: CanGc) {
+        let global_scope = self.window.upcast::<GlobalScope>();
+        let error_info: ErrorInfo = crate::dom::bindings::error::ErrorInfo {
+            message: "ResizeObserver loop completed with undelivered notifications.".to_string(),
+            ..Default::default()
+        };
+        global_scope.report_an_error(error_info, HandleValue::null(), can_gc);
+    }
+
+    pub(crate) fn status_code(&self) -> Option<u16> {
+        self.status_code
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#encoding-parsing-a-url>
+    pub fn encoding_parse_a_url(&self, url: &str) -> Result<ServoUrl, url::ParseError> {
+        // NOTE: This algorithm is defined for both Document and environment settings objects.
+        // This implementation is only for documents.
+
+        // Step 1. Let encoding be UTF-8.
+        // Step 2. If environment is a Document object, then set encoding to environment's character encoding.
+        let encoding = self.encoding.get();
+
+        // Step 3. Otherwise, if environment's relevant global object is a Window object, set encoding to environment's
+        // relevant global object's associated Document's character encoding.
+
+        // Step 4. Let baseURL be environment's base URL, if environment is a Document object;
+        // otherwise environment's API base URL.
+        let base_url = self.base_url();
+
+        // Step 5. Return the result of applying the URL parser to url, with baseURL and encoding.
+        url::Url::options()
+            .base_url(Some(base_url.as_url()))
+            .encoding_override(Some(&|s| encoding.encode(s).0))
+            .parse(url)
+            .map(ServoUrl::from)
     }
 }
 
@@ -2924,7 +3147,7 @@ pub enum DocumentSource {
 
 #[allow(unsafe_code)]
 pub trait LayoutDocumentHelpers<'dom> {
-    fn is_html_document_for_layout(self) -> bool;
+    fn is_html_document_for_layout(&self) -> bool;
     fn needs_paint_from_layout(self);
     fn will_paint(self);
     fn quirks_mode(self) -> QuirksMode;
@@ -2937,7 +3160,7 @@ pub trait LayoutDocumentHelpers<'dom> {
 #[allow(unsafe_code)]
 impl<'dom> LayoutDocumentHelpers<'dom> for LayoutDom<'dom, Document> {
     #[inline]
-    fn is_html_document_for_layout(self) -> bool {
+    fn is_html_document_for_layout(&self) -> bool {
         self.unsafe_get().is_html_document
     }
 
@@ -3065,6 +3288,7 @@ impl Document {
         doc_loader: DocumentLoader,
         referrer: Option<String>,
         referrer_policy: Option<ReferrerPolicy>,
+        status_code: Option<u16>,
         canceller: FetchCanceller,
     ) -> Document {
         let url = url.unwrap_or_else(|| ServoUrl::parse("about:blank").unwrap());
@@ -3121,17 +3345,15 @@ impl Document {
             anchors: Default::default(),
             applets: Default::default(),
             style_shared_lock: {
-                lazy_static! {
-                    /// Per-process shared lock for author-origin stylesheets
-                    ///
-                    /// FIXME: make it per-document or per-pipeline instead:
-                    /// <https://github.com/servo/servo/issues/16027>
-                    /// (Need to figure out what to do with the style attribute
-                    /// of elements adopted into another document.)
-                    static ref PER_PROCESS_AUTHOR_SHARED_LOCK: StyleSharedRwLock = {
-                        StyleSharedRwLock::new()
-                    };
-                }
+                /// Per-process shared lock for author-origin stylesheets
+                ///
+                /// FIXME: make it per-document or per-pipeline instead:
+                /// <https://github.com/servo/servo/issues/16027>
+                /// (Need to figure out what to do with the style attribute
+                /// of elements adopted into another document.)
+                static PER_PROCESS_AUTHOR_SHARED_LOCK: LazyLock<StyleSharedRwLock> =
+                    LazyLock::new(StyleSharedRwLock::new);
+
                 PER_PROCESS_AUTHOR_SHARED_LOCK.clone()
                 //StyleSharedRwLock::new()
             },
@@ -3159,7 +3381,6 @@ impl Document {
             pending_restyles: DomRefCell::new(HashMap::new()),
             needs_paint: Cell::new(false),
             active_touch_points: DomRefCell::new(Vec::new()),
-            dom_loading: Cell::new(Default::default()),
             dom_interactive: Cell::new(Default::default()),
             dom_content_loaded_event_start: Cell::new(Default::default()),
             dom_content_loaded_event_end: Cell::new(Default::default()),
@@ -3198,7 +3419,7 @@ impl Document {
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
             dirty_webgl_contexts: DomRefCell::new(HashMapTracedValues::new()),
-            dirty_webgpu_contexts: DomRefCell::new(HashMap::new()),
+            dirty_webgpu_contexts: DomRefCell::new(HashMapTracedValues::new()),
             csp_list: DomRefCell::new(None),
             selection: MutNullableDom::new(None),
             animation_timeline: if pref!(layout.animations.test.enabled) {
@@ -3209,7 +3430,64 @@ impl Document {
             animations: DomRefCell::new(Animations::new()),
             dirty_root: Default::default(),
             declarative_refresh: Default::default(),
+            pending_animation_ticks: Default::default(),
+            pending_compositor_events: Default::default(),
+            mouse_move_event_index: Default::default(),
+            resize_observers: Default::default(),
+            fonts: Default::default(),
+            visibility_state: Cell::new(DocumentVisibilityState::Hidden),
+            status_code,
         }
+    }
+
+    /// Note a pending animation tick, to be processed at the next `update_the_rendering` task.
+    pub fn note_pending_animation_tick(&self, tick_type: AnimationTickType) {
+        self.pending_animation_ticks.borrow_mut().extend(tick_type);
+    }
+
+    /// Whether this document has received an animation tick for rafs.
+    pub fn has_received_raf_tick(&self) -> bool {
+        self.pending_animation_ticks
+            .borrow()
+            .contains(AnimationTickType::REQUEST_ANIMATION_FRAME)
+    }
+
+    /// As part of a `update_the_rendering` task, tick all pending animations.
+    pub fn tick_all_animations(&self, should_run_rafs: bool, can_gc: CanGc) {
+        let tick_type = mem::take(&mut *self.pending_animation_ticks.borrow_mut());
+        if should_run_rafs {
+            self.run_the_animation_frame_callbacks(can_gc);
+        }
+        if tick_type.contains(AnimationTickType::CSS_ANIMATIONS_AND_TRANSITIONS) {
+            self.maybe_mark_animating_nodes_as_dirty();
+        }
+    }
+
+    /// Note a pending compositor event, to be processed at the next `update_the_rendering` task.
+    pub fn note_pending_compositor_event(&self, event: CompositorEvent) {
+        let mut pending_compositor_events = self.pending_compositor_events.borrow_mut();
+        if matches!(event, CompositorEvent::MouseMoveEvent { .. }) {
+            // First try to replace any existing mouse move event.
+            if let Some(mouse_move_event) = self
+                .mouse_move_event_index
+                .borrow()
+                .and_then(|index| pending_compositor_events.get_mut(index))
+            {
+                *mouse_move_event = event;
+                return;
+            }
+
+            *self.mouse_move_event_index.borrow_mut() = Some(pending_compositor_events.len());
+        }
+
+        pending_compositor_events.push(event);
+    }
+
+    /// Get pending compositor events, for processing within an `update_the_rendering` task.
+    pub fn take_pending_compositor_events(&self) -> Vec<CompositorEvent> {
+        // Reset the mouse event index.
+        *self.mouse_move_event_index.borrow_mut() = None;
+        mem::take(&mut *self.pending_compositor_events.borrow_mut())
     }
 
     pub fn set_csp_list(&self, csp_list: Option<CspList>) {
@@ -3281,32 +3559,6 @@ impl Document {
         );
     }
 
-    // https://dom.spec.whatwg.org/#dom-document-document
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<Document>> {
-        let doc = window.Document();
-        let docloader = DocumentLoader::new(&doc.loader());
-        Ok(Document::new_with_proto(
-            window,
-            proto,
-            HasBrowsingContext::No,
-            None,
-            doc.origin().clone(),
-            IsHTMLDocument::NonHTMLDocument,
-            None,
-            None,
-            DocumentActivity::Inactive,
-            DocumentSource::NotFromParser,
-            docloader,
-            None,
-            None,
-            Default::default(),
-        ))
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         window: &Window,
@@ -3321,7 +3573,9 @@ impl Document {
         doc_loader: DocumentLoader,
         referrer: Option<String>,
         referrer_policy: Option<ReferrerPolicy>,
+        status_code: Option<u16>,
         canceller: FetchCanceller,
+        can_gc: CanGc,
     ) -> DomRoot<Document> {
         Self::new_with_proto(
             window,
@@ -3337,7 +3591,9 @@ impl Document {
             doc_loader,
             referrer,
             referrer_policy,
+            status_code,
             canceller,
+            can_gc,
         )
     }
 
@@ -3356,7 +3612,9 @@ impl Document {
         doc_loader: DocumentLoader,
         referrer: Option<String>,
         referrer_policy: Option<ReferrerPolicy>,
+        status_code: Option<u16>,
         canceller: FetchCanceller,
+        can_gc: CanGc,
     ) -> DomRoot<Document> {
         let document = reflect_dom_object_with_proto(
             Box::new(Document::new_inherited(
@@ -3372,10 +3630,12 @@ impl Document {
                 doc_loader,
                 referrer,
                 referrer_policy,
+                status_code,
                 canceller,
             )),
             window,
             proto,
+            can_gc,
         );
         {
             let node = document.upcast::<Node>();
@@ -3416,7 +3676,7 @@ impl Document {
         if element.namespace() != &ns!(html) {
             return false;
         }
-        element.get_name().map_or(false, |n| *n == **name)
+        element.get_name().is_some_and(|n| *n == **name)
     }
 
     fn count_node_list<F: Fn(&Node) -> bool>(&self, callback: F) -> u32 {
@@ -3467,22 +3727,12 @@ impl Document {
         have_changed
     }
 
-    /// Runs the given closure using the Stylo `Device` suitable for media query evaluation.
-    ///
-    /// TODO: This can just become a getter when each Layout is more strongly associated with
-    /// its given Document and Window.
-    pub fn with_device<T>(&self, call: impl FnOnce(&Device) -> T) -> T {
-        self.window
-            .with_layout(move |layout| call(layout.device()))
-            .unwrap()
-    }
-
     pub fn salvageable(&self) -> bool {
         self.salvageable.get()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#appropriate-template-contents-owner-document>
-    pub fn appropriate_template_contents_owner_document(&self) -> DomRoot<Document> {
+    pub fn appropriate_template_contents_owner_document(&self, can_gc: CanGc) -> DomRoot<Document> {
         self.appropriate_template_contents_owner_document
             .or_init(|| {
                 let doctype = if self.is_html_document {
@@ -3504,7 +3754,9 @@ impl Document {
                     DocumentLoader::new(&self.loader()),
                     None,
                     None,
+                    None,
                     Default::default(),
+                    can_gc,
                 );
                 new_doc
                     .appropriate_template_contents_owner_document
@@ -3596,7 +3848,7 @@ impl Document {
         self.referrer_policy.get()
     }
 
-    pub fn set_target_element(&self, node: Option<&Element>) {
+    pub fn set_target_element(&self, node: Option<&Element>, can_gc: CanGc) {
         if let Some(ref element) = self.target_element.get() {
             element.set_target_state(false);
         }
@@ -3608,7 +3860,7 @@ impl Document {
         }
 
         self.window
-            .reflow(ReflowGoal::Full, ReflowReason::ElementStateChanged);
+            .reflow(ReflowGoal::Full, ReflowReason::ElementStateChanged, can_gc);
     }
 
     pub fn incr_ignore_destructive_writes_counter(&self) {
@@ -3642,10 +3894,10 @@ impl Document {
     }
 
     // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
-    pub fn enter_fullscreen(&self, pending: &Element) -> Rc<Promise> {
+    pub fn enter_fullscreen(&self, pending: &Element, can_gc: CanGc) -> Rc<Promise> {
         // Step 1
         let in_realm_proof = AlreadyInRealm::assert();
-        let promise = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof));
+        let promise = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc);
         let mut error = false;
 
         // Step 4
@@ -3709,11 +3961,11 @@ impl Document {
     }
 
     // https://fullscreen.spec.whatwg.org/#exit-fullscreen
-    pub fn exit_fullscreen(&self) -> Rc<Promise> {
+    pub fn exit_fullscreen(&self, can_gc: CanGc) -> Rc<Promise> {
         let global = self.global();
         // Step 1
         let in_realm_proof = AlreadyInRealm::assert();
-        let promise = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof));
+        let promise = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc);
         // Step 2
         if self.fullscreen_element.get().is_none() {
             promise.reject_error(Error::Type(String::from("fullscreen is null")));
@@ -3764,9 +4016,9 @@ impl Document {
                     true
                 } else {
                     // Step 3
-                    window.GetFrameElement().map_or(false, |el| {
-                        el.has_attribute(&local_name!("allowfullscreen"))
-                    })
+                    window
+                        .GetFrameElement()
+                        .is_some_and(|el| el.has_attribute(&local_name!("allowfullscreen")))
                 }
             },
         }
@@ -3840,12 +4092,10 @@ impl Document {
 
         let cloned_stylesheet = sheet.clone();
         let insertion_point2 = insertion_point.clone();
-        let _ = self.window.with_layout(move |layout| {
-            layout.add_stylesheet(
-                cloned_stylesheet,
-                insertion_point2.as_ref().map(|s| s.sheet.clone()),
-            );
-        });
+        self.window.layout_mut().add_stylesheet(
+            cloned_stylesheet,
+            insertion_point2.as_ref().map(|s| s.sheet.clone()),
+        );
 
         DocumentOrShadowRoot::add_stylesheet(
             owner,
@@ -3858,18 +4108,18 @@ impl Document {
 
     /// Given a stylesheet, load all web fonts from it in Layout.
     pub fn load_web_fonts_from_stylesheet(&self, stylesheet: Arc<Stylesheet>) {
-        let _ = self.window.with_layout(move |layout| {
-            layout.load_web_fonts_from_stylesheet(stylesheet);
-        });
+        self.window
+            .layout()
+            .load_web_fonts_from_stylesheet(stylesheet);
     }
 
     /// Remove a stylesheet owned by `owner` from the list of document sheets.
     #[allow(crown::unrooted_must_root)] // Owner needs to be rooted already necessarily.
     pub fn remove_stylesheet(&self, owner: &Element, stylesheet: &Arc<Stylesheet>) {
         let cloned_stylesheet = stylesheet.clone();
-        let _ = self
-            .window
-            .with_layout(|layout| layout.remove_stylesheet(cloned_stylesheet));
+        self.window
+            .layout_mut()
+            .remove_stylesheet(cloned_stylesheet);
 
         DocumentOrShadowRoot::remove_stylesheet(
             owner,
@@ -3964,6 +4214,49 @@ impl Document {
     pub(crate) fn set_declarative_refresh(&self, refresh: DeclarativeRefresh) {
         *self.declarative_refresh.borrow_mut() = Some(refresh);
     }
+
+    /// <https://html.spec.whatwg.org/multipage/#visibility-state>
+    fn update_visibility_state(&self, visibility_state: DocumentVisibilityState, can_gc: CanGc) {
+        // Step 1 If document's visibility state equals visibilityState, then return.
+        if self.visibility_state.get() == visibility_state {
+            return;
+        }
+        // Step 2 Set document's visibility state to visibilityState.
+        self.visibility_state.set(visibility_state);
+        // Step 3 Queue a new VisibilityStateEntry whose visibility state is visibilityState and whose timestamp is
+        // the current high resolution time given document's relevant global object.
+        let entry =
+            VisibilityStateEntry::new(&self.global(), visibility_state, CrossProcessInstant::now());
+        self.window
+            .Performance()
+            .queue_entry(entry.upcast::<PerformanceEntry>());
+
+        // Step 4 Run the screen orientation change steps with document.
+        // TODO ScreenOrientation hasn't implemented yet
+
+        // Step 5 Run the view transition page visibility change steps with document.
+        // TODO ViewTransition hasn't implemented yet
+
+        // Step 6 Run any page visibility change steps which may be defined in other specifications, with visibility
+        // state and document. Any other specs' visibility steps will go here.
+
+        // <https://www.w3.org/TR/gamepad/#handling-visibility-change>
+        if visibility_state == DocumentVisibilityState::Hidden {
+            self.window
+                .Navigator()
+                .GetGamepads()
+                .iter_mut()
+                .for_each(|gamepad| {
+                    if let Some(g) = gamepad {
+                        g.vibration_actuator().handle_visibility_change();
+                    }
+                });
+        }
+
+        // Step 7 Fire an event named visibilitychange at document, with its bubbles attribute initialized to true.
+        self.upcast::<EventTarget>()
+            .fire_bubbling_event(atom!("visibilitychange"), can_gc);
+    }
 }
 
 impl ProfilerMetadataFactory for Document {
@@ -3977,6 +4270,34 @@ impl ProfilerMetadataFactory for Document {
 }
 
 impl DocumentMethods for Document {
+    // https://dom.spec.whatwg.org/#dom-document-document
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<Document>> {
+        let doc = window.Document();
+        let docloader = DocumentLoader::new(&doc.loader());
+        Ok(Document::new_with_proto(
+            window,
+            proto,
+            HasBrowsingContext::No,
+            None,
+            doc.origin().clone(),
+            IsHTMLDocument::NonHTMLDocument,
+            None,
+            None,
+            DocumentActivity::Inactive,
+            DocumentSource::NotFromParser,
+            docloader,
+            None,
+            None,
+            None,
+            Default::default(),
+            can_gc,
+        ))
+    }
+
     // https://w3c.github.io/editing/ActiveDocuments/execCommand.html#querycommandsupported()
     fn QueryCommandSupported(&self, _command: DOMString) -> bool {
         false
@@ -4124,15 +4445,15 @@ impl DocumentMethods for Document {
     // https://dom.spec.whatwg.org/#dom-document-getelementsbytagname
     fn GetElementsByTagName(&self, qualified_name: DOMString) -> DomRoot<HTMLCollection> {
         let qualified_name = LocalName::from(&*qualified_name);
-        match self.tag_map.borrow_mut().entry(qualified_name.clone()) {
-            Occupied(entry) => DomRoot::from_ref(entry.get()),
-            Vacant(entry) => {
-                let result =
-                    HTMLCollection::by_qualified_name(&self.window, self.upcast(), qualified_name);
-                entry.insert(Dom::from_ref(&*result));
-                result
-            },
+        if let Some(entry) = self.tag_map.borrow_mut().get(&qualified_name) {
+            return DomRoot::from_ref(entry);
         }
+        let result =
+            HTMLCollection::by_qualified_name(&self.window, self.upcast(), qualified_name.clone());
+        self.tag_map
+            .borrow_mut()
+            .insert(qualified_name, Dom::from_ref(&*result));
+        result
     }
 
     // https://dom.spec.whatwg.org/#dom-document-getelementsbytagnamens
@@ -4178,8 +4499,9 @@ impl DocumentMethods for Document {
         &self,
         mut local_name: DOMString,
         options: StringOrElementCreationOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<Element>> {
-        if xml_name_type(&local_name) == InvalidXMLName {
+        if xml_name_type(&local_name) == Invalid {
             debug!("Not a valid element name");
             return Err(Error::InvalidCharacter);
         }
@@ -4211,6 +4533,7 @@ impl DocumentMethods for Document {
             ElementCreator::ScriptCreated,
             CustomElementCreationMode::Synchronous,
             None,
+            can_gc,
         ))
     }
 
@@ -4220,6 +4543,7 @@ impl DocumentMethods for Document {
         namespace: Option<DOMString>,
         qualified_name: DOMString,
         options: StringOrElementCreationOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<Element>> {
         let (namespace, prefix, local_name) = validate_and_extract(namespace, &qualified_name)?;
         let name = QualName::new(prefix, namespace, local_name);
@@ -4236,12 +4560,13 @@ impl DocumentMethods for Document {
             ElementCreator::ScriptCreated,
             CustomElementCreationMode::Synchronous,
             None,
+            can_gc,
         ))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattribute
     fn CreateAttribute(&self, mut local_name: DOMString) -> Fallible<DomRoot<Attr>> {
-        if xml_name_type(&local_name) == InvalidXMLName {
+        if xml_name_type(&local_name) == Invalid {
             debug!("Not a valid element name");
             return Err(Error::InvalidCharacter);
         }
@@ -4320,7 +4645,7 @@ impl DocumentMethods for Document {
         data: DOMString,
     ) -> Fallible<DomRoot<ProcessingInstruction>> {
         // Step 1.
-        if xml_name_type(&target) == InvalidXMLName {
+        if xml_name_type(&target) == Invalid {
             return Err(Error::InvalidCharacter);
         }
 
@@ -4334,7 +4659,7 @@ impl DocumentMethods for Document {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-importnode
-    fn ImportNode(&self, node: &Node, deep: bool) -> Fallible<DomRoot<Node>> {
+    fn ImportNode(&self, node: &Node, deep: bool, can_gc: CanGc) -> Fallible<DomRoot<Node>> {
         // Step 1.
         if node.is::<Document>() || node.is::<ShadowRoot>() {
             return Err(Error::NotSupported);
@@ -4347,7 +4672,7 @@ impl DocumentMethods for Document {
             CloneChildrenFlag::DoNotCloneChildren
         };
 
-        Ok(Node::clone(node, Some(self), clone_children))
+        Ok(Node::clone(node, Some(self), clone_children, can_gc))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-adoptnode
@@ -4370,7 +4695,7 @@ impl DocumentMethods for Document {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createevent
-    fn CreateEvent(&self, mut interface: DOMString) -> Fallible<DomRoot<Event>> {
+    fn CreateEvent(&self, mut interface: DOMString, can_gc: CanGc) -> Fallible<DomRoot<Event>> {
         interface.make_ascii_lowercase();
         match &*interface {
             "beforeunloadevent" => Ok(DomRoot::upcast(BeforeUnloadEvent::new_uninitialized(
@@ -4381,28 +4706,37 @@ impl DocumentMethods for Document {
             )),
             "customevent" => Ok(DomRoot::upcast(CustomEvent::new_uninitialized(
                 self.window.upcast(),
+                can_gc,
             ))),
             // FIXME(#25136): devicemotionevent, deviceorientationevent
             // FIXME(#7529): dragevent
             "events" | "event" | "htmlevents" | "svgevents" => {
-                Ok(Event::new_uninitialized(self.window.upcast()))
+                Ok(Event::new_uninitialized(self.window.upcast(), can_gc))
             },
-            "focusevent" => Ok(DomRoot::upcast(FocusEvent::new_uninitialized(&self.window))),
+            "focusevent" => Ok(DomRoot::upcast(FocusEvent::new_uninitialized(
+                &self.window,
+                can_gc,
+            ))),
             "hashchangeevent" => Ok(DomRoot::upcast(HashChangeEvent::new_uninitialized(
                 &self.window,
+                can_gc,
             ))),
             "keyboardevent" => Ok(DomRoot::upcast(KeyboardEvent::new_uninitialized(
                 &self.window,
+                can_gc,
             ))),
             "messageevent" => Ok(DomRoot::upcast(MessageEvent::new_uninitialized(
                 self.window.upcast(),
+                can_gc,
             ))),
-            "mouseevent" | "mouseevents" => {
-                Ok(DomRoot::upcast(MouseEvent::new_uninitialized(&self.window)))
-            },
+            "mouseevent" | "mouseevents" => Ok(DomRoot::upcast(MouseEvent::new_uninitialized(
+                &self.window,
+                can_gc,
+            ))),
             "storageevent" => Ok(DomRoot::upcast(StorageEvent::new_uninitialized(
                 &self.window,
                 "".into(),
+                can_gc,
             ))),
             "touchevent" => Ok(DomRoot::upcast(TouchEvent::new_uninitialized(
                 &self.window,
@@ -4410,27 +4744,29 @@ impl DocumentMethods for Document {
                 &TouchList::new(&self.window, &[]),
                 &TouchList::new(&self.window, &[]),
             ))),
-            "uievent" | "uievents" => Ok(DomRoot::upcast(UIEvent::new_uninitialized(&self.window))),
+            "uievent" | "uievents" => Ok(DomRoot::upcast(UIEvent::new_uninitialized(
+                &self.window,
+                can_gc,
+            ))),
             _ => Err(Error::NotSupported),
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-lastmodified
     fn LastModified(&self) -> DOMString {
-        match self.last_modified {
-            Some(ref t) => DOMString::from(t.clone()),
-            None => DOMString::from(
-                time::now()
-                    .strftime("%m/%d/%Y %H:%M:%S")
-                    .unwrap()
-                    .to_string(),
-            ),
-        }
+        DOMString::from(self.last_modified.as_ref().cloned().unwrap_or_else(|| {
+            // Ideally this would get the local time using `time`, but `time` always fails to get the local
+            // timezone on Unix unless the application is single threaded unless the library is explicitly
+            // set to "unsound" mode. Maybe that's fine, but it needs more investigation. see
+            // https://nvd.nist.gov/vuln/detail/CVE-2020-26235
+            // When `time` supports a thread-safe way of getting the local time zone we could use it here.
+            Local::now().format("%m/%d/%Y %H:%M:%S").to_string()
+        }))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createrange
-    fn CreateRange(&self) -> DomRoot<Range> {
-        Range::new_with_doc(self, None)
+    fn CreateRange(&self, can_gc: CanGc) -> DomRoot<Range> {
+        Range::new_with_doc(self, None, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createnodeiteratorroot-whattoshow-filter
@@ -4455,35 +4791,11 @@ impl DocumentMethods for Document {
 
     // https://html.spec.whatwg.org/multipage/#document.title
     fn Title(&self) -> DOMString {
-        let title = self.GetDocumentElement().and_then(|root| {
-            if root.namespace() == &ns!(svg) && root.local_name() == &local_name!("svg") {
-                // Step 1.
-                root.upcast::<Node>()
-                    .child_elements()
-                    .find(|node| {
-                        node.namespace() == &ns!(svg) && node.local_name() == &local_name!("title")
-                    })
-                    .map(DomRoot::upcast::<Node>)
-            } else {
-                // Step 2.
-                root.upcast::<Node>()
-                    .traverse_preorder(ShadowIncluding::No)
-                    .find(|node| node.is::<HTMLTitleElement>())
-            }
-        });
-
-        match title {
-            None => DOMString::new(),
-            Some(ref title) => {
-                // Steps 3-4.
-                let value = title.child_text_content();
-                DOMString::from(str_join(split_html_space_chars(&value), " "))
-            },
-        }
+        self.title().unwrap_or_else(|| DOMString::from(""))
     }
 
     // https://html.spec.whatwg.org/multipage/#document.title
-    fn SetTitle(&self, title: DOMString) {
+    fn SetTitle(&self, title: DOMString, can_gc: CanGc) {
         let root = match self.GetDocumentElement() {
             Some(root) => root,
             None => return,
@@ -4504,6 +4816,7 @@ impl DocumentMethods for Document {
                         ElementCreator::ScriptCreated,
                         CustomElementCreationMode::Synchronous,
                         None,
+                        can_gc,
                     );
                     let parent = root.upcast::<Node>();
                     let child = elem.upcast::<Node>();
@@ -4529,6 +4842,7 @@ impl DocumentMethods for Document {
                             ElementCreator::ScriptCreated,
                             CustomElementCreationMode::Synchronous,
                             None,
+                            can_gc,
                         );
                         head.upcast::<Node>().AppendChild(elem.upcast()).unwrap()
                     },
@@ -4871,7 +5185,7 @@ impl DocumentMethods for Document {
                     HTMLElementTypeId::HTMLFormElement | HTMLElementTypeId::HTMLIFrameElement => {
                         elem.get_name().as_ref() == Some(&self.name)
                     },
-                    HTMLElementTypeId::HTMLImageElement => elem.get_name().map_or(false, |name| {
+                    HTMLElementTypeId::HTMLImageElement => elem.get_name().is_some_and(|name| {
                         name == *self.name ||
                             !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
                     }),
@@ -4975,22 +5289,34 @@ impl DocumentMethods for Document {
     );
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
-    fn ElementFromPoint(&self, x: Finite<f64>, y: Finite<f64>) -> Option<DomRoot<Element>> {
+    fn ElementFromPoint(
+        &self,
+        x: Finite<f64>,
+        y: Finite<f64>,
+        can_gc: CanGc,
+    ) -> Option<DomRoot<Element>> {
         self.document_or_shadow_root.element_from_point(
             x,
             y,
             self.GetDocumentElement(),
             self.has_browsing_context,
+            can_gc,
         )
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint
-    fn ElementsFromPoint(&self, x: Finite<f64>, y: Finite<f64>) -> Vec<DomRoot<Element>> {
+    fn ElementsFromPoint(
+        &self,
+        x: Finite<f64>,
+        y: Finite<f64>,
+        can_gc: CanGc,
+    ) -> Vec<DomRoot<Element>> {
         self.document_or_shadow_root.elements_from_point(
             x,
             y,
             self.GetDocumentElement(),
             self.has_browsing_context,
+            can_gc,
         )
     }
 
@@ -4999,6 +5325,7 @@ impl DocumentMethods for Document {
         &self,
         _unused1: Option<DOMString>,
         _unused2: Option<DOMString>,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<Document>> {
         // Step 1
         if !self.is_html_document() {
@@ -5024,7 +5351,7 @@ impl DocumentMethods for Document {
         // Step 5
         if self
             .get_current_parser()
-            .map_or(false, |parser| parser.is_active())
+            .is_some_and(|parser| parser.is_active())
         {
             return Ok(DomRoot::from_ref(self));
         }
@@ -5049,7 +5376,7 @@ impl DocumentMethods for Document {
         if self.has_browsing_context() {
             // spec says "stop document loading",
             // which is a process that does more than just abort
-            self.abort();
+            self.abort(can_gc);
         }
 
         // Step 9
@@ -5116,14 +5443,15 @@ impl DocumentMethods for Document {
         url: USVString,
         target: DOMString,
         features: DOMString,
+        can_gc: CanGc,
     ) -> Fallible<Option<DomRoot<WindowProxy>>> {
         self.browsing_context()
             .ok_or(Error::InvalidAccess)?
-            .open(url, target, features)
+            .open(url, target, features, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-write
-    fn Write(&self, text: Vec<DOMString>) -> ErrorResult {
+    fn Write(&self, text: Vec<DOMString>, can_gc: CanGc) -> ErrorResult {
         if !self.is_html_document() {
             // Step 1.
             return Err(Error::InvalidState);
@@ -5152,7 +5480,7 @@ impl DocumentMethods for Document {
                     return Ok(());
                 }
                 // Step 5.
-                self.Open(None, None)?;
+                self.Open(None, None, can_gc)?;
                 self.get_current_parser().unwrap()
             },
         };
@@ -5161,20 +5489,20 @@ impl DocumentMethods for Document {
         // TODO: handle reload override buffer.
 
         // Steps 6-8.
-        parser.write(text);
+        parser.write(text, can_gc);
 
         // Step 9.
         Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-writeln
-    fn Writeln(&self, mut text: Vec<DOMString>) -> ErrorResult {
+    fn Writeln(&self, mut text: Vec<DOMString>, can_gc: CanGc) -> ErrorResult {
         text.push("\n".into());
-        self.Write(text)
+        self.Write(text, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-close
-    fn Close(&self) -> ErrorResult {
+    fn Close(&self, can_gc: CanGc) -> ErrorResult {
         if !self.is_html_document() {
             // Step 1.
             return Err(Error::InvalidState);
@@ -5194,7 +5522,7 @@ impl DocumentMethods for Document {
         };
 
         // Step 4-6.
-        parser.close();
+        parser.close(can_gc);
 
         Ok(())
     }
@@ -5229,8 +5557,8 @@ impl DocumentMethods for Document {
     }
 
     // https://fullscreen.spec.whatwg.org/#dom-document-exitfullscreen
-    fn ExitFullscreen(&self) -> Rc<Promise> {
-        self.exit_fullscreen()
+    fn ExitFullscreen(&self, can_gc: CanGc) -> Rc<Promise> {
+        self.exit_fullscreen(can_gc)
     }
 
     // check-tidy: no specs after this line
@@ -5251,13 +5579,27 @@ impl DocumentMethods for Document {
             None
         }
     }
+
+    // https://drafts.csswg.org/css-font-loading/#font-face-source
+    fn Fonts(&self, can_gc: CanGc) -> DomRoot<FontFaceSet> {
+        self.fonts
+            .or_init(|| FontFaceSet::new(&self.global(), None, can_gc))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-hidden>
+    fn Hidden(&self) -> bool {
+        self.visibility_state.get() == DocumentVisibilityState::Hidden
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-visibilitystate>
+    fn VisibilityState(&self) -> DocumentVisibilityState {
+        self.visibility_state.get()
+    }
 }
 
-fn update_with_current_time_ms(marker: &Cell<u64>) {
-    if marker.get() == 0 {
-        let time = time::get_time();
-        let current_time_ms = time.sec * 1000 + time.nsec as i64 / 1000000;
-        marker.set(current_time_ms as u64);
+fn update_with_current_instant(marker: &Cell<Option<CrossProcessInstant>>) {
+    if marker.get().is_none() {
+        marker.set(Some(CrossProcessInstant::now()))
     }
 }
 
@@ -5304,9 +5646,9 @@ pub struct FakeRequestAnimationFrameCallback {
 }
 
 impl FakeRequestAnimationFrameCallback {
-    pub fn invoke(self) {
+    pub fn invoke(self, can_gc: CanGc) {
         let document = self.document.root();
-        document.run_the_animation_frame_callbacks();
+        document.run_the_animation_frame_callbacks(can_gc);
     }
 }
 
@@ -5443,5 +5785,5 @@ fn is_named_element_with_id_attribute(elem: &Element) -> bool {
     // TODO handle <embed> and <object>; these depend on whether the element is
     // “exposed”, a concept that doesn’t fully make sense until embed/object
     // behaviour is actually implemented
-    elem.is::<HTMLImageElement>() && elem.get_name().map_or(false, |name| !name.is_empty())
+    elem.is::<HTMLImageElement>() && elem.get_name().is_some_and(|name| !name.is_empty())
 }

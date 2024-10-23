@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::os::raw;
 use std::ptr;
 
+use base::id::{BlobId, MessagePortId};
 use js::glue::{
     CopyJSStructuredCloneData, DeleteJSAutoStructuredCloneBuffer, GetLengthOfJSStructuredCloneData,
     NewJSAutoStructuredCloneBuffer, WriteBytesToJSStructuredCloneData,
@@ -22,7 +23,6 @@ use js::jsapi::{
 use js::jsval::UndefinedValue;
 use js::rust::wrappers::{JS_ReadStructuredClone, JS_WriteStructuredClone};
 use js::rust::{CustomAutoRooterGuard, HandleValue, MutableHandleValue};
-use msg::constellation_msg::{BlobId, MessagePortId};
 use script_traits::serializable::BlobImpl;
 use script_traits::transferable::MessagePortImpl;
 use script_traits::StructuredSerializedData;
@@ -37,18 +37,19 @@ use crate::dom::blob::Blob;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageport::MessagePort;
 use crate::realms::{enter_realm, AlreadyInRealm, InRealm};
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 // TODO: Should we add Min and Max const to https://github.com/servo/rust-mozjs/blob/master/src/consts.rs?
 // TODO: Determine for sure which value Min and Max should have.
 // NOTE: Current values found at https://dxr.mozilla.org/mozilla-central/
 // rev/ff04d410e74b69acfab17ef7e73e7397602d5a68/js/public/StructuredClone.h#323
 #[repr(u32)]
-enum StructuredCloneTags {
+pub(super) enum StructuredCloneTags {
     /// To support additional types, add new tags with values incremented from the last one before Max.
     Min = 0xFFFF8000,
     DomBlob = 0xFFFF8001,
     MessagePort = 0xFFFF8002,
+    Principals = 0xFFFF8003,
     Max = 0xFFFFFFFF,
 }
 
@@ -56,6 +57,7 @@ unsafe fn read_blob(
     owner: &GlobalScope,
     r: *mut JSStructuredCloneReader,
     sc_holder: &mut StructuredDataHolder,
+    can_gc: CanGc,
 ) -> *mut JSObject {
     let mut name_space: u32 = 0;
     let mut index: u32 = 0;
@@ -65,7 +67,7 @@ unsafe fn read_blob(
         &mut index as *mut u32
     ));
     let storage_key = StorageKey { index, name_space };
-    if <Blob as Serializable>::deserialize(owner, sc_holder, storage_key).is_ok() {
+    if <Blob as Serializable>::deserialize(owner, sc_holder, storage_key, can_gc).is_ok() {
         let blobs = match sc_holder {
             StructuredDataHolder::Read { blobs, .. } => blobs,
             _ => panic!("Unexpected variant of StructuredDataHolder"),
@@ -132,6 +134,7 @@ unsafe extern "C" fn read_callback(
             &GlobalScope::from_context(cx, InRealm::Already(&in_realm_proof)),
             r,
             &mut *(closure as *mut StructuredDataHolder),
+            CanGc::note(),
         );
     }
     ptr::null_mut()
@@ -159,6 +162,7 @@ unsafe extern "C" fn write_callback(
 unsafe extern "C" fn read_transfer_callback(
     cx: *mut JSContext,
     _r: *mut JSStructuredCloneReader,
+    _policy: *const CloneDataPolicy,
     tag: u32,
     _content: *mut raw::c_void,
     extra_data: u64,

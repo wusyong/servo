@@ -17,7 +17,11 @@ WorkerGlobalScope includes GlobalCrypto;
 
 [Exposed=(Window,Worker)]
 interface Crypto {
-  //readonly attribute SubtleCrypto subtle;
+  [SecureContext] readonly attribute SubtleCrypto subtle;
   [Throws]
   ArrayBufferView getRandomValues(ArrayBufferView array);
+
+  [SecureContext]
+  // UTF8String is not observably different from USVString
+  USVString randomUUID();
 };

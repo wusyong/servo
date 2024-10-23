@@ -18,6 +18,7 @@ use crate::dom::event::Event;
 use crate::dom::gamepad::Gamepad;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct GamepadEvent {
@@ -44,8 +45,9 @@ impl GamepadEvent {
         bubbles: bool,
         cancelable: bool,
         gamepad: &Gamepad,
+        can_gc: CanGc,
     ) -> DomRoot<GamepadEvent> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable, gamepad)
+        Self::new_with_proto(global, None, type_, bubbles, cancelable, gamepad, can_gc)
     }
 
     fn new_with_proto(
@@ -55,11 +57,13 @@ impl GamepadEvent {
         bubbles: bool,
         cancelable: bool,
         gamepad: &Gamepad,
+        can_gc: CanGc,
     ) -> DomRoot<GamepadEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(GamepadEvent::new_inherited(gamepad)),
             global,
             proto,
+            can_gc,
         );
         {
             let event = ev.upcast::<Event>();
@@ -72,20 +76,23 @@ impl GamepadEvent {
         global: &GlobalScope,
         event_type: GamepadEventType,
         gamepad: &Gamepad,
+        can_gc: CanGc,
     ) -> DomRoot<GamepadEvent> {
         let name = match event_type {
             GamepadEventType::Connected => "gamepadconnected",
             GamepadEventType::Disconnected => "gamepaddisconnected",
         };
 
-        GamepadEvent::new(global, name.into(), false, false, gamepad)
+        GamepadEvent::new(global, name.into(), false, false, gamepad, can_gc)
     }
+}
 
+impl GamepadEventMethods for GamepadEvent {
     // https://w3c.github.io/gamepad/#gamepadevent-interface
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &GamepadEventBinding::GamepadEventInit,
     ) -> Fallible<DomRoot<GamepadEvent>> {
@@ -96,11 +103,10 @@ impl GamepadEvent {
             init.parent.bubbles,
             init.parent.cancelable,
             &init.gamepad,
+            can_gc,
         ))
     }
-}
 
-impl GamepadEventMethods for GamepadEvent {
     // https://w3c.github.io/gamepad/#gamepadevent-interface
     fn Gamepad(&self) -> DomRoot<Gamepad> {
         DomRoot::from_ref(&*self.gamepad)

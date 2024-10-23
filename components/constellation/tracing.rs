@@ -181,9 +181,6 @@ mod from_script {
                 Self::PipelineExited => target!("PipelineExited"),
                 Self::ForwardDOMMessage(..) => target!("ForwardDOMMessage"),
                 Self::ScheduleJob(..) => target!("ScheduleJob"),
-                Self::GetClientWindow(..) => target!("GetClientWindow"),
-                Self::GetScreenSize(..) => target!("GetScreenSize"),
-                Self::GetScreenAvailSize(..) => target!("GetScreenAvailSize"),
                 Self::MediaSessionEvent(..) => target!("MediaSessionEvent"),
                 Self::RequestAdapter(..) => target!("RequestAdapter"),
                 Self::GetWebGPUChan(..) => target!("GetWebGPUChan"),
@@ -237,6 +234,8 @@ mod from_script {
                 Self::OnDevtoolsStarted(..) => target_variant!("OnDevtoolsStarted"),
                 Self::ReadyToPresent(..) => target_variant!("ReadyToPresent"),
                 Self::EventDelivered(..) => target_variant!("EventDelivered"),
+                Self::PlayGamepadHapticEffect(..) => target_variant!("PlayGamepadHapticEffect"),
+                Self::StopGamepadHapticEffect(..) => target_variant!("StopGamepadHapticEffect"),
             }
         }
     }

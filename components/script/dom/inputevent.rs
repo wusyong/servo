@@ -13,6 +13,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::uievent::UIEvent;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct InputEvent {
@@ -33,6 +34,7 @@ impl InputEvent {
         detail: i32,
         data: Option<DOMString>,
         is_composing: bool,
+        can_gc: CanGc,
     ) -> DomRoot<InputEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(InputEvent {
@@ -42,16 +44,20 @@ impl InputEvent {
             }),
             window,
             proto,
+            can_gc,
         );
         ev.uievent
             .InitUIEvent(type_, can_bubble, cancelable, view, detail);
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl InputEventMethods for InputEvent {
+    // https://w3c.github.io/uievents/#dom-inputevent-inputevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &InputEventBinding::InputEventInit,
     ) -> Fallible<DomRoot<InputEvent>> {
@@ -65,12 +71,11 @@ impl InputEvent {
             init.parent.detail,
             init.data.clone(),
             init.isComposing,
+            can_gc,
         );
         Ok(event)
     }
-}
 
-impl InputEventMethods for InputEvent {
     // https://w3c.github.io/uievents/#dom-inputevent-data
     fn GetData(&self) -> Option<DOMString> {
         self.data.clone()

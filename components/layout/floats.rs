@@ -10,7 +10,6 @@ use log::debug;
 use serde::Serialize;
 use style::computed_values::float::T as StyleFloat;
 use style::logical_geometry::{LogicalRect, LogicalSize, WritingMode};
-use style::values::computed::Size;
 
 use crate::block::FormattingContextType;
 use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
@@ -163,9 +162,7 @@ impl Floats {
 
     /// Adjusts the recorded offset of the flow relative to the first float.
     pub fn translate(&mut self, delta: LogicalSize<Au>) {
-        // TODO(servo#30577) revert once underlying bug is fixed
-        // self.offset = self.offset + delta
-        self.offset = self.offset.add_or_warn(delta)
+        self.offset = self.offset + delta
     }
 
     /// Returns the position of the last float in flow coordinates.
@@ -553,12 +550,8 @@ impl SpeculatedFloatPlacement {
             // traversal logic will know that objects later in the document
             // might flow around this float.
             let inline_size = flow.as_block().fragment.style.content_inline_size();
-            let fixed = match inline_size {
-                Size::Auto => false,
-                Size::LengthPercentage(ref lp) => {
-                    lp.0.is_definitely_zero() || lp.0.maybe_to_used_value(None).is_some()
-                },
-            };
+            let fixed =
+                inline_size.is_definitely_zero() || inline_size.maybe_to_used_value(None).is_some();
             if !fixed {
                 float_inline_size = Au::from_px(1)
             }

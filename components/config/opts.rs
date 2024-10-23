@@ -10,12 +10,11 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{LazyLock, RwLock, RwLockReadGuard};
 use std::{env, process};
 
 use euclid::Size2D;
 use getopts::{Matches, Options};
-use lazy_static::lazy_static;
 use log::error;
 use serde::{Deserialize, Serialize};
 use servo_geometry::DeviceIndependentPixel;
@@ -129,9 +128,6 @@ pub struct Opts {
 
     /// Print Progressive Web Metrics to console.
     pub print_pwm: bool,
-
-    /// True to enable minibrowser
-    pub minibrowser: bool,
 }
 
 fn print_usage(app: &str, opts: &Options) {
@@ -426,7 +422,6 @@ pub fn default_opts() -> Opts {
         unminify_js: false,
         local_script_source: None,
         print_pwm: false,
-        minibrowser: true,
     }
 }
 
@@ -565,7 +560,6 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
         "Directory root with unminified scripts",
         "",
     );
-    opts.optflag("", "no-minibrowser", "Open minibrowser");
 
     let opt_match = match opts.parse(args) {
         Ok(m) => m,
@@ -735,7 +729,6 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
     let legacy_layout = opt_match.opt_present("legacy-layout");
     if legacy_layout {
         set_pref!(layout.legacy_layout, true);
-        set_pref!(layout.flexbox.enabled, true);
     }
 
     let opts = Opts {
@@ -769,7 +762,6 @@ pub fn from_cmdline_args(mut opts: Options, args: &[String]) -> ArgumentParsingR
         unminify_js: opt_match.opt_present("unminify-js"),
         local_script_source: opt_match.opt_str("local-script-source"),
         print_pwm: opt_match.opt_present("print-pwm"),
-        minibrowser: !opt_match.opt_present("no-minibrowser"),
     };
 
     set_options(opts);
@@ -789,9 +781,7 @@ pub enum ArgumentParsingResult {
 // Make Opts available globally. This saves having to clone and pass
 // opts everywhere it is used, which gets particularly cumbersome
 // when passing through the DOM structures.
-lazy_static! {
-    static ref OPTIONS: RwLock<Opts> = RwLock::new(default_opts());
-}
+static OPTIONS: LazyLock<RwLock<Opts>> = LazyLock::new(|| RwLock::new(default_opts()));
 
 pub fn set_options(opts: Opts) {
     MULTIPROCESS.store(opts.multiprocess, Ordering::SeqCst);

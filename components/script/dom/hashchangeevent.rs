@@ -16,6 +16,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::event::Event;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#hashchangeevent
 #[dom_struct]
@@ -34,18 +35,20 @@ impl HashChangeEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<HashChangeEvent> {
-        Self::new_uninitialized_with_proto(window, None)
+    pub fn new_uninitialized(window: &Window, can_gc: CanGc) -> DomRoot<HashChangeEvent> {
+        Self::new_uninitialized_with_proto(window, None, can_gc)
     }
 
     fn new_uninitialized_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HashChangeEvent> {
         reflect_dom_object_with_proto(
             Box::new(HashChangeEvent::new_inherited(String::new(), String::new())),
             window,
             proto,
+            can_gc,
         )
     }
 
@@ -56,10 +59,14 @@ impl HashChangeEvent {
         cancelable: bool,
         old_url: String,
         new_url: String,
+        can_gc: CanGc,
     ) -> DomRoot<HashChangeEvent> {
-        Self::new_with_proto(window, None, type_, bubbles, cancelable, old_url, new_url)
+        Self::new_with_proto(
+            window, None, type_, bubbles, cancelable, old_url, new_url, can_gc,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
@@ -68,11 +75,13 @@ impl HashChangeEvent {
         cancelable: bool,
         old_url: String,
         new_url: String,
+        can_gc: CanGc,
     ) -> DomRoot<HashChangeEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(HashChangeEvent::new_inherited(old_url, new_url)),
             window,
             proto,
+            can_gc,
         );
         {
             let event = ev.upcast::<Event>();
@@ -80,11 +89,14 @@ impl HashChangeEvent {
         }
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl HashChangeEventMethods for HashChangeEvent {
+    // https://html.spec.whatwg.org/multipage/#hashchangeevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &HashChangeEventBinding::HashChangeEventInit,
     ) -> Fallible<DomRoot<HashChangeEvent>> {
@@ -96,11 +108,10 @@ impl HashChangeEvent {
             init.parent.cancelable,
             init.oldURL.0.clone(),
             init.newURL.0.clone(),
+            can_gc,
         ))
     }
-}
 
-impl HashChangeEventMethods for HashChangeEvent {
     // https://html.spec.whatwg.org/multipage/#dom-hashchangeevent-oldurl
     fn OldURL(&self) -> USVString {
         USVString(self.old_url.clone())

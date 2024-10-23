@@ -21,6 +21,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::servoparser::ServoParser;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct DOMParser {
@@ -36,25 +37,32 @@ impl DOMParser {
         }
     }
 
-    fn new(window: &Window, proto: Option<HandleObject>) -> DomRoot<DOMParser> {
-        reflect_dom_object_with_proto(Box::new(DOMParser::new_inherited(window)), window, proto)
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<DOMParser>> {
-        Ok(DOMParser::new(window, proto))
+    fn new(window: &Window, proto: Option<HandleObject>, can_gc: CanGc) -> DomRoot<DOMParser> {
+        reflect_dom_object_with_proto(
+            Box::new(DOMParser::new_inherited(window)),
+            window,
+            proto,
+            can_gc,
+        )
     }
 }
 
 impl DOMParserMethods for DOMParser {
-    // https://w3c.github.io/DOM-Parsing/#the-domparser-interface
+    /// <https://html.spec.whatwg.org/multipage/#dom-domparser-constructor>
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<DOMParser>> {
+        Ok(DOMParser::new(window, proto, can_gc))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-domparser-parsefromstring>
     fn ParseFromString(
         &self,
         s: DOMString,
         ty: DOMParserBinding::SupportedType,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<Document>> {
         let url = self.window.get_url();
         let content_type = ty
@@ -78,9 +86,11 @@ impl DOMParserMethods for DOMParser {
                     loader,
                     None,
                     None,
+                    None,
                     Default::default(),
+                    can_gc,
                 );
-                ServoParser::parse_html_document(&document, Some(s), url);
+                ServoParser::parse_html_document(&document, Some(s), url, can_gc);
                 document.set_ready_state(DocumentReadyState::Complete);
                 Ok(document)
             },
@@ -98,9 +108,11 @@ impl DOMParserMethods for DOMParser {
                     loader,
                     None,
                     None,
+                    None,
                     Default::default(),
+                    can_gc,
                 );
-                ServoParser::parse_xml_document(&document, Some(s), url);
+                ServoParser::parse_xml_document(&document, Some(s), url, can_gc);
                 document.set_ready_state(DocumentReadyState::Complete);
                 Ok(document)
             },

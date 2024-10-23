@@ -7,6 +7,7 @@ use html5ever::{local_name, namespace_url, ns, LocalName, Prefix, QualName};
 use js::rust::HandleObject;
 
 use crate::dom::bindings::codegen::Bindings::ElementBinding::Element_Binding::ElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLAudioElementBinding::HTMLAudioElementMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
@@ -17,6 +18,7 @@ use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
 use crate::dom::htmlmediaelement::HTMLMediaElement;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLAudioElement {
@@ -49,12 +51,14 @@ impl HTMLAudioElement {
             proto,
         )
     }
+}
 
+impl HTMLAudioElementMethods for HTMLAudioElement {
     // https://html.spec.whatwg.org/multipage/#dom-audio
-    #[allow(non_snake_case)]
-    pub fn Audio(
+    fn Audio(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         src: Option<DOMString>,
     ) -> Fallible<DomRoot<HTMLAudioElement>> {
         let element = Element::create(
@@ -64,6 +68,7 @@ impl HTMLAudioElement {
             ElementCreator::ScriptCreated,
             CustomElementCreationMode::Synchronous,
             proto,
+            can_gc,
         );
 
         let audio = DomRoot::downcast::<HTMLAudioElement>(element).unwrap();
