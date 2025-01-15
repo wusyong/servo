@@ -5,10 +5,13 @@
 use std::default::Default;
 use std::sync::{Arc, Mutex};
 
-use canvas_traits::webgl::{webgl_channel, GlType, WebGLContextId, WebGLMsg, WebGLThreads};
+use canvas_traits::webgl::{
+    webgl_channel, GlType, WebGLContextId, WebGLMsg, WebGLMsgSender, WebGLReceiver, WebGLSender,
+    WebGLThreads,
+};
 use euclid::default::Size2D;
 use fnv::FnvHashMap;
-use log::debug;
+use log::{debug, warn};
 use surfman::chains::{SwapChainAPI, SwapChains, SwapChainsAPI};
 use surfman::{Device, SurfaceInfo, SurfaceTexture};
 use webrender::RenderApiSender;
@@ -63,7 +66,12 @@ impl WebGLComm {
             webxr_init,
         };
 
-        let external = WebGLExternalImages::new(surfman, webrender_swap_chains);
+        let (image_sender, image_receiver) = webgl_channel().unwrap();
+        let external = WebGLExternalImages {
+            webgl_sender: sender.clone(),
+            image_sender,
+            image_receiver,
+        };
 
         WebGLThread::run_on_own_thread(init);
 
@@ -76,64 +84,91 @@ impl WebGLComm {
     }
 }
 
+// /// Bridge between the webrender::ExternalImage callbacks and the WebGLThreads.
+// struct WebGLExternalImages {
+//     surfman: RenderingContext,
+//     swap_chains: SwapChains<WebGLContextId, Device>,
+//     locked_front_buffers: FnvHashMap<WebGLContextId, SurfaceTexture>,
+// }
+//
+// impl WebGLExternalImages {
+//     fn new(surfman: RenderingContext, swap_chains: SwapChains<WebGLContextId, Device>) -> Self {
+//         Self {
+//             surfman,
+//             swap_chains,
+//             locked_front_buffers: FnvHashMap::default(),
+//         }
+//     }
+//
+//     fn lock_swap_chain(&mut self, id: WebGLContextId) -> Option<(u32, Size2D<i32>)> {
+//         debug!("... locking chain {:?}", id);
+//         let front_buffer = self.swap_chains.get(id)?.take_surface()?;
+//
+//         let SurfaceInfo {
+//             id: front_buffer_id,
+//             size,
+//             ..
+//         } = self.surfman.surface_info(&front_buffer);
+//         debug!("... getting texture for surface {:?}", front_buffer_id);
+//         let front_buffer_texture = self.surfman.create_surface_texture(front_buffer).unwrap();
+//         let gl_texture = self.surfman.surface_texture_object(&front_buffer_texture);
+//
+//         self.locked_front_buffers.insert(id, front_buffer_texture);
+//
+//         Some((gl_texture, size))
+//     }
+//
+//     fn unlock_swap_chain(&mut self, id: WebGLContextId) -> Option<()> {
+//         let locked_front_buffer = self.locked_front_buffers.remove(&id)?;
+//         let locked_front_buffer = self
+//             .surfman
+//             .destroy_surface_texture(locked_front_buffer)
+//             .unwrap();
+//
+//         debug!("... unlocked chain {:?}", id);
+//         self.swap_chains
+//             .get(id)?
+//             .recycle_surface(locked_front_buffer);
+//         Some(())
+//     }
+// }
+//
+// impl WebrenderExternalImageApi for WebGLExternalImages {
+//     fn lock(&mut self, id: u64) -> (WebrenderImageSource, Size2D<i32>) {
+//         let id = WebGLContextId(id);
+//         let (texture_id, size) = self.lock_swap_chain(id).unwrap_or_default();
+//         (WebrenderImageSource::TextureHandle(texture_id), size)
+//     }
+//
+//     fn unlock(&mut self, id: u64) {
+//         let id = WebGLContextId(id);
+//         self.unlock_swap_chain(id);
+//     }
+// }
+
 /// Bridge between the webrender::ExternalImage callbacks and the WebGLThreads.
 struct WebGLExternalImages {
-    surfman: RenderingContext,
-    swap_chains: SwapChains<WebGLContextId, Device>,
-    locked_front_buffers: FnvHashMap<WebGLContextId, SurfaceTexture>,
-}
-
-impl WebGLExternalImages {
-    fn new(surfman: RenderingContext, swap_chains: SwapChains<WebGLContextId, Device>) -> Self {
-        Self {
-            surfman,
-            swap_chains,
-            locked_front_buffers: FnvHashMap::default(),
-        }
-    }
-
-    fn lock_swap_chain(&mut self, id: WebGLContextId) -> Option<(u32, Size2D<i32>)> {
-        debug!("... locking chain {:?}", id);
-        let front_buffer = self.swap_chains.get(id)?.take_surface()?;
-
-        let SurfaceInfo {
-            id: front_buffer_id,
-            size,
-            ..
-        } = self.surfman.surface_info(&front_buffer);
-        debug!("... getting texture for surface {:?}", front_buffer_id);
-        let front_buffer_texture = self.surfman.create_surface_texture(front_buffer).unwrap();
-        let gl_texture = self.surfman.surface_texture_object(&front_buffer_texture);
-
-        self.locked_front_buffers.insert(id, front_buffer_texture);
-
-        Some((gl_texture, size))
-    }
-
-    fn unlock_swap_chain(&mut self, id: WebGLContextId) -> Option<()> {
-        let locked_front_buffer = self.locked_front_buffers.remove(&id)?;
-        let locked_front_buffer = self
-            .surfman
-            .destroy_surface_texture(locked_front_buffer)
-            .unwrap();
-
-        debug!("... unlocked chain {:?}", id);
-        self.swap_chains
-            .get(id)?
-            .recycle_surface(locked_front_buffer);
-        Some(())
-    }
+    webgl_sender: WebGLSender<WebGLMsg>,
+    image_sender: WebGLSender<(u32, Size2D<i32>)>,
+    image_receiver: WebGLReceiver<(u32, Size2D<i32>)>,
 }
 
 impl WebrenderExternalImageApi for WebGLExternalImages {
     fn lock(&mut self, id: u64) -> (WebrenderImageSource, Size2D<i32>) {
-        let id = WebGLContextId(id);
-        let (texture_id, size) = self.lock_swap_chain(id).unwrap_or_default();
+        if let Err(e) = self
+            .webgl_sender
+            .send(WebGLMsg::LockTexture(id, self.image_sender.clone()))
+        {
+            warn!("Failed to send WebGLMsg::LockTexture ({e:?})");
+        }
+
+        let (texture_id, size) = self.image_receiver.recv().unwrap_or_default();
         (WebrenderImageSource::TextureHandle(texture_id), size)
     }
 
     fn unlock(&mut self, id: u64) {
-        let id = WebGLContextId(id);
-        self.unlock_swap_chain(id);
+        if let Err(e) = self.webgl_sender.send(WebGLMsg::UnlockTexture(id)) {
+            warn!("Failed to send WebGLMsg::UnlockTexture ({e:?})");
+        }
     }
 }
