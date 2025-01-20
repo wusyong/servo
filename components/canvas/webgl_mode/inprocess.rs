@@ -14,7 +14,7 @@ use surfman::{Device, SurfaceInfo, SurfaceTexture};
 use webrender::RenderApiSender;
 use webrender_api::DocumentId;
 use webrender_traits::{
-    RenderingContext, WebrenderExternalImageApi, WebrenderExternalImageRegistry,
+    SurfmanRenderingContext, WebrenderExternalImageApi, WebrenderExternalImageRegistry,
     WebrenderImageSource,
 };
 #[cfg(feature = "webxr")]
@@ -34,7 +34,7 @@ pub struct WebGLComm {
 impl WebGLComm {
     /// Creates a new `WebGLComm` object.
     pub fn new(
-        surfman: RenderingContext,
+        surfman: SurfmanRenderingContext,
         webrender_api_sender: RenderApiSender,
         webrender_doc: DocumentId,
         external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
@@ -78,13 +78,13 @@ impl WebGLComm {
 
 /// Bridge between the webrender::ExternalImage callbacks and the WebGLThreads.
 struct WebGLExternalImages {
-    surfman: RenderingContext,
+    surfman: SurfmanRenderingContext,
     swap_chains: SwapChains<WebGLContextId, Device>,
     locked_front_buffers: FnvHashMap<WebGLContextId, SurfaceTexture>,
 }
 
 impl WebGLExternalImages {
-    fn new(surfman: RenderingContext, swap_chains: SwapChains<WebGLContextId, Device>) -> Self {
+    fn new(surfman: SurfmanRenderingContext, swap_chains: SwapChains<WebGLContextId, Device>) -> Self {
         Self {
             surfman,
             swap_chains,

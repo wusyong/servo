@@ -16,10 +16,17 @@ use surfman::{
     SurfaceTexture, SurfaceType,
 };
 
+pub trait RenderingContext {
+    fn device(&self) -> NativeDevice;
+    fn context(&self) -> NativeContext;
+    fn resize(&self, size: Size2D<i32>) -> Result<(), Error>;
+    fn present(&self) -> Result<(), Error>;
+}
+
 /// A Servo rendering context, which holds all of the information needed
 /// to render Servo's layout, and bridges WebRender and surfman.
 #[derive(Clone)]
-pub struct RenderingContext(Rc<RenderingContextData>);
+pub struct SurfmanRenderingContext(Rc<RenderingContextData>);
 
 struct RenderingContextData {
     device: RefCell<Device>,
@@ -39,7 +46,7 @@ impl Drop for RenderingContextData {
     }
 }
 
-impl RenderingContext {
+impl SurfmanRenderingContext {
     pub fn create(
         connection: &Connection,
         adapter: &Adapter,
@@ -82,7 +89,7 @@ impl RenderingContext {
             context,
             swap_chain,
         };
-        Ok(RenderingContext(Rc::new(data)))
+        Ok(SurfmanRenderingContext(Rc::new(data)))
     }
 
     pub fn create_surface(

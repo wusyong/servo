@@ -50,7 +50,7 @@ use webrender_api::{
 };
 use webrender_traits::display_list::{HitTestInfo, ScrollTree};
 use webrender_traits::{
-    CompositorHitTestResult, CrossProcessCompositorMessage, ImageUpdate, RenderingContext,
+    CompositorHitTestResult, CrossProcessCompositorMessage, ImageUpdate, SurfmanRenderingContext,
     UntrustedNodeAddress,
 };
 
@@ -165,7 +165,7 @@ pub struct IOCompositor<Window: WindowMethods + ?Sized> {
     webrender_api: RenderApi,
 
     /// The surfman instance that webrender targets
-    rendering_context: RenderingContext,
+    rendering_context: SurfmanRenderingContext,
 
     /// The GL bindings for webrender
     webrender_gl: Rc<dyn gleam::gl::Gl>,

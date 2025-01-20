@@ -97,7 +97,7 @@ use webgpu::swapchain::WGPUImageMap;
 use webrender::{RenderApiSender, ShaderPrecacheFlags, UploadMethod, ONE_TIME_USAGE_HINT};
 use webrender_api::{ColorF, DocumentId, FramePublishId};
 use webrender_traits::{
-    CrossProcessCompositorApi, RenderingContext, WebrenderExternalImageHandlers,
+    CrossProcessCompositorApi, SurfmanRenderingContext, WebrenderExternalImageHandlers,
     WebrenderExternalImageRegistry, WebrenderImageHandlerType,
 };
 pub use {
@@ -236,7 +236,7 @@ where
     pub fn new(
         opts: Opts,
         preferences: Preferences,
-        rendering_context: RenderingContext,
+        rendering_context: SurfmanRenderingContext,
         mut embedder: Box<dyn EmbedderMethods>,
         window: Rc<Window>,
         user_agent: Option<String>,
@@ -539,7 +539,7 @@ where
 
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn get_native_media_display_and_gl_context(
-        rendering_context: &RenderingContext,
+        rendering_context: &SurfmanRenderingContext,
     ) -> Option<(NativeDisplay, GlContext)> {
         let gl_context = match rendering_context.native_context() {
             NativeContext::Default(LinuxNativeContext::Default(native_context)) => {
@@ -566,7 +566,7 @@ where
     // @TODO(victor): https://github.com/servo/media/pull/315
     #[cfg(target_os = "windows")]
     fn get_native_media_display_and_gl_context(
-        rendering_context: &RenderingContext,
+        rendering_context: &SurfmanRenderingContext,
     ) -> Option<(NativeDisplay, GlContext)> {
         #[cfg(feature = "no-wgl")]
         {
@@ -585,7 +585,7 @@ where
         all(target_os = "linux", not(target_env = "ohos"))
     )))]
     fn get_native_media_display_and_gl_context(
-        _rendering_context: &RenderingContext,
+        _rendering_context: &SurfmanRenderingContext,
     ) -> Option<(NativeDisplay, GlContext)> {
         None
     }
@@ -593,7 +593,7 @@ where
     fn create_media_window_gl_context(
         external_image_handlers: &mut WebrenderExternalImageHandlers,
         external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
-        rendering_context: &RenderingContext,
+        rendering_context: &SurfmanRenderingContext,
     ) -> (WindowGLContext, Option<GLPlayerThreads>) {
         if !pref!(media_glvideo_enabled) {
             return (
