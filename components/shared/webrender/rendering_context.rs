@@ -11,13 +11,24 @@ use std::rc::Rc;
 use euclid::default::Size2D;
 use gleam::gl;
 use log::{debug, warn};
+use servo_media::player::context::{GlContext, NativeDisplay};
 use surfman::chains::{PreserveBuffer, SwapChain};
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+use surfman::platform::generic::multi::connection::NativeConnection as LinuxNativeConnection;
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+use surfman::platform::generic::multi::context::NativeContext as LinuxNativeContext;
 pub use surfman::Error;
 use surfman::{
     Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device, GLApi,
-    GLVersion, NativeContext, NativeDevice, NativeWidget, Surface, SurfaceAccess, SurfaceInfo,
-    SurfaceTexture, SurfaceType,
+    NativeContext, NativeDevice, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture,
+    SurfaceType,
 };
+
+/// Describes the OpenGL version that is requested when a context is created.
+pub enum GLVersion {
+    GL(u8, u8),
+    GLES(u8, u8),
+}
 
 /// The `RenderingContext` trait defines a set of methods for managing
 /// an OpenGL or GLES rendering context.
@@ -25,10 +36,6 @@ use surfman::{
 /// management, and destruction of the rendering context and its associated
 /// resources.
 pub trait RenderingContext {
-    /// Returns the native OpenGL or GLES device handle
-    fn device(&self) -> NativeDevice;
-    /// Returns the native OpenGL or GLES context handle.
-    fn context(&self) -> NativeContext;
     /// Resizes the rendering surface to the given size.
     fn resize(&self, size: Size2D<i32>);
     /// Presents the rendered frame to the screen.
@@ -48,6 +55,10 @@ pub trait RenderingContext {
     fn gl_api(&self) -> Rc<dyn gleam::gl::Gl>;
     /// Describes the OpenGL version that is requested when a context is created.
     fn gl_version(&self) -> GLVersion;
+    /// Returns the GL Context used by servo media player.
+    fn gl_context(&self) -> GlContext;
+    /// Returns the GL Display used by servo media player.
+    fn gl_display(&self) -> NativeDisplay;
     /// Creates a texture from a given surface and returns the surface texture,
     /// the OpenGL texture object, and the size of the surface.
     fn create_texture(&self, surface: Surface) -> (SurfaceTexture, u32, Size2D<i32>);
@@ -85,11 +96,65 @@ impl Drop for RenderingContextData {
 }
 
 impl RenderingContext for SurfmanRenderingContext {
-    fn device(&self) -> NativeDevice {
-        self.native_device()
+    fn gl_context(&self) -> GlContext {
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            match self.native_context() {
+                NativeContext::Default(LinuxNativeContext::Default(native_context)) => {
+                    GlContext::Egl(native_context.egl_context as usize)
+                },
+                NativeContext::Default(LinuxNativeContext::Alternate(native_context)) => {
+                    GlContext::Egl(native_context.egl_context as usize)
+                },
+                NativeContext::Alternate(_) => GlContext::Unknown,
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            #[cfg(feature = "no-wgl")]
+            {
+                GlContext::Egl(self.native_context().egl_context as usize)
+            }
+            #[cfg(not(feature = "no-wgl"))]
+            GlContext::Unknown
+        }
+        #[cfg(not(any(
+            target_os = "windows",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
+        {
+            GlContext::Unknown
+        }
     }
-    fn context(&self) -> NativeContext {
-        self.native_context()
+    fn gl_display(&self) -> NativeDisplay {
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            match self.connection().native_connection() {
+                NativeConnection::Default(LinuxNativeConnection::Default(connection)) => {
+                    NativeDisplay::Egl(connection.0 as usize)
+                },
+                NativeConnection::Default(LinuxNativeConnection::Alternate(connection)) => {
+                    NativeDisplay::X11(connection.x11_display as usize)
+                },
+                NativeConnection::Alternate(_) => NativeDisplay::Unknown,
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            #[cfg(feature = "no-wgl")]
+            {
+                NativeDisplay::Egl(self.native_device().egl_display as usize)
+            }
+            #[cfg(not(feature = "no-wgl"))]
+            NativeDisplay::Unknown
+        }
+        #[cfg(not(any(
+            target_os = "windows",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
+        {
+            NativeDisplay::Unknown
+        }
     }
     fn connection(&self) -> Connection {
         self.connection()
@@ -132,7 +197,12 @@ impl RenderingContext for SurfmanRenderingContext {
         let context = self.0.context.borrow();
         let descriptor = device.context_descriptor(&context);
         let attributes = device.context_descriptor_attributes(&descriptor);
-        attributes.version
+        let major = attributes.version.major;
+        let minor = attributes.version.minor;
+        match self.connection().gl_api() {
+            GLApi::GL => GLVersion::GL(major, minor),
+            GLApi::GLES => GLVersion::GLES(major, minor),
+        }
     }
 
     fn create_texture(&self, surface: Surface) -> (SurfaceTexture, u32, Size2D<i32>) {
@@ -165,8 +235,8 @@ impl SurfmanRenderingContext {
             | ContextAttributeFlags::DEPTH
             | ContextAttributeFlags::STENCIL;
         let version = match connection.gl_api() {
-            GLApi::GLES => GLVersion { major: 3, minor: 0 },
-            GLApi::GL => GLVersion { major: 3, minor: 2 },
+            GLApi::GLES => surfman::GLVersion { major: 3, minor: 0 },
+            GLApi::GL => surfman::GLVersion { major: 3, minor: 2 },
         };
         let context_attributes = ContextAttributes { flags, version };
         let context_descriptor = device.create_context_descriptor(&context_attributes)?;
