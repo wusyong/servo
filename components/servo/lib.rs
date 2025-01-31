@@ -661,15 +661,6 @@ impl Servo {
                     )
                 }
             },
-            EmbedderEvent::InvalidateNativeSurface => {
-                self.compositor.borrow_mut().invalidate_native_surface();
-            },
-            EmbedderEvent::ReplaceNativeSurface(native_widget, coords) => {
-                self.compositor
-                    .borrow_mut()
-                    .replace_native_surface(native_widget, coords);
-                self.compositor.borrow_mut().composite();
-            },
             EmbedderEvent::AllowNavigationResponse(pipeline_id, allowed) => {
                 let msg = ConstellationMsg::AllowNavigationResponse(pipeline_id, allowed);
                 if let Err(e) = self.constellation_proxy.try_send(msg) {
