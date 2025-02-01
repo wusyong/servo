@@ -50,15 +50,23 @@ pub trait RenderingContext {
     fn gl_api(&self) -> Rc<dyn gleam::gl::Gl>;
     /// Describes the OpenGL version that is requested when a context is created.
     fn gl_version(&self) -> GLVersion;
-    /// Returns the GL Context used by servo media player.
-    fn gl_context(&self) -> GlContext;
-    /// Returns the GL Display used by servo media player.
-    fn gl_display(&self) -> NativeDisplay;
+    /// Returns the GL Context used by servo media player. Default to `GlContext::Unknown`.
+    fn gl_context(&self) -> GlContext {
+        GlContext::Unknown
+    }
+    /// Returns the GL Display used by servo media player. Default to `NativeDisplay::Unknown`.
+    fn gl_display(&self) -> NativeDisplay {
+        NativeDisplay::Unknown
+    }
     /// Creates a texture from a given surface and returns the surface texture,
-    /// the OpenGL texture object, and the size of the surface.
-    fn create_texture(&self, surface: Surface) -> (SurfaceTexture, u32, Size2D<i32>);
-    /// Destroys the texture and returns the surface.
-    fn destroy_texture(&self, surface_texture: SurfaceTexture) -> Surface;
+    /// the OpenGL texture object, and the size of the surface. Default to `None`.
+    fn create_texture(&self, _surface: Surface) -> Option<(SurfaceTexture, u32, Size2D<i32>)> {
+        None
+    }
+    /// Destroys the texture and returns the surface. Default to `None`.
+    fn destroy_texture(&self, _surface_texture: SurfaceTexture) -> Option<Surface> {
+        None
+    }
 }
 
 /// A rendering context that uses the Surfman library to create and manage
@@ -194,7 +202,7 @@ impl RenderingContext for SurfmanRenderingContext {
         }
     }
 
-    fn create_texture(&self, surface: Surface) -> (SurfaceTexture, u32, Size2D<i32>) {
+    fn create_texture(&self, surface: Surface) -> Option<(SurfaceTexture, u32, Size2D<i32>)> {
         let device = &self.0.device.borrow();
         let context = &mut self.0.context.borrow_mut();
         let SurfaceInfo {
@@ -205,11 +213,11 @@ impl RenderingContext for SurfmanRenderingContext {
         debug!("... getting texture for surface {:?}", front_buffer_id);
         let surface_texture = device.create_surface_texture(context, surface).unwrap();
         let gl_texture = device.surface_texture_object(&surface_texture);
-        (surface_texture, gl_texture, size)
+        Some((surface_texture, gl_texture, size))
     }
 
-    fn destroy_texture(&self, surface_texture: SurfaceTexture) -> Surface {
-        self.destroy_surface_texture(surface_texture).unwrap()
+    fn destroy_texture(&self, surface_texture: SurfaceTexture) -> Option<Surface> {
+        self.destroy_surface_texture(surface_texture).ok()
     }
 }
 

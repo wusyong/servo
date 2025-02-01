@@ -104,23 +104,30 @@ impl WebGLExternalImages {
         debug!("... locking chain {:?}", id);
         let front_buffer = self.swap_chains.get(id)?.take_surface()?;
 
-        let (surface_texture, gl_texture, size) =
-            self.rendering_context.create_texture(front_buffer);
+        if let Some((surface_texture, gl_texture, size)) =
+            self.rendering_context.create_texture(front_buffer)
+        {
+            self.locked_front_buffers.insert(id, surface_texture);
 
-        self.locked_front_buffers.insert(id, surface_texture);
-
-        Some((gl_texture, size))
+            Some((gl_texture, size))
+        } else {
+            None
+        }
     }
 
     fn unlock_swap_chain(&mut self, id: WebGLContextId) -> Option<()> {
-        let locked_front_buffer = self.locked_front_buffers.remove(&id)?;
-        let locked_front_buffer = self.rendering_context.destroy_texture(locked_front_buffer);
-
         debug!("... unlocked chain {:?}", id);
-        self.swap_chains
-            .get(id)?
-            .recycle_surface(locked_front_buffer);
-        Some(())
+        let locked_front_buffer = self.locked_front_buffers.remove(&id)?;
+        if let Some(locked_front_buffer) =
+            self.rendering_context.destroy_texture(locked_front_buffer)
+        {
+            self.swap_chains
+                .get(id)?
+                .recycle_surface(locked_front_buffer);
+            Some(())
+        } else {
+            None
+        }
     }
 }
 
