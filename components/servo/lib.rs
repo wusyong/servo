@@ -88,8 +88,6 @@ use servo_config::prefs::Preferences;
 use servo_config::{opts, pref, prefs};
 use servo_media::player::context::GlContext;
 use servo_media::ServoMedia;
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-use surfman::{NativeConnection, NativeContext};
 #[cfg(feature = "webgpu")]
 pub use webgpu;
 #[cfg(feature = "webgpu")]

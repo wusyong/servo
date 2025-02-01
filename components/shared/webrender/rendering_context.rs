@@ -133,13 +133,13 @@ impl RenderingContext for SurfmanRenderingContext {
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             match self.connection().native_connection() {
-                NativeConnection::Default(LinuxNativeConnection::Default(connection)) => {
+                surfman::NativeConnection::Default(LinuxNativeConnection::Default(connection)) => {
                     NativeDisplay::Egl(connection.0 as usize)
                 },
-                NativeConnection::Default(LinuxNativeConnection::Alternate(connection)) => {
-                    NativeDisplay::X11(connection.x11_display as usize)
-                },
-                NativeConnection::Alternate(_) => NativeDisplay::Unknown,
+                surfman::NativeConnection::Default(LinuxNativeConnection::Alternate(
+                    connection,
+                )) => NativeDisplay::X11(connection.x11_display as usize),
+                surfman::NativeConnection::Alternate(_) => NativeDisplay::Unknown,
             }
         }
         #[cfg(target_os = "windows")]
