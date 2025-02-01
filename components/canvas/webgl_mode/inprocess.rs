@@ -48,6 +48,10 @@ impl WebGLComm {
         let webxr_init = crate::webxr::WebXRBridgeInit::new(sender.clone());
         #[cfg(feature = "webxr")]
         let webxr_layer_grand_manager = webxr_init.layer_grand_manager();
+        let connection = surfman::Connection::new().expect("Failed to create connection");
+        let adapter = connection
+            .create_adapter()
+            .expect("Failed to create adapter");
 
         // This implementation creates a single `WebGLThread` for all the pipelines.
         let init = WebGLThreadInit {
@@ -57,8 +61,8 @@ impl WebGLComm {
             sender: sender.clone(),
             receiver,
             webrender_swap_chains: webrender_swap_chains.clone(),
-            connection: rendering_context.connection(),
-            adapter: rendering_context.adapter(),
+            connection,
+            adapter,
             api_type,
             #[cfg(feature = "webxr")]
             webxr_init,

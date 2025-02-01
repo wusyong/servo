@@ -40,11 +40,6 @@ pub trait RenderingContext {
     fn resize(&self, size: Size2D<i32>);
     /// Presents the rendered frame to the screen.
     fn present(&self);
-    /// The connection to the display server.
-    fn connection(&self) -> Connection;
-    /// Represents a hardware display adapter that can be used for
-    /// rendering (including the CPU).
-    fn adapter(&self) -> Adapter;
     /// Makes the context the current OpenGL context for this thread.
     /// After calling this function, it is valid to use OpenGL rendering
     /// commands.
@@ -155,12 +150,6 @@ impl RenderingContext for SurfmanRenderingContext {
         {
             NativeDisplay::Unknown
         }
-    }
-    fn connection(&self) -> Connection {
-        self.connection()
-    }
-    fn adapter(&self) -> Adapter {
-        self.adapter()
     }
     fn resize(&self, size: Size2D<i32>) {
         if let Err(err) = self.resize(size) {
