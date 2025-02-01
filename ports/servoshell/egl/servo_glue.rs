@@ -416,8 +416,10 @@ impl ServoGlue {
             panic!("null passed for native_surface");
         }
         let connection = self.rendering_context.connection();
-        let native_widget =
-            unsafe { connection.create_native_widget_from_ptr(native_widget, coords.to_untyped()) };
+        let native_widget = unsafe {
+            connection
+                .create_native_widget_from_ptr(native_surface, coords.framebuffer.to_untyped())
+        };
         if let Err(e) = self
             .rendering_context
             .bind_native_surface_to_context(native_widget)
