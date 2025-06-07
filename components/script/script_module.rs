@@ -42,6 +42,9 @@ use net_traits::{
     FetchMetadata, FetchResponseListener, Metadata, NetworkError, ReferrerPolicy,
     ResourceFetchTiming, ResourceTimingType,
 };
+use script_bindings::error::Fallible;
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use servo_url::ServoUrl;
 use url::ParseError as UrlParseError;
 use uuid::Uuid;
@@ -1857,4 +1860,88 @@ pub(crate) fn fetch_inline_module_script(
             owner.notify_owner_to_finish(ModuleIdentity::ScriptId(script_id), options, can_gc);
         },
     }
+}
+
+#[derive(JSTraceable)]
+pub(crate) struct ImportMap {
+    imports: u8,
+    scopes: u8,
+    integrity: u8,
+}
+
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#parse-an-import-map-string>
+pub(crate) fn parse_an_import_map_string(
+    owner: ModuleOwner,
+    input: Rc<DOMString>,
+    url: ServoUrl,
+    can_gc: CanGc,
+) -> Fallible<ImportMap> {
+    // Step 1. Let parsed be the result of parsing a JSON string to an Infra value given input.
+    let parsed: JsonValue = serde_json::from_str(input.str())
+        .map_err(|_| Error::Type("The value needs to be a JSON object.".to_owned()))?;
+    // Step 2. If parsed is not an ordered map, then throw a TypeError indicating that the
+    // top-level value needs to be a JSON object.a
+    let JsonValue::Object(mut parsed) = parsed else {
+        return Err(Error::Type(
+            "The top-level value needs to be a JSON object.".to_owned(),
+        ));
+    };
+
+    // Step 3. Let sortedAndNormalizedImports be an empty ordered map.
+    let imports = 0;
+    // Step 4. If parsed["imports"] exists, then:
+    if let Some(imports) = parsed.get("imports") {
+        // Step 4.1 If parsed["imports"] is not an ordered map, then throw a TypeError
+        // indicating that the value for the "imports" top-level key needs to be a JSON object.
+        let JsonValue::Object(imports) = imports else {
+            return Err(Error::Type(
+                "The \"imports\" top-level value needs to be a JSON object.".to_owned(),
+            ));
+        };
+        // Step 4.2
+        todo!()
+    }
+
+    // Step 5. Let sortedAndNormalizedScopes be an empty ordered map.
+    let scopes = 0;
+    // Step 6. If parsed["scopes"] exists, then:
+    if let Some(scopes) = parsed.get("scopes") {
+        // Step 6.1 If parsed["scopes"] is not an ordered map, then throw a TypeError
+        // indicating that the value for the "scopes" top-level key needs to be a JSON object.
+        let JsonValue::Object(scopes) = scopes else {
+            return Err(Error::Type(
+                "The \"scopes\" top-level value needs to be a JSON object.".to_owned(),
+            ));
+        };
+        todo!()
+    }
+
+    // Step 7. Let normalizedIntegrity be an empty ordered map.
+    let integrity = 0;
+    // Step 8. If parsed["integrity"] exists, then:
+    if let Some(integrity) = parsed.get("integrity") {
+        // Step 8.1 If parsed["integrity"] is not an ordered map, then throw a TypeError
+        // indicating that the value for the "integrity" top-level key needs to be a JSON object.
+        let JsonValue::Object(integrity) = integrity else {
+            return Err(Error::Type(
+                "The \"integrity\" top-level value needs to be a JSON object.".to_owned(),
+            ));
+        };
+        todo!()
+    }
+
+    // Step 9. If parsed's keys contains any items besides "imports", "scopes", or "integrity",
+    // then the user agent should report a warning to the console indicating that an invalid
+    // top-level key was present in the import map.
+    parsed.retain(|k, _| !matches!(k.as_str(), "imports" | "scopes" | "integrity"));
+    if !parsed.is_empty() {
+        todo!()
+    }
+
+    // Step 10. Return an import map
+    Ok(ImportMap {
+        imports,
+        scopes,
+        integrity,
+    })
 }
